@@ -300,6 +300,9 @@ func InitResources() error {
 
 	// 加载环境变量
 	common.InitEnv()
+	if err := service.ValidateManagedModelAdmissionConfig(); err != nil {
+		return err
+	}
 
 	logger.SetupLogger()
 

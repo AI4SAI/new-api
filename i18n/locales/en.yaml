@@ -89,3 +89,7 @@ channel.upstream_update_added_models: "Added model examples (showing {{.Shown}}/
 channel.upstream_update_removed_models: "Removed model examples (showing {{.Shown}}/{{.Total}}): {{.Models}}"
 channel.upstream_update_failed_channels: "Failed channel IDs (showing {{.Shown}}/{{.Total}}): {{.Ids}}"
 channel.upstream_update_more_omitted: " ({{.Count}} more omitted)"
+
+model.admission_unavailable: "Model account admission is unavailable"
+model.admission_denied: "Model account or funding does not permit this request"
+model.background_unavailable: "Background responses are unavailable for this billing service"

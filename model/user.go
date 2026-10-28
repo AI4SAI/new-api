@@ -17,7 +17,7 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-const UserNameMaxLength = 20
+const UserNameMaxLength = 64
 
 var userSortColumns = map[string]string{
 	"id":            "id",
@@ -78,11 +78,11 @@ func resolveUserSortOptions(sortOptions []UserSortOptions) UserSortOptions {
 // Otherwise, the sensitive information will be saved on local storage in plain text!
 type User struct {
 	Id                   int                        `json:"id"`
-	Username             string                     `json:"username" gorm:"unique;index" validate:"max=20"`
+	Username             string                     `json:"username" gorm:"unique;index" validate:"max=64"`
 	Password             string                     `json:"password" gorm:"not null;" validate:"min=8,max=128"`
 	HasPassword          bool                       `json:"-" gorm:"-:all"`
 	OriginalPassword     string                     `json:"original_password" gorm:"-:all"` // this field is only for Password change verification, don't save it to database!
-	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=20"`
+	DisplayName          string                     `json:"display_name" gorm:"index" validate:"max=64"`
 	Role                 int                        `json:"role" gorm:"type:int;default:1"`   // admin, common
 	Status               int                        `json:"status" gorm:"type:int;default:1"` // enabled, disabled
 	Email                string                     `json:"email" gorm:"index" validate:"max=50"`
@@ -751,7 +751,13 @@ func (user *User) InsertWithTx(tx *gorm.DB, inviterId int) error {
 			user.SetSetting(defaultSetting)
 		}
 
-		return tx.Create(user).Error
+		if err := tx.Create(user).Error; err != nil {
+			return err
+		}
+		if user.OidcId != "" {
+			return ClaimExternalIdentityWithTx(tx, "oidc", user.OidcId, user.Id)
+		}
+		return nil
 	})
 }
 
@@ -930,6 +936,9 @@ func (user *User) ClearBinding(bindingType string) error {
 		}
 		if bindingType == ExternalIdentityProviderTelegram {
 			return ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id)
+		}
+		if bindingType == "oidc" {
+			return ReleaseExternalIdentityWithTx(tx, "oidc", user.Id)
 		}
 		return nil
 	}); err != nil {

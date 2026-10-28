@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -144,6 +145,9 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		}
 	}
 
+	if denied := service.ManagedResponsesBody(c, bytes.NewReader(jsonData)); denied != nil {
+		return nil, denied
+	}
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
 		return nil, types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())

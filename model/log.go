@@ -71,6 +71,8 @@ type Log struct {
 	ChannelId         int    `json:"channel" gorm:"index"`
 	ChannelName       string `json:"channel_name" gorm:"->"`
 	TokenId           int    `json:"token_id" gorm:"default:0;index"`
+	BillingContextRef string `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index"`
+	BillingProduct    string `json:"billing_product,omitempty" gorm:"type:varchar(256)"`
 	Group             string `json:"group" gorm:"index"`
 	Ip                string `json:"ip" gorm:"index;default:''"`
 	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
@@ -356,21 +358,23 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		}
 	}
 	log := &Log{
-		UserId:           userId,
-		Username:         username,
-		CreatedAt:        createdAt,
-		Type:             LogTypeConsume,
-		Content:          content,
-		PromptTokens:     params.PromptTokens,
-		CompletionTokens: params.CompletionTokens,
-		TokenName:        params.TokenName,
-		ModelName:        params.ModelName,
-		Quota:            params.Quota,
-		ChannelId:        params.ChannelId,
-		TokenId:          params.TokenId,
-		UseTime:          params.UseTimeSeconds,
-		IsStream:         params.IsStream,
-		Group:            params.Group,
+		UserId:            userId,
+		Username:          username,
+		CreatedAt:         createdAt,
+		Type:              LogTypeConsume,
+		Content:           content,
+		PromptTokens:      params.PromptTokens,
+		CompletionTokens:  params.CompletionTokens,
+		TokenName:         params.TokenName,
+		ModelName:         params.ModelName,
+		Quota:             params.Quota,
+		ChannelId:         params.ChannelId,
+		TokenId:           params.TokenId,
+		BillingContextRef: c.GetString("model_billing_context_ref"),
+		BillingProduct:    c.GetString("model_billing_product"),
+		UseTime:           params.UseTimeSeconds,
+		IsStream:          params.IsStream,
+		Group:             params.Group,
 		Ip: func() string {
 			if needRecordIp {
 				return c.ClientIP()
@@ -477,10 +481,26 @@ type LogFilter struct {
 	Group             string
 	RequestId         string
 	UpstreamRequestId string
+	UserID            *int
+	TokenID           *int
+	BillingContextRef *string
+	BillingProduct    string
 }
 
 func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	var err error
+	if f.UserID != nil {
+		tx = tx.Where("logs.user_id = ?", *f.UserID)
+	}
+	if f.TokenID != nil {
+		tx = tx.Where("logs.token_id = ?", *f.TokenID)
+	}
+	if f.BillingContextRef != nil {
+		tx = tx.Where("logs.billing_context_ref = ?", *f.BillingContextRef)
+	}
+	if f.BillingProduct != "" {
+		tx = tx.Where("(logs.billing_product = ? OR ((logs.billing_product IS NULL OR logs.billing_product = '') AND logs.model_name = ?))", f.BillingProduct, f.BillingProduct)
+	}
 	if f.Type != LogTypeUnknown {
 		tx = tx.Where("logs.type = ?", f.Type)
 	}
@@ -677,11 +697,23 @@ type Stat struct {
 	Tpm   int `json:"tpm"`
 }
 
-func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string) (stat Stat, err error) {
+func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string, nativeIdentity ...LogFilter) (stat Stat, err error) {
 	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
+	if len(nativeIdentity) == 1 {
+		nativeIdentity[0].BillingProduct = modelName
+		modelName = ""
+		tx, err = nativeIdentity[0].apply(tx)
+		if err != nil {
+			return stat, err
+		}
+		rpmTpmQuery, err = nativeIdentity[0].apply(rpmTpmQuery)
+		if err != nil {
+			return stat, err
+		}
+	}
 
 	if tx, err = applyExplicitLogTextFilter(tx, "username", username); err != nil {
 		return stat, err

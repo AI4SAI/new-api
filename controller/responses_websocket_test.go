@@ -414,6 +414,10 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 		c.Set(common.RequestIdKey, "responses-http-billing")
 		Relay(c, types.RelayFormatOpenAIResponses)
 	})
+	engine.POST("/pg/chat/completions", middleware.UserAuth(), middleware.Distribute(), func(c *gin.Context) {
+		defer func() { fixture.httpDone <- struct{}{} }()
+		Playground(c)
+	})
 	gateway := httptest.NewServer(engine)
 	fixture.gatewayURL = gateway.URL
 	t.Cleanup(gateway.Close)
@@ -642,6 +646,108 @@ func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
 	assert.Equal(t, 3000, token.UsedQuota)
 	assert.Equal(t, 97000, user.Quota)
 	assert.Equal(t, 3000, user.UsedQuota)
+}
+
+func TestManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	var calls atomic.Int32
+	fixture := newResponsesWSBillingTest(t, `tier("input", p * 2)`, func(ws *websocket.Conn, _ *http.Request) {
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+			calls.Add(1)
+			if err := ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed","response":{"id":"first","status":"completed","usage":{"input_tokens":1000,"output_tokens":10,"total_tokens":1010}}}`)); err != nil {
+				return
+			}
+		}
+	})
+	fixture.httpUpstream = func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010}}`)
+	}
+	var deny atomic.Bool
+	ref, playgroundRef := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
+	keyFile := filepath.Join(t.TempDir(), "admission")
+	key := strings.Repeat("a", 48)
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if deny.Load() {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		assert.Equal(t, "Bearer "+key, r.Header.Get("Authorization"))
+		var body map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		body["billing_context_ref"], body["product_model"] = ref, body["model"]
+		if body["kind"] == "playground" {
+			assert.Equal(t, float64(0), body["native_token_id"])
+			body["billing_context_ref"] = playgroundRef
+		}
+		data, err := common.Marshal(body)
+		require.NoError(t, err)
+		_, _ = w.Write(data)
+	}))
+	defer admission.Close()
+	t.Setenv("MODEL_BILLING_ADMISSION_URL", admission.URL)
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", keyFile)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "native-fixture")
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"first"}`)))
+	assert.Equal(t, "response.completed", readResponsesWSTestEvent(t, fixture.client)["type"])
+	deny.Store(true)
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"revoked"}`)))
+	rejected := readResponsesWSTestEvent(t, fixture.client)
+	assert.Equal(t, "error", rejected["type"])
+	assert.Equal(t, float64(403), rejected["status"])
+	assert.Equal(t, int32(1), calls.Load())
+	post := func(path, body, bearer string) int {
+		request, err := http.NewRequest("POST", fixture.gatewayURL+path, strings.NewReader(body))
+		require.NoError(t, err)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+bearer)
+		request.Header.Set("New-Api-User", fmt.Sprint(fixture.user.Id))
+		response, err := http.DefaultClient.Do(request)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, response.Body)
+		require.NoError(t, err)
+		response.Body.Close()
+		if path == "/v1/responses" || path == "/pg/chat/completions" {
+			select {
+			case <-fixture.httpDone:
+			case <-time.After(3 * time.Second):
+				t.Fatal("HTTP relay did not finish")
+			}
+		}
+		return response.StatusCode
+	}
+	assert.Equal(t, 403, post("/v1/responses", `{"model":"ws-billing","input":"blocked"}`, "sk-"+fixture.token.Key))
+	deny.Store(false)
+	fixture.channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: true, ResponsesWebSocketEnabled: true})
+	require.NoError(t, model.DB.Model(fixture.channel).Update("setting", fixture.channel.Setting).Error)
+	assert.Equal(t, 400, post("/v1/responses", `{"model":"ws-billing","input":"async","background":true}`, "sk-"+fixture.token.Key))
+	fixture.channel.SetSetting(dto.ChannelSettings{ResponsesWebSocketEnabled: true})
+	parameters := `{"background":true}`
+	require.NoError(t, model.DB.Model(fixture.channel).Updates(map[string]any{"setting": fixture.channel.Setting, "param_override": parameters}).Error)
+	assert.Equal(t, 400, post("/v1/responses", `{"model":"ws-billing","input":"async override"}`, "sk-"+fixture.token.Key))
+	assert.Equal(t, int32(1), calls.Load(), "denied and async requests must not reach the supplier")
+	require.NoError(t, model.DB.Model(fixture.channel).Update("param_override", nil).Error)
+	previousSecret := common.SessionSecret
+	common.SessionSecret = "managed-playground-fixture-secret"
+	t.Cleanup(func() { common.SessionSecret = previousSecret })
+	require.NoError(t, model.DB.AutoMigrate(&model.UserSession{}, &model.UserAccessToken{}, &model.Option{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.AuditLog{}))
+	bundle, err := service.CreateLoginSession(fixture.user.Id, "password", "127.0.0.1", "fixture")
+	require.NoError(t, err)
+	assert.Equal(t, 200, post("/pg/chat/completions", `{"model":"ws-billing","messages":[{"role":"user","content":"hello"}]}`, bundle.AccessToken))
+	var logs []model.Log
+	require.NoError(t, model.LOG_DB.Where("type = ?", model.LogTypeConsume).Order("id").Find(&logs).Error)
+	require.Len(t, logs, 2)
+	assert.Equal(t, ref, logs[0].BillingContextRef)
+	assert.Equal(t, playgroundRef, logs[1].BillingContextRef)
+	assert.Equal(t, "ws-billing", logs[0].BillingProduct)
+	assert.Equal(t, 0, logs[1].TokenId)
+	assert.Equal(t, int32(2), calls.Load())
 }
 
 // Both transports must reach the same upstream target with the same

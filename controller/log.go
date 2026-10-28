@@ -32,6 +32,24 @@ func logFilterFromQuery(c *gin.Context, admin bool) model.LogFilter {
 	if admin {
 		filter.Username = c.Query("username")
 		filter.Channel, _ = strconv.Atoi(c.Query("channel"))
+		filter.BillingProduct = c.Query("billing_product")
+		if c.Query("user_id") != "" {
+			id, err := strconv.Atoi(c.Query("user_id"))
+			if err != nil || id <= 0 {
+				id = -1
+			}
+			filter.UserID = &id
+		}
+	}
+	if c.Query("token_id") != "" {
+		id, err := strconv.Atoi(c.Query("token_id"))
+		if err != nil || id < 0 {
+			id = -1
+		}
+		filter.TokenID = &id
+	}
+	if value, exists := c.GetQuery("billing_context_ref"); exists {
+		filter.BillingContextRef = &value
 	}
 	return filter
 }
@@ -209,7 +227,21 @@ func GetLogsStat(c *gin.Context) {
 	modelName := c.Query("model_name")
 	channel, _ := strconv.Atoi(c.Query("channel"))
 	group := c.Query("group")
-	stat, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+	var nativeIdentity []model.LogFilter
+	if c.Query("user_id") != "" || c.Query("token_id") != "" {
+		userID, userErr := strconv.Atoi(c.Query("user_id"))
+		tokenID, tokenErr := strconv.Atoi(c.Query("token_id"))
+		if userErr != nil || tokenErr != nil || userID <= 0 || tokenID < 0 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		filter := model.LogFilter{UserID: &userID, TokenID: &tokenID}
+		if value, exists := c.GetQuery("billing_context_ref"); exists {
+			filter.BillingContextRef = &value
+		}
+		nativeIdentity = []model.LogFilter{filter}
+	}
+	stat, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, nativeIdentity...)
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -219,9 +251,12 @@ func GetLogsStat(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"quota": stat.Quota,
-			"rpm":   stat.Rpm,
-			"tpm":   stat.Tpm,
+			"quota":               stat.Quota,
+			"user_id":             c.Query("user_id"),
+			"token_id":            c.Query("token_id"),
+			"billing_context_ref": c.Query("billing_context_ref"),
+			"rpm":                 stat.Rpm,
+			"tpm":                 stat.Tpm,
 		},
 	})
 	return

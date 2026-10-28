@@ -30,6 +30,42 @@ import { consumeOAuthLoginRedirect } from './lib/oauth-callback-mode'
 afterEach(() => vi.restoreAllMocks())
 
 test.each([true, false])(
+  'uses the server OIDC authorization URL and refuses a missing URL: %s',
+  async (hasUrl) => {
+    const authorizationUrl =
+      'https://identity.example.test/auth?code_challenge=pkce&nonce=flow'
+    vi.spyOn(api, 'post').mockImplementation(async (url) => {
+      if (url === '/api/user/auth/logout') return { data: { success: true } }
+      if (url === '/api/oauth/state') {
+        return {
+          data: {
+            success: true,
+            data: {
+              flow_token: 'oidc-state',
+              ...(hasUrl ? { authorization_url: authorizationUrl } : {}),
+            },
+          },
+        }
+      }
+      throw new Error(`Unexpected POST ${url}`)
+    })
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
+    const error = vi.spyOn(toast, 'error')
+    const { result } = renderHook(() =>
+      useOAuthLogin({ oidc_enabled: true }, '/console/personal')
+    )
+    await act(() => result.current.handleOIDCLogin())
+    if (hasUrl) {
+      expect(open).toHaveBeenCalledWith(authorizationUrl, '_self')
+      expect(consumeOAuthLoginRedirect('oidc-state')).toBe('/console/personal')
+    } else {
+      expect(open).not.toHaveBeenCalled()
+      expect(error).toHaveBeenCalled()
+    }
+  }
+)
+
+test.each([true, false])(
   'starts Telegram OAuth only when configuration is ready: %s',
   async (configured) => {
     vi.spyOn(window, 'localStorage', 'get').mockReturnValue(

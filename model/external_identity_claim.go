@@ -1,8 +1,11 @@
 package model
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/QuantumNous/new-api/common"
 	"strings"
 	"time"
 
@@ -11,6 +14,13 @@ import (
 )
 
 const ExternalIdentityProviderTelegram = "telegram"
+
+// OIDCIdentityKey keeps issuer and subject as a single versioned identity key.
+// JSON encodes the tuple unambiguously even when claims contain separators.
+func OIDCIdentityKey(issuer, subject string) string {
+	encoded, _ := common.Marshal([]string{"oidc/v1", issuer, subject})
+	return fmt.Sprintf("v1:%x", sha256.Sum256(encoded))
+}
 
 var ErrExternalIdentityAlreadyClaimed = errors.New("external identity is already claimed")
 
@@ -115,19 +125,30 @@ func releaseAllExternalIdentitiesWithTx(tx *gorm.DB, userId int) error {
 	return tx.Where("user_id = ?", userId).Delete(&ExternalIdentityClaim{}).Error
 }
 
-// InitializeExternalIdentityClaims imports legacy Telegram bindings after the
+// InitializeExternalIdentityClaims imports external bindings after the
 // claim table is migrated. Existing duplicate ownership fails migration rather
 // than preserving an ambiguous login identity.
 func InitializeExternalIdentityClaims() error {
 	var users []User
-	if err := DB.Unscoped().Select("id", "telegram_id").
-		Where("telegram_id <> ?", "").Find(&users).Error; err != nil {
+	if err := DB.Unscoped().Select("id", "telegram_id", "oidc_id").
+		Where("telegram_id <> ? OR oidc_id <> ?", "", "").Find(&users).Error; err != nil {
 		return err
 	}
 	return DB.Transaction(func(tx *gorm.DB) error {
 		for _, user := range users {
-			if err := ClaimExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.TelegramId, user.Id); err != nil {
-				return fmt.Errorf("backfill Telegram identity for user %d: %w", user.Id, err)
+			if user.TelegramId != "" {
+				if err := ClaimExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.TelegramId, user.Id); err != nil {
+					return fmt.Errorf("backfill Telegram identity for user %d: %w", user.Id, err)
+				}
+			}
+			if user.OidcId != "" {
+				_, validHash := hex.DecodeString(strings.TrimPrefix(user.OidcId, "v1:"))
+				if !strings.HasPrefix(user.OidcId, "v1:") || len(user.OidcId) != 67 || validHash != nil {
+					return errors.New("legacy OIDC bindings require an issuer-verified migration")
+				}
+				if err := ClaimExternalIdentityWithTx(tx, "oidc", user.OidcId, user.Id); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

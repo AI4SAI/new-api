@@ -758,6 +758,37 @@ func TestOAuthLoginConsumesFlowOnlyAfterProviderIdentity(t *testing.T) {
 	}
 }
 
+func TestOIDCFlowRequiresTheBrowserThatStartedIt(t *testing.T) {
+	setupAuthFlowControllerTest(t)
+	previous := oauth.GetProvider("oidc")
+	provider := &authFlowTestOAuthProvider{exchangeErr: errors.New("provider unavailable")}
+	oauth.Register("oidc", provider)
+	t.Cleanup(func() { oauth.Register("oidc", previous) })
+	proof := strings.Repeat("p", 43)
+	payload, err := common.Marshal(oauthFlowPayload{OIDCPKCEVerifier: strings.Repeat("v", 43),
+		OIDCNonce: strings.Repeat("n", 43), OIDCBrowserHash: fmt.Sprintf("%x", sha256.Sum256([]byte(proof))),
+		OIDCClientID: "test-client", OIDCIssuer: "https://identity.example.test"})
+	require.NoError(t, err)
+	state, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeOAuth,
+		Provider: "oidc", Intent: model.AuthFlowIntentLogin, Payload: string(payload), ExpiresAt: time.Now().Add(time.Minute)})
+	require.NoError(t, err)
+	router := gin.New()
+	router.GET("/api/oauth/:provider", HandleOAuth)
+	for _, cookie := range []string{"", "another-browser", proof} {
+		request := httptest.NewRequest("GET", "/api/oauth/oidc?state="+state+"&code=code", nil)
+		if cookie != "" {
+			request.AddCookie(&http.Cookie{Name: oidcBrowserCookieName(state), Value: cookie})
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if cookie != proof {
+			assert.Equal(t, http.StatusForbidden, response.Code)
+			assert.Zero(t, provider.exchangeCalls)
+		}
+	}
+	assert.Equal(t, 1, provider.exchangeCalls)
+}
+
 func TestOAuthLoginConsumesFlowAfterProviderIdentityAndOnProviderError(t *testing.T) {
 	provider := setupAuthFlowControllerTest(t)
 

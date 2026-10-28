@@ -1,13 +1,20 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -15,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
@@ -30,11 +38,17 @@ type oauthStateRequest struct {
 }
 
 type oauthFlowPayload struct {
-	AffiliateCode   string                         `json:"affiliate_code,omitempty"`
-	Verification    *service.OAuthVerificationFlow `json:"verification,omitempty"`
-	Telegram        *oauth.TelegramOAuthFlow       `json:"telegram,omitempty"`
-	SessionIdentity *service.AuthIdentity          `json:"session_identity,omitempty"`
-	Authorization   *model.AuthFlowAuthorization   `json:"authorization,omitempty"`
+	OIDCPKCEVerifier string                         `json:"oidc_pkce_verifier,omitempty"`
+	OIDCNonce        string                         `json:"oidc_nonce,omitempty"`
+	OIDCClientID     string                         `json:"oidc_client_id,omitempty"`
+	OIDCIssuer       string                         `json:"oidc_issuer,omitempty"`
+	OIDCAuthAfter    int64                          `json:"oidc_auth_after,omitempty"`
+	OIDCBrowserHash  string                         `json:"oidc_browser_hash,omitempty"`
+	AffiliateCode    string                         `json:"affiliate_code,omitempty"`
+	Verification     *service.OAuthVerificationFlow `json:"verification,omitempty"`
+	Telegram         *oauth.TelegramOAuthFlow       `json:"telegram,omitempty"`
+	SessionIdentity  *service.AuthIdentity          `json:"session_identity,omitempty"`
+	Authorization    *model.AuthFlowAuthorization   `json:"authorization,omitempty"`
 }
 
 // providerParams returns the params of messages that name the OAuth provider.
@@ -63,6 +77,38 @@ func GenerateOAuthCode(c *gin.Context) {
 	userID := 0
 	sessionID := ""
 	flowPayload := oauthFlowPayload{AffiliateCode: request.Aff}
+	var oidcAuthorizationEndpoint string
+	var oidcBrowserProof string
+	if request.Provider == "oidc" {
+		var err error
+		oidcBrowserProof, err = common.GenerateRandomCharsKey(43)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		flowPayload.OIDCBrowserHash = fmt.Sprintf("%x", sha256.Sum256([]byte(oidcBrowserProof)))
+		if request.Intent == model.AuthFlowIntentVerify {
+			flowPayload.OIDCAuthAfter = time.Now().Unix()
+		}
+		verifier, err := common.GenerateRandomCharsKey(43)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		flowPayload.OIDCPKCEVerifier = verifier
+		nonce, err := common.GenerateRandomCharsKey(43)
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		provider, _, issuer, err := oauth.OIDCDiscovery(c.Request.Context())
+		if err != nil {
+			writeSecurityOperationError(c, err)
+			return
+		}
+		flowPayload.OIDCNonce, flowPayload.OIDCClientID, flowPayload.OIDCIssuer = nonce, system_setting.GetOIDCSettings().ClientId, issuer
+		oidcAuthorizationEndpoint = provider.Endpoint().AuthURL
+	}
 	bindingStarted := false
 	if request.Provider == "telegram" {
 		telegramFlow, err := oauth.NewTelegramOAuthFlow()
@@ -135,11 +181,45 @@ func GenerateOAuthCode(c *gin.Context) {
 	if flowPayload.Telegram != nil {
 		data["authorization_url"] = flowPayload.Telegram.AuthorizationURL(state)
 	}
+	if request.Provider == "oidc" {
+		http.SetCookie(c.Writer, &http.Cookie{Name: oidcBrowserCookieName(state), Value: oidcBrowserProof,
+			Path: "/", HttpOnly: true, Secure: common.SessionCookieSecure, SameSite: http.SameSiteLaxMode,
+			MaxAge: int(oauthAuthFlowTTL.Seconds()), Expires: expiresAt})
+		authorize, err := url.Parse(oidcAuthorizationEndpoint)
+		if err != nil || authorize.Host == "" {
+			writeSecurityOperationError(c, model.ErrAuthFlowInvalid)
+			return
+		}
+		query := authorize.Query()
+		query.Set("client_id", flowPayload.OIDCClientID)
+		query.Set("nonce", flowPayload.OIDCNonce)
+		if flowPayload.OIDCAuthAfter != 0 {
+			query.Set("max_age", "0")
+			query.Set("prompt", "login")
+		}
+		query.Set("redirect_uri", system_setting.ServerAddress+"/oauth/oidc")
+		query.Set("response_type", "code")
+		query.Set("scope", "openid profile email")
+		query.Set("state", state)
+		digest := sha256.Sum256([]byte(flowPayload.OIDCPKCEVerifier))
+		query.Set("code_challenge", base64.RawURLEncoding.EncodeToString(digest[:]))
+		query.Set("code_challenge_method", "S256")
+		authorize.RawQuery = query.Encode()
+		data["authorization_url"] = authorize.String()
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
 		"data":    data,
 	})
+}
+
+func oidcBrowserCookieName(state string) string {
+	prefix := "newapi_oidc_"
+	if common.SessionCookieSecure {
+		prefix = "__Host-" + prefix
+	}
+	return prefix + fmt.Sprintf("%x", sha256.Sum256([]byte(state)))[:24]
 }
 
 // HandleOAuth handles OAuth callback for all standard OAuth providers
@@ -250,6 +330,26 @@ func HandleOAuth(c *gin.Context) {
 		return
 	}
 	// 5. Exchange code for token
+	if providerName == "oidc" {
+		var payload oauthFlowPayload
+		if common.UnmarshalJsonStr(pendingFlow.Payload, &payload) != nil || len(payload.OIDCPKCEVerifier) != 43 {
+			writeSecurityOperationError(c, model.ErrAuthFlowInvalid)
+			return
+		}
+		proof, cookieErr := c.Cookie(oidcBrowserCookieName(state))
+		digest := fmt.Sprintf("%x", sha256.Sum256([]byte(proof)))
+		if cookieErr != nil || len(proof) != 43 || subtle.ConstantTimeCompare([]byte(digest), []byte(payload.OIDCBrowserHash)) != 1 {
+			writeAccountStatusError(c, http.StatusForbidden, "State parameter is empty or mismatched")
+			return
+		}
+		http.SetCookie(c.Writer, &http.Cookie{Name: oidcBrowserCookieName(state), Path: "/", MaxAge: -1,
+			HttpOnly: true, Secure: common.SessionCookieSecure, SameSite: http.SameSiteLaxMode})
+		c.Set("oidc_pkce_verifier", payload.OIDCPKCEVerifier)
+		c.Set("oidc_nonce", payload.OIDCNonce)
+		c.Set("oidc_client_id", payload.OIDCClientID)
+		c.Set("oidc_issuer", payload.OIDCIssuer)
+		c.Set("oidc_auth_after", payload.OIDCAuthAfter)
+	}
 	code := c.Query("code")
 	token, err := provider.ExchangeToken(c.Request.Context(), code, c)
 	if err != nil {
@@ -397,6 +497,11 @@ func handleOAuthBind(c *gin.Context, providerName string, provider oauth.Provide
 // legacy GitHub binding that still waits for the login verification, it also
 // returns the rewrite to carry into the challenge.
 func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *oauth.OAuthUser, token *oauth.OAuthToken, affiliateCode string) (*model.User, *service.LegacyGitHubMigration, error) {
+	if _, oidc := provider.(*oauth.OIDCProvider); oidc {
+		if os.Getenv("OIDC_REQUIRE_PREPROVISIONED") == "true" && !provider.IsUserIDTaken(oauthUser.ProviderUserID) {
+			return nil, nil, oauth.NewOAuthError(common.NewMessage("Account synchronization is pending. Please try again later."))
+		}
+	}
 	user := &model.User{}
 	if provider.ProviderUserIDColumn() == "telegram_id" {
 		err := provider.FillUserByProviderID(user, oauthUser.ProviderUserID)
@@ -486,7 +591,7 @@ func findOrCreateOAuthUser(c *gin.Context, provider oauth.Provider, oauthUser *o
 	if oauthUser.Username != "" {
 		if exists, err := model.CheckUserExistOrDeleted(oauthUser.Username, ""); err == nil && !exists {
 			// 防止索引退化
-			if len(oauthUser.Username) <= model.UserNameMaxLength {
+			if utf8.RuneCountInString(oauthUser.Username) <= model.UserNameMaxLength {
 				user.Username = oauthUser.Username
 			}
 		}

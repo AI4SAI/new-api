@@ -6,6 +6,14 @@ Copyright (c) QuantumNous and contributors.
 This project is licensed under the GNU Affero General Public License v3.0.
 See LICENSE for the full project license terms.
 
+==== SAI modifications, 2026 ====
+
+This modified version adds longer managed account names, verified OpenID Connect
+login, idempotent account and budget provisioning, and external billing admission
+with immutable usage attribution. Upstream new-api and QuantumNous attribution
+and license terms remain in force. These modifications do not imply upstream
+endorsement.
+
 ==== Additional Terms under AGPLv3 Section 7 ====
 
 Pursuant to Section 7(b) of the GNU Affero General Public License version 3,

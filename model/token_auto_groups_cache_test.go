@@ -11,18 +11,20 @@ import (
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	token := Token{
-		Id:         42,
-		UserId:     7,
-		Key:        "token-auto-groups-cache-key",
-		Name:       "auto-cache",
-		Group:      "auto",
-		AutoGroups: `["vip","default"]`,
+		Id:                42,
+		UserId:            7,
+		Key:               "token-auto-groups-cache-key",
+		Name:              "auto-cache",
+		Group:             "auto",
+		AutoGroups:        `["vip","default"]`,
+		ManagedBindingRef: "11111111-1111-4111-8111-111111111111",
 	}
 
 	require.NoError(t, cacheSetTokenForTest(token))
 	cached, err := cacheGetTokenByKey(token.Key)
 	require.NoError(t, err)
 	assert.Equal(t, token.AutoGroups, cached.AutoGroups)
+	assert.Equal(t, token.ManagedBindingRef, cached.ManagedBindingRef)
 	groups, err := cached.GetAutoGroups()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"vip", "default"}, groups)

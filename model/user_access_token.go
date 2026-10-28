@@ -39,16 +39,18 @@ var legacyAccessTokenRetireAt atomic.Int64
 // SHA-256 fingerprint of the plaintext is stored; it doubles as the audit
 // token_ref.
 type UserAccessToken struct {
-	Id         int    `json:"id"`
-	UserId     int    `json:"-" gorm:"index"`
-	Name       string `json:"name" gorm:"type:varchar(64)"`
-	TokenHash  string `json:"token_ref" gorm:"type:varchar(64);uniqueIndex"`
-	TokenHint  string `json:"token_hint" gorm:"type:varchar(8)"`
-	Scopes     string `json:"-" gorm:"type:varchar(2048)"`
-	ExpiresAt  int64  `json:"expires_at" gorm:"type:bigint;index"`
-	LastUsedAt int64  `json:"last_used_at" gorm:"type:bigint"`
-	LastUsedIp string `json:"last_used_ip" gorm:"type:varchar(64)"`
-	CreatedAt  int64  `json:"created_at" gorm:"type:bigint"`
+	Id          int     `json:"id"`
+	UserId      int     `json:"-" gorm:"index"`
+	Name        string  `json:"name" gorm:"type:varchar(64)"`
+	TokenHash   string  `json:"token_ref" gorm:"type:varchar(64);uniqueIndex"`
+	TokenHint   string  `json:"token_hint" gorm:"type:varchar(8)"`
+	Scopes      string  `json:"-" gorm:"type:varchar(2048)"`
+	ExpiresAt   int64   `json:"expires_at" gorm:"type:bigint;index"`
+	LastUsedAt  int64   `json:"last_used_at" gorm:"type:bigint"`
+	LastUsedIp  string  `json:"last_used_ip" gorm:"type:varchar(64)"`
+	CreatedAt   int64   `json:"created_at" gorm:"type:bigint"`
+	Managed     bool    `json:"managed" gorm:"not null;default:false"`
+	ManagedSlot *string `json:"-" gorm:"type:varchar(64);uniqueIndex"`
 }
 
 func (UserAccessToken) TableName() string {
@@ -99,7 +101,7 @@ func FindUserAccessTokenByHash(hash string) (*UserAccessToken, error) {
 
 func GetUserAccessToken(userID, id int) (*UserAccessToken, error) {
 	var token UserAccessToken
-	err := DB.Where("id = ? AND user_id = ?", id, userID).First(&token).Error
+	err := DB.Where("id = ? AND user_id = ? AND managed = ?", id, userID, false).First(&token).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, ErrAccessTokenNotFound
 	}
@@ -111,7 +113,7 @@ func GetUserAccessToken(userID, id int) (*UserAccessToken, error) {
 
 func ListUserAccessTokens(userID int) ([]UserAccessToken, error) {
 	tokens := make([]UserAccessToken, 0)
-	err := DB.Where("user_id = ?", userID).Order("created_at DESC").Order("id DESC").Find(&tokens).Error
+	err := DB.Where("user_id = ? AND managed = ?", userID, false).Order("created_at DESC").Order("id DESC").Find(&tokens).Error
 	return tokens, err
 }
 
@@ -127,7 +129,7 @@ func CreateUserAccessToken(userID int, token *UserAccessToken, limit int) error 
 			return err
 		}
 		var count int64
-		if err := tx.Model(&UserAccessToken{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		if err := tx.Model(&UserAccessToken{}).Where("user_id = ? AND managed = ?", userID, false).Count(&count).Error; err != nil {
 			return err
 		}
 		if count >= int64(limit) {
@@ -135,6 +137,8 @@ func CreateUserAccessToken(userID int, token *UserAccessToken, limit int) error 
 		}
 		token.Id = 0
 		token.UserId = userID
+		token.Managed = false
+		token.ManagedSlot = nil
 		if token.CreatedAt == 0 {
 			token.CreatedAt = common.GetTimestamp()
 		}
@@ -153,7 +157,7 @@ func UpdateUserAccessToken(userID, id int, name string, scopes []string) (*UserA
 		}
 		updates["scopes"] = grant.Scopes
 	}
-	result := DB.Model(&UserAccessToken{}).Where("id = ? AND user_id = ?", id, userID).Updates(updates)
+	result := DB.Model(&UserAccessToken{}).Where("id = ? AND user_id = ? AND managed = ?", id, userID, false).Updates(updates)
 	if result.Error != nil {
 		return nil, result.Error
 	}
@@ -169,7 +173,7 @@ func UpdateUserAccessToken(userID, id int, name string, scopes []string) (*UserA
 func DeleteUserAccessToken(userID, id int) (*UserAccessToken, error) {
 	var token UserAccessToken
 	err := DB.Transaction(func(tx *gorm.DB) error {
-		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", id, userID).First(&token).Error; err != nil {
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ? AND managed = ?", id, userID, false).First(&token).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return ErrAccessTokenNotFound
 			}

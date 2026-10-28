@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"github.com/QuantumNous/new-api/relay/helper"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/gin-gonic/gin"
 )
@@ -54,6 +56,17 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		if err != nil {
 			return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
+		if c.GetString("model_billing_context_ref") != "" {
+			reader, err := storage.NewReader()
+			if err != nil {
+				return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
+			}
+			denied := service.ManagedResponsesBody(c, reader)
+			reader.Close()
+			if denied != nil {
+				return nil, nil, nil, denied
+			}
+		}
 		body := common.NewReplayableBodyReader(storage)
 		return adaptor, body, io.NopCloser(body), nil
 	}
@@ -78,6 +91,9 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		}
 	}
 
+	if denied := service.ManagedResponsesBody(c, bytes.NewReader(jsonData)); denied != nil {
+		return nil, nil, nil, denied
+	}
 	logger.LogDebug(c, "requestBody: %s", jsonData)
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {

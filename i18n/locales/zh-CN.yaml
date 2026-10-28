@@ -90,3 +90,7 @@ channel.upstream_update_added_models: "新增模型示例（展示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "删除模型示例（展示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失败渠道 ID（展示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其余 {{.Count}} 个已省略）"
+
+model.admission_unavailable: "模型账户暂时无法验证"
+model.admission_denied: "当前账户或可用额度不允许此请求"
+model.background_unavailable: "当前模型计费服务不支持后台异步响应"

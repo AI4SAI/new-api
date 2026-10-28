@@ -248,6 +248,9 @@ func RelayTaskSubmit(c *gin.Context, info *relaycommon.RelayInfo) (*TaskSubmitRe
 
 	// 4. 价格计算：基础模型价格
 	info.OriginModelName = modelName
+	if denied := service.AdmitManagedModel(c, modelName, "task"); denied != nil {
+		return nil, service.TaskErrorWrapperLocal(denied, "model_admission_denied", denied.StatusCode)
+	}
 	var priceData types.PriceData
 	var err error
 	pluginKey := c.GetString("task_plugin_key")

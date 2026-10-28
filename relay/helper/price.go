@@ -66,7 +66,7 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hostty
 
 func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens int, meta *types.TokenCountMeta) (hosttypes.PriceData, error) {
 	if info != nil {
-		if matched := resolveBillingModelName(info.GetOriginModelName()); matched != "" && matched != info.OriginModelName {
+		if matched := ResolveBillingModelName(info.GetOriginModelName()); matched != "" && matched != info.OriginModelName {
 			info.BillingModelName = matched
 		}
 	}
@@ -305,7 +305,7 @@ func HasPriceOrRatioEntry(name string) bool {
 	return billing_setting.GetBillingMode(formatted) == billing_setting.BillingModeTieredExpr
 }
 
-func resolveBillingModelName(origin string) string {
+func ResolveBillingModelName(origin string) string {
 	var candidates []string
 	if !reasoning.ParseModelModifiers(origin).HasModifiers() {
 		candidates = append(candidates, origin)

@@ -327,6 +327,7 @@ func setAccessTokenContext(c *gin.Context, lookup *accessTokenLookup) {
 		return
 	}
 	c.Set("access_token_id", lookup.token.Id)
+	c.Set("access_token_managed", lookup.token.Managed)
 	c.Set("access_token_scopes", lookup.token.GetScopes())
 	c.Set(accessTokenIdentityContextKey, service.AuthIdentity{
 		UserID:          lookup.user.Id,
@@ -678,6 +679,7 @@ func SetupContextForToken(c *gin.Context, token *model.Token, parts ...string) e
 	c.Set("token_id", token.Id)
 	c.Set("token_key", token.Key)
 	c.Set("token_name", token.Name)
+	c.Set("managed_binding_ref", token.ManagedBindingRef)
 	c.Set("token_unlimited_quota", token.UnlimitedQuota)
 	if !token.UnlimitedQuota {
 		c.Set("token_quota", token.RemainQuota)

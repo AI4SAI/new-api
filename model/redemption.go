@@ -11,18 +11,20 @@ import (
 )
 
 type Redemption struct {
-	Id           int            `json:"id"`
-	UserId       int            `json:"user_id"`
-	Key          string         `json:"key" gorm:"type:char(32);uniqueIndex"`
-	Status       int            `json:"status" gorm:"default:1"`
-	Name         string         `json:"name" gorm:"index"`
-	Quota        int            `json:"quota" gorm:"default:100"`
-	CreatedTime  int64          `json:"created_time" gorm:"bigint"`
-	RedeemedTime int64          `json:"redeemed_time" gorm:"bigint"`
-	Count        int            `json:"count" gorm:"-:all"` // only for api request
-	UsedUserId   int            `json:"used_user_id"`
-	DeletedAt    gorm.DeletedAt `gorm:"index"`
-	ExpiredTime  int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	Id              int            `json:"id"`
+	UserId          int            `json:"user_id"`
+	Key             string         `json:"key" gorm:"type:char(32);uniqueIndex"`
+	Status          int            `json:"status" gorm:"default:1"`
+	Name            string         `json:"name" gorm:"index"`
+	Quota           int            `json:"quota" gorm:"default:100"`
+	CreatedTime     int64          `json:"created_time" gorm:"bigint"`
+	RedeemedTime    int64          `json:"redeemed_time" gorm:"bigint"`
+	Count           int            `json:"count" gorm:"-:all"` // only for api request
+	UsedUserId      int            `json:"used_user_id"`
+	DeletedAt       gorm.DeletedAt `gorm:"index"`
+	ExpiredTime     int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	ManagedGrantRef *string        `json:"managed_grant_ref,omitempty" gorm:"type:varchar(36);uniqueIndex"`
+	ManagedOwnerID  int            `json:"managed_owner_id,omitempty" gorm:"not null;default:0"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {
@@ -155,6 +157,9 @@ func Redeem(key string, userId int) (quota int, err error) {
 		if redemption.Status != common.RedemptionCodeStatusEnabled {
 			return errors.New("redemption code already used")
 		}
+		if redemption.ManagedOwnerID != 0 && redemption.ManagedOwnerID != userId {
+			return errors.New("redemption account differs")
+		}
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("redemption code expired")
 		}
@@ -198,12 +203,18 @@ func (redemption *Redemption) Insert() error {
 }
 
 func (redemption *Redemption) SelectUpdate() error {
+	if err := redemption.requireMutable(); err != nil {
+		return err
+	}
 	// This can update zero values
 	return DB.Model(redemption).Select("redeemed_time", "status").Updates(redemption).Error
 }
 
 // Update Make sure your token's fields is completed, because this will update non-zero values
 func (redemption *Redemption) Update() error {
+	if err := redemption.requireMutable(); err != nil {
+		return err
+	}
 	if redemption.Quota <= 0 {
 		return errors.New("redemption quota must be positive")
 	}
@@ -216,9 +227,23 @@ func (redemption *Redemption) Update() error {
 }
 
 func (redemption *Redemption) Delete() error {
+	if err := redemption.requireMutable(); err != nil {
+		return err
+	}
 	var err error
 	err = DB.Delete(redemption).Error
 	return err
+}
+
+func (redemption *Redemption) requireMutable() error {
+	var count int64
+	if err := DB.Model(&Redemption{}).Where("id = ? AND managed_grant_ref IS NOT NULL", redemption.Id).Count(&count).Error; err != nil {
+		return err
+	}
+	if count != 0 {
+		return errors.New("managed budget receipts are immutable")
+	}
+	return nil
 }
 
 func DeleteRedemptionById(id int) (err error) {
@@ -235,7 +260,7 @@ func DeleteRedemptionById(id int) (err error) {
 
 func DeleteInvalidRedemptions() (int64, error) {
 	now := common.GetTimestamp()
-	result := DB.Where("status IN ? OR (status = ? AND expired_time != 0 AND expired_time < ?)", []int{common.RedemptionCodeStatusUsed, common.RedemptionCodeStatusDisabled}, common.RedemptionCodeStatusEnabled, now).Delete(&Redemption{})
+	result := DB.Where("managed_grant_ref IS NULL").Where("(status IN ? OR (status = ? AND expired_time != 0 AND expired_time < ?))", []int{common.RedemptionCodeStatusUsed, common.RedemptionCodeStatusDisabled}, common.RedemptionCodeStatusEnabled, now).Delete(&Redemption{})
 	return result.RowsAffected, result.Error
 }
 
@@ -249,6 +274,6 @@ func BatchDeleteRedemptions(ids []int) (int64, error) {
 			return 0, errors.New("redemption IDs must be positive")
 		}
 	}
-	result := DB.Where("id IN ?", ids).Delete(&Redemption{})
+	result := DB.Where("id IN ? AND managed_grant_ref IS NULL", ids).Delete(&Redemption{})
 	return result.RowsAffected, result.Error
 }

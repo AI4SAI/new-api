@@ -2,15 +2,17 @@ package oauth
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"errors"
+	"github.com/coreos/go-oidc/v3/oidc"
+	"golang.org/x/oauth2"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/logger"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/gin-gonic/gin"
@@ -22,15 +24,6 @@ func init() {
 
 // OIDCProvider implements OAuth for OIDC
 type OIDCProvider struct{}
-
-type oidcOAuthResponse struct {
-	AccessToken  string `json:"access_token"`
-	IDToken      string `json:"id_token"`
-	RefreshToken string `json:"refresh_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int    `json:"expires_in"`
-	Scope        string `json:"scope"`
-}
 
 type oidcUser struct {
 	OpenID            string `json:"sub"`
@@ -48,113 +41,117 @@ func (p *OIDCProvider) IsEnabled() bool {
 	return system_setting.GetOIDCSettings().Enabled
 }
 
+// OIDCDiscovery uses the configured issuer and the maintained protocol engine.
+func OIDCDiscovery(ctx context.Context) (*oidc.Provider, context.Context, string, error) {
+	settings := system_setting.GetOIDCSettings()
+	const suffix = "/.well-known/openid-configuration"
+	if !strings.HasSuffix(settings.WellKnown, suffix) {
+		return nil, ctx, "", errors.New("OIDC discovery is required")
+	}
+	issuer := strings.TrimSuffix(settings.WellKnown, suffix)
+	parsed, err := url.Parse(issuer)
+	if err != nil || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Scheme != "https" && !(parsed.Scheme == "http" && (parsed.Hostname() == "localhost" || net.ParseIP(parsed.Hostname()).IsLoopback()))) {
+		return nil, ctx, "", errors.New("OIDC issuer is invalid")
+	}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	requestContext := oidc.ClientContext(ctx, client)
+	provider, err := oidc.NewProvider(requestContext, issuer)
+	if err != nil {
+		return nil, requestContext, issuer, errors.New("OIDC discovery unavailable")
+	}
+	var metadata struct {
+		Authorization string   `json:"authorization_endpoint"`
+		Token         string   `json:"token_endpoint"`
+		JWKS          string   `json:"jwks_uri"`
+		UserInfo      string   `json:"userinfo_endpoint"`
+		PKCE          []string `json:"code_challenge_methods_supported"`
+	}
+	if provider.Claims(&metadata) != nil || !slices.Contains(metadata.PKCE, "S256") {
+		return nil, requestContext, issuer, errors.New("OIDC S256 is required")
+	}
+	for _, endpoint := range []string{metadata.Authorization, metadata.Token, metadata.JWKS, metadata.UserInfo} {
+		u, err := url.Parse(endpoint)
+		if err != nil || u.Host == "" || u.User != nil || u.Fragment != "" ||
+			(u.Scheme != "https" && !(parsed.Scheme == "http" && u.Scheme == "http" &&
+				(u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()))) {
+			return nil, requestContext, issuer, errors.New("OIDC endpoint is invalid")
+		}
+	}
+	return provider, requestContext, issuer, nil
+}
+
 func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Context) (*OAuthToken, error) {
-	if code == "" {
+	settings := system_setting.GetOIDCSettings()
+	verifier, nonce := c.GetString("oidc_pkce_verifier"), c.GetString("oidc_nonce")
+	clientID, expectedIssuer := c.GetString("oidc_client_id"), c.GetString("oidc_issuer")
+	if code == "" || len(verifier) != 43 || len(nonce) != 43 || clientID == "" || clientID != settings.ClientId {
 		return nil, NewOAuthError(common.NewMessage(msgInvalidCode))
 	}
-
-	settings := system_setting.GetOIDCSettings()
-	redirectUri := fmt.Sprintf("%s/oauth/oidc", system_setting.ServerAddress)
-	values := url.Values{}
-	values.Set("client_id", settings.ClientId)
-	values.Set("client_secret", settings.ClientSecret)
-	values.Set("code", code)
-	values.Set("grant_type", "authorization_code")
-	values.Set("redirect_uri", redirectUri)
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken: token_endpoint=%s, redirect_uri=%s", settings.TokenEndpoint, redirectUri)
-
-	req, err := http.NewRequestWithContext(ctx, "POST", settings.TokenEndpoint, strings.NewReader(values.Encode()))
+	provider, requestContext, issuer, err := OIDCDiscovery(ctx)
+	if err != nil || issuer != expectedIssuer {
+		return nil, errors.New("OIDC configuration changed")
+	}
+	endpoint := provider.Endpoint()
+	var methods struct {
+		Auth []string `json:"token_endpoint_auth_methods_supported"`
+	}
+	if provider.Claims(&methods) != nil {
+		return nil, errors.New("OIDC token authentication unavailable")
+	}
+	if len(methods.Auth) == 0 || slices.Contains(methods.Auth, "client_secret_basic") {
+		endpoint.AuthStyle = oauth2.AuthStyleInHeader
+	} else if slices.Contains(methods.Auth, "client_secret_post") {
+		endpoint.AuthStyle = oauth2.AuthStyleInParams
+	} else {
+		return nil, errors.New("OIDC token authentication unavailable")
+	}
+	config := oauth2.Config{ClientID: clientID, ClientSecret: settings.ClientSecret, Endpoint: endpoint,
+		RedirectURL: system_setting.ServerAddress + "/oauth/oidc"}
+	token, err := config.Exchange(requestContext, code, oauth2.VerifierOption(verifier))
 	if err != nil {
-		return nil, err
+		return nil, errors.New("OIDC code exchange failed")
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	client := http.Client{
-		Timeout: 5 * time.Second,
+	raw, ok := token.Extra("id_token").(string)
+	if !ok || raw == "" {
+		return nil, errors.New("OIDC ID token is missing")
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] ExchangeToken error: %s", err.Error()))
-		return nil, NewOAuthErrorWithRaw(common.NewMessage(msgConnectFailed, map[string]any{"provider": "OIDC"}), err.Error())
+	verified, err := provider.Verifier(&oidc.Config{ClientID: clientID}).Verify(requestContext, raw)
+	if err != nil || verified.Subject == "" || verified.Nonce != nonce {
+		return nil, errors.New("OIDC ID token verification failed")
 	}
-	defer res.Body.Close()
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken response status: %d", res.StatusCode)
-
-	var oidcResponse oidcOAuthResponse
-	err = json.NewDecoder(res.Body).Decode(&oidcResponse)
-	if err != nil {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] ExchangeToken decode error: %s", err.Error()))
-		return nil, err
+	var claims struct {
+		AuthorizedParty string `json:"azp"`
+		AuthTime        int64  `json:"auth_time"`
 	}
-
-	if oidcResponse.AccessToken == "" {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] ExchangeToken failed: empty access token"))
-		return nil, NewOAuthError(common.NewMessage(msgTokenFailed, map[string]any{"provider": "OIDC"}))
+	if verified.Claims(&claims) != nil || (claims.AuthorizedParty != "" && claims.AuthorizedParty != clientID) ||
+		(len(verified.Audience) > 1 && claims.AuthorizedParty != clientID) {
+		return nil, errors.New("OIDC audience differs")
 	}
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] ExchangeToken success: scope=%s", oidcResponse.Scope)
-
-	return &OAuthToken{
-		AccessToken:  oidcResponse.AccessToken,
-		TokenType:    oidcResponse.TokenType,
-		RefreshToken: oidcResponse.RefreshToken,
-		ExpiresIn:    oidcResponse.ExpiresIn,
-		Scope:        oidcResponse.Scope,
-		IDToken:      oidcResponse.IDToken,
-	}, nil
+	if after := c.GetInt64("oidc_auth_after"); after != 0 && (claims.AuthTime < after-30 || claims.AuthTime > time.Now().Unix()+60) {
+		return nil, errors.New("OIDC recent authentication is required")
+	}
+	if verified.AccessTokenHash != "" && verified.VerifyAccessToken(token.AccessToken) != nil {
+		return nil, errors.New("OIDC access token differs")
+	}
+	return &OAuthToken{AccessToken: token.AccessToken, TokenType: token.TokenType, RefreshToken: token.RefreshToken,
+		IDToken: raw, ClientID: clientID, VerifiedSubject: verified.Subject, VerifiedIssuer: issuer}, nil
 }
 
 func (p *OIDCProvider) GetUserInfo(ctx context.Context, token *OAuthToken) (*OAuthUser, error) {
-	settings := system_setting.GetOIDCSettings()
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] GetUserInfo: userinfo_endpoint=%s", settings.UserInfoEndpoint)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", settings.UserInfoEndpoint, nil)
-	if err != nil {
-		return nil, err
+	provider, requestContext, issuer, err := OIDCDiscovery(ctx)
+	if err != nil || token.VerifiedSubject == "" || token.VerifiedIssuer != issuer || token.ClientID != system_setting.GetOIDCSettings().ClientId {
+		return nil, errors.New("OIDC identity is not verified")
 	}
-	req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-
-	client := http.Client{
-		Timeout: 5 * time.Second,
+	info, err := provider.UserInfo(requestContext, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token.AccessToken, TokenType: token.TokenType}))
+	if err != nil || info.Subject != token.VerifiedSubject {
+		return nil, errors.New("OIDC UserInfo subject differs")
 	}
-	res, err := client.Do(req)
-	if err != nil {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] GetUserInfo error: %s", err.Error()))
-		return nil, NewOAuthErrorWithRaw(common.NewMessage(msgConnectFailed, map[string]any{"provider": "OIDC"}), err.Error())
+	var claims oidcUser
+	if info.Claims(&claims) != nil {
+		return nil, errors.New("OIDC UserInfo is invalid")
 	}
-	defer res.Body.Close()
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] GetUserInfo response status: %d", res.StatusCode)
-
-	if res.StatusCode != http.StatusOK {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] GetUserInfo failed: status=%d", res.StatusCode))
-		return nil, NewOAuthError(common.NewMessage(msgGetUserFailed))
-	}
-
-	var oidcUser oidcUser
-	err = json.NewDecoder(res.Body).Decode(&oidcUser)
-	if err != nil {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] GetUserInfo decode error: %s", err.Error()))
-		return nil, err
-	}
-
-	if oidcUser.OpenID == "" || oidcUser.Email == "" {
-		logger.LogError(ctx, common.LogText("[OAuth-OIDC] GetUserInfo failed: empty fields (sub=%s, email=%s)", oidcUser.OpenID, oidcUser.Email))
-		return nil, NewOAuthError(common.NewMessage(msgUserInfoEmpty, map[string]any{"provider": "OIDC"}))
-	}
-
-	logger.LogDebug(ctx, "[OAuth-OIDC] GetUserInfo success: sub=%s, username=%s, name=%s, email=%s", oidcUser.OpenID, oidcUser.PreferredUsername, oidcUser.Name, oidcUser.Email)
-
-	return &OAuthUser{
-		ProviderUserID: oidcUser.OpenID,
-		Username:       oidcUser.PreferredUsername,
-		DisplayName:    oidcUser.Name,
-		Email:          oidcUser.Email,
-	}, nil
+	return &OAuthUser{ProviderUserID: model.OIDCIdentityKey(issuer, info.Subject), Username: claims.PreferredUsername, DisplayName: claims.Name, Email: claims.Email}, nil
 }
 
 func (p *OIDCProvider) IsUserIDTaken(providerUserID string) bool {

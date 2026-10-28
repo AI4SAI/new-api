@@ -80,6 +80,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	)
 
 	if relayFormat == types.RelayFormatOpenAIRealtime {
+		if denied := service.AdmitManagedModel(c, common.GetContextKeyString(c, constant.ContextKeyOriginalModel), "realtime"); denied != nil {
+			c.JSON(denied.StatusCode, gin.H{"error": denied.ToOpenAIError()})
+			return
+		}
 		var err error
 		ws, err = upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
@@ -142,6 +146,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 	}()
 
+	kind := "request"
+	c.Set("model_billing_alias", helper.ResolveBillingModelName(relayInfo.OriginModelName))
+	if strings.HasPrefix(c.Request.URL.Path, "/pg/") {
+		kind = "playground"
+	}
+	if relayFormat != types.RelayFormatOpenAIRealtime {
+		if newAPIError = service.AdmitManagedModel(c, relayInfo.OriginModelName, kind); newAPIError != nil {
+			return
+		}
+	}
 	if newAPIError = relay.PrepareRequestBilling(c, relayInfo); newAPIError != nil {
 		return
 	}
@@ -328,8 +342,16 @@ func RelayMidjourney(c *gin.Context) {
 	case relayconstant.RelayModeMidjourneyTaskImageSeed:
 		mjErr = relay.RelayMidjourneyTaskImageSeed(c)
 	case relayconstant.RelayModeSwapFace:
+		if denied := service.AdmitManagedModel(c, relayInfo.OriginModelName, "task"); denied != nil {
+			c.JSON(denied.StatusCode, gin.H{"error": denied.ToOpenAIError()})
+			return
+		}
 		mjErr = relay.RelaySwapFace(c, relayInfo)
 	default:
+		if denied := service.AdmitManagedModel(c, relayInfo.OriginModelName, "task"); denied != nil {
+			c.JSON(denied.StatusCode, gin.H{"error": denied.ToOpenAIError()})
+			return
+		}
 		mjErr = relay.RelayMidjourneySubmit(c, relayInfo)
 	}
 	//err = relayMidjourneySubmit(c, relayMode)

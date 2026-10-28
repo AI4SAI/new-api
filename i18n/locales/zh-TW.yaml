@@ -90,3 +90,7 @@ channel.upstream_update_added_models: "新增模型範例（顯示 {{.Shown}}/{{
 channel.upstream_update_removed_models: "刪除模型範例（顯示 {{.Shown}}/{{.Total}}）：{{.Models}}"
 channel.upstream_update_failed_channels: "失敗管道 ID（顯示 {{.Shown}}/{{.Total}}）：{{.Ids}}"
 channel.upstream_update_more_omitted: "（其餘 {{.Count}} 個已省略）"
+
+model.admission_unavailable: "模型帳戶暫時無法驗證"
+model.admission_denied: "目前帳戶或可用額度不允許此請求"
+model.background_unavailable: "目前模型計費服務不支援背景非同步回應"

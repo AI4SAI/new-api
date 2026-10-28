@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -304,6 +305,17 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if token.ManagedBindingRef != "" {
+		if len(token.ManagedBindingRef) != 36 || (!c.GetBool("access_token_managed") && !requireManagedProvisioner(c)) {
+			if !c.IsAborted() {
+				c.AbortWithStatus(http.StatusForbidden)
+			}
+			return
+		}
+	} else if c.GetBool("access_token_managed") {
+		common.ApiError(c, errors.New("managed model keys require their original binding"))
+		return
+	}
 	if len(token.Name) > 50 {
 		common.ApiErrorT(c, "Token name is too long")
 		return
@@ -364,6 +376,7 @@ func AddToken(c *gin.Context) {
 		AutoGroups:         token.AutoGroups,
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
+	cleanToken.ManagedBindingRef = token.ManagedBindingRef
 	err = cleanToken.Insert()
 	if err != nil {
 		common.ApiError(c, err)

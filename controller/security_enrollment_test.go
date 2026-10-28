@@ -115,6 +115,199 @@ func setupSecurityEnrollmentTest(t *testing.T) (*model.User, service.AuthIdentit
 	return user, identity
 }
 
+func TestManagedOIDCAccountPreservesIdentityAndFunds(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Token{}))
+	keyFile := t.TempDir() + "/provision-key"
+	key := strings.Repeat("k", 48)
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	t.Setenv("MANAGED_ACCOUNT_PROVISION_KEY_FILE", keyFile)
+	settings := system_setting.GetOIDCSettings()
+	previous := *settings
+	t.Cleanup(func() { *settings = previous })
+	settings.WellKnown = "https://identity.example.test/realm/.well-known/openid-configuration"
+	name := "org-" + strings.Repeat("x", 60)
+	require.NoError(t, common.Validate.StructExcept(&model.User{Username: name, DisplayName: name}, "Password"))
+	assert.Error(t, common.Validate.StructExcept(&model.User{Username: name + "x"}, "Password"))
+	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 1234, "display_name": user.Username}).Error)
+	ref := "personal:11111111-1111-4111-8111-111111111111"
+	body := fmt.Sprintf(`{"account_ref":%q,"user_id":%d,"expected_name":%q,"username":%q,"oidc_subject":"native-client-subject","oidc_issuer":"https://identity.example.test/realm"}`, ref, user.Id, user.Username, name)
+	router := gin.New()
+	root := func(c *gin.Context) { c.Set("role", common.RoleRootUser); c.Set("id", 999); c.Next() }
+	router.POST("/user", root, EnsureManagedAccount)
+	router.POST("/user/:id", root, CreateManagedAccessToken)
+	router.POST("/api/token/", middleware.UserAuth(), AddToken)
+	request := func(path, body, credential string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", path, strings.NewReader(body))
+		req.Header.Set("X-Managed-Provisioning-Key", credential)
+		router.ServeHTTP(response, req)
+		return response
+	}
+	require.Equal(t, http.StatusForbidden, request("/user", body, "").Code)
+	for range 2 {
+		require.Contains(t, request("/user", body, key).Body.String(), `"success":true`)
+	}
+	var after model.User
+	require.NoError(t, model.DB.First(&after, user.Id).Error)
+	assert.Equal(t, user.Password, after.Password)
+	assert.Equal(t, 1234, after.Quota)
+	assert.Equal(t, name, after.DisplayName)
+	assert.Equal(t, model.OIDCIdentityKey("https://identity.example.test/realm", "native-client-subject"), after.OidcId)
+	pat := fmt.Sprintf(`{"account_ref":%q,"name":"portal-model-manager-test","scopes":["api_key:read","api_key:write","api_key:reveal","wallet:write"]}`, ref)
+	var issued string
+	for range 2 {
+		response := request(fmt.Sprintf("/user/%d", user.Id), pat, key)
+		require.Contains(t, response.Body.String(), `"success":true`)
+		var value struct {
+			Data struct {
+				Token string `json:"token"`
+			} `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &value))
+		if issued != "" {
+			assert.Equal(t, issued, value.Data.Token)
+		}
+		issued = value.Data.Token
+	}
+	var grants []model.UserAccessToken
+	require.NoError(t, model.DB.Where("user_id = ?", user.Id).Find(&grants).Error)
+	require.Len(t, grants, 1)
+	assert.True(t, grants[0].Managed)
+	modelKey := httptest.NewRequest("POST", "/api/token/", strings.NewReader(`{"name":"managed-model","unlimited_quota":true,"expired_time":-1,"managed_binding_ref":"33333333-3333-4333-8333-333333333333"}`))
+	modelKey.Header.Set("Authorization", "Bearer "+issued)
+	modelKey.Header.Set("New-Api-User", strconv.Itoa(user.Id))
+	createdKey := httptest.NewRecorder()
+	router.ServeHTTP(createdKey, modelKey)
+	require.Contains(t, createdKey.Body.String(), `"success":true`)
+	var nativeKey model.Token
+	require.NoError(t, model.DB.Where("user_id = ?", user.Id).First(&nativeKey).Error)
+	assert.Equal(t, "33333333-3333-4333-8333-333333333333", nativeKey.ManagedBindingRef)
+	_, err := model.DeleteUserAccessToken(user.Id, grants[0].Id)
+	assert.ErrorIs(t, err, model.ErrAccessTokenNotFound)
+	key = strings.Repeat("r", 48)
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	path := fmt.Sprintf("/user/%d", user.Id)
+	require.Contains(t, request(path, pat, key).Body.String(), `"success":false`)
+	rotation := strings.TrimSuffix(pat, "}") + fmt.Sprintf(`,"previous_token_ref":%q}`, model.AccessTokenFingerprint(issued))
+	require.Contains(t, request(path, rotation, key).Body.String(), `"success":true`)
+	var rotated model.UserAccessToken
+	require.NoError(t, model.DB.First(&rotated, grants[0].Id).Error)
+	assert.NotEqual(t, model.AccessTokenFingerprint(issued), rotated.TokenHash)
+	_, err = model.UpdateUserAccessToken(user.Id, grants[0].Id, "personal", nil)
+	assert.ErrorIs(t, err, model.ErrAccessTokenNotFound)
+	require.Contains(t, request("/user", strings.ReplaceAll(body, "native-client-subject", "different-subject"), key).Body.String(), `"success":false`)
+	previousQuota := common.QuotaForNewUser
+	common.QuotaForNewUser = 999
+	t.Cleanup(func() { common.QuotaForNewUser = previousQuota })
+	fresh := `{"account_ref":"org:22222222-2222-4222-8222-222222222222","username":"new-org"}`
+	for range 2 {
+		require.Contains(t, request("/user", fresh, key).Body.String(), `"success":true`)
+	}
+	var created model.User
+	require.NoError(t, model.DB.Where("username = ?", "new-org").First(&created).Error)
+	assert.Zero(t, created.Quota)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.User{}).Where("username = ?", "new-org").Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+}
+
+func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	confirmPaymentComplianceForTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Redemption{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	require.NoError(t, model.ClaimExternalIdentityWithTx(model.DB, "managed-account", "test-owner", user.Id))
+	keyFile, key := t.TempDir()+"/provision-key", strings.Repeat("g", 48)
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	t.Setenv("MANAGED_ACCOUNT_PROVISION_KEY_FILE", keyFile)
+	body := fmt.Sprintf(`{"grant_ref":"11111111-1111-4111-8111-111111111111","user_id":%d,"name":"grant-test","quota":123}`, user.Id)
+	invoke := func(body string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(response)
+		c.Request = httptest.NewRequest("POST", "/api/redemption/managed", strings.NewReader(body))
+		c.Request.Header.Set("X-Managed-Provisioning-Key", key)
+		c.Set("id", 999)
+		c.Set("role", common.RoleRootUser)
+		EnsureManagedRedemption(c)
+		return response
+	}
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() { responses <- invoke(body) }()
+	}
+	var first model.Redemption
+	for range 2 {
+		response := <-responses
+		require.Contains(t, response.Body.String(), `"success":true`)
+		var result struct {
+			Data model.Redemption `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+		if first.Id != 0 {
+			assert.Equal(t, first.Id, result.Data.Id)
+			assert.Equal(t, first.Key, result.Data.Key)
+		}
+		first = result.Data
+	}
+	var receipt model.Redemption
+	require.NoError(t, model.DB.First(&receipt).Error)
+	other := model.User{Username: "other-owner", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Quota: 5, AffCode: "othr"}
+	require.NoError(t, model.DB.Create(&other).Error)
+	_, err := model.Redeem(receipt.Key, other.Id)
+	require.Error(t, err)
+	require.NoError(t, model.DB.First(&other, other.Id).Error)
+	assert.Equal(t, 5, other.Quota)
+	require.NoError(t, model.DB.First(&receipt).Error)
+	assert.Equal(t, common.RedemptionCodeStatusEnabled, receipt.Status)
+	_, err = model.Redeem(receipt.Key, user.Id)
+	require.NoError(t, err)
+	require.Contains(t, invoke(body).Body.String(), `"success":true`)
+	require.Contains(t, invoke(strings.Replace(body, `"quota":123`, `"quota":124`, 1)).Body.String(), `"success":false`)
+	require.NoError(t, model.DB.First(&receipt).Error)
+	assert.Equal(t, common.RedemptionCodeStatusUsed, receipt.Status)
+	assert.Error(t, receipt.Update())
+	assert.Error(t, receipt.Delete())
+	deleted, err := model.BatchDeleteRedemptions([]int{receipt.Id})
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+	deleted, err = model.DeleteInvalidRedemptions()
+	require.NoError(t, err)
+	assert.Zero(t, deleted)
+	var count int64
+	require.NoError(t, model.DB.Model(&model.Redemption{}).Count(&count).Error)
+	assert.EqualValues(t, 1, count)
+	var current model.User
+	require.NoError(t, model.DB.First(&current, user.Id).Error)
+	assert.Equal(t, user.Quota+123, current.Quota)
+}
+
+func TestNativeBillingStatSeparatesPolicyContextsAfterRename(t *testing.T) {
+	setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	ref := "11111111-1111-4111-8111-111111111111"
+	rows := []model.Log{
+		{UserId: 7, TokenId: 13, Username: "old-name", TokenName: "old-key", Type: model.LogTypeConsume, ModelName: "model", Quota: 17, CreatedAt: 100, BillingContextRef: ref},
+		{UserId: 7, TokenId: 13, Username: "renamed", TokenName: "renamed-key", Type: model.LogTypeConsume, ModelName: "base-priced-model", BillingProduct: "model", Quota: 23, CreatedAt: 101, BillingContextRef: ref},
+		{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 31, CreatedAt: 101, BillingContextRef: "22222222-2222-4222-8222-222222222222"},
+		{UserId: 8, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 43, CreatedAt: 101, BillingContextRef: ref},
+	}
+	require.NoError(t, model.LOG_DB.Create(&rows).Error)
+	response := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(response)
+	c.Request = httptest.NewRequest("GET", "/api/log/stat?type=2&user_id=7&token_id=13&model_name=model&start_timestamp=100&end_timestamp=200&billing_context_ref="+ref, nil)
+	GetLogsStat(c)
+	var result struct {
+		Data struct {
+			Quota   int    `json:"quota"`
+			Context string `json:"billing_context_ref"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+	assert.Equal(t, 40, result.Data.Quota)
+	assert.Equal(t, ref, result.Data.Context)
+}
+
 func securityEnrollmentRequest(method, path, body, proof string, identity service.AuthIdentity, handler gin.HandlerFunc) *httptest.ResponseRecorder {
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)

@@ -4,13 +4,15 @@ import "github.com/QuantumNous/new-api/common"
 
 // OAuthToken represents the token received from OAuth provider
 type OAuthToken struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	RefreshToken string `json:"refresh_token,omitempty"`
-	ExpiresIn    int    `json:"expires_in,omitempty"`
-	Scope        string `json:"scope,omitempty"`
-	IDToken      string `json:"id_token,omitempty"`
-	ClientID     string `json:"-"` // Expected OIDC audience from the server-owned flow.
+	VerifiedSubject string `json:"-"`
+	VerifiedIssuer  string `json:"-"`
+	AccessToken     string `json:"access_token"`
+	TokenType       string `json:"token_type"`
+	RefreshToken    string `json:"refresh_token,omitempty"`
+	ExpiresIn       int    `json:"expires_in,omitempty"`
+	Scope           string `json:"scope,omitempty"`
+	IDToken         string `json:"id_token,omitempty"`
+	ClientID        string `json:"-"` // Expected OIDC audience from the server-owned flow.
 }
 
 // OAuthUser represents the user info from OAuth provider

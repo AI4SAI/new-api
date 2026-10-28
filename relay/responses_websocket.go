@@ -265,6 +265,10 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	if apiErr = checkResponsesWSModelAccess(c, modelName); apiErr != nil {
 		return apiErr
 	}
+	c.Set("model_billing_alias", helper.ResolveBillingModelName(modelName))
+	if apiErr = service.AdmitManagedModel(c, modelName, "responses_ws"); apiErr != nil {
+		return apiErr
+	}
 	common.SetContextKey(c, appconstant.ContextKeyOriginalModel, modelName)
 	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())
 	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
