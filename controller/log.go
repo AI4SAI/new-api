@@ -235,7 +235,12 @@ func GetLogsStat(c *gin.Context) {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		filter := model.LogFilter{UserID: &userID, TokenID: &tokenID}
+		filter := model.LogFilter{UserID: &userID, TokenID: &tokenID,
+			IncludeMetering: c.Query("include_metering") == "true" && startTimestamp > 0 &&
+				endTimestamp >= startTimestamp && endTimestamp-startTimestamp <= 3600,
+			Context: c.Request.Context()}
+		// Descriptive metering is bounded independently; longer charge windows
+		// retain their original SUM and explicitly report metering unavailable.
 		if value, exists := c.GetQuery("billing_context_ref"); exists {
 			filter.BillingContextRef = &value
 		}
@@ -252,6 +257,11 @@ func GetLogsStat(c *gin.Context) {
 		"message": "",
 		"data": gin.H{
 			"quota":               stat.Quota,
+			"request_count":       stat.RequestCount,
+			"metering_available":  stat.MeteringAvailable,
+			"input_tokens":        stat.InputTokens,
+			"cache_read_tokens":   stat.CacheReadTokens,
+			"output_tokens":       stat.OutputTokens,
 			"user_id":             c.Query("user_id"),
 			"token_id":            c.Query("token_id"),
 			"billing_context_ref": c.Query("billing_context_ref"),

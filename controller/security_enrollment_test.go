@@ -287,25 +287,91 @@ func TestNativeBillingStatSeparatesPolicyContextsAfterRename(t *testing.T) {
 	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
 	ref := "11111111-1111-4111-8111-111111111111"
 	rows := []model.Log{
-		{UserId: 7, TokenId: 13, Username: "old-name", TokenName: "old-key", Type: model.LogTypeConsume, ModelName: "model", Quota: 17, CreatedAt: 100, BillingContextRef: ref},
-		{UserId: 7, TokenId: 13, Username: "renamed", TokenName: "renamed-key", Type: model.LogTypeConsume, ModelName: "base-priced-model", BillingProduct: "model", Quota: 23, CreatedAt: 101, BillingContextRef: ref},
+		{UserId: 7, TokenId: 13, Username: "old-name", TokenName: "old-key", Type: model.LogTypeConsume, ModelName: "model", Quota: 17, CreatedAt: 100, BillingContextRef: ref,
+			PromptTokens: 100, CompletionTokens: 2, Other: `{"input_tokens_total":120,"cache_tokens":20}`},
+		{UserId: 7, TokenId: 13, Username: "renamed", TokenName: "renamed-key", Type: model.LogTypeConsume, ModelName: "base-priced-model", BillingProduct: "model", Quota: 23, CreatedAt: 101, BillingContextRef: ref,
+			PromptTokens: 200, CompletionTokens: 4, Other: `{"cache_tokens":0}`},
 		{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 31, CreatedAt: 101, BillingContextRef: "22222222-2222-4222-8222-222222222222"},
 		{UserId: 8, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 43, CreatedAt: 101, BillingContextRef: ref},
 	}
 	require.NoError(t, model.LOG_DB.Create(&rows).Error)
 	response := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(response)
-	c.Request = httptest.NewRequest("GET", "/api/log/stat?type=2&user_id=7&token_id=13&model_name=model&start_timestamp=100&end_timestamp=200&billing_context_ref="+ref, nil)
+	c.Request = httptest.NewRequest("GET", "/api/log/stat?include_metering=true&type=2&user_id=7&token_id=13&model_name=model&start_timestamp=100&end_timestamp=200&billing_context_ref="+ref, nil)
 	GetLogsStat(c)
 	var result struct {
 		Data struct {
-			Quota   int    `json:"quota"`
-			Context string `json:"billing_context_ref"`
+			Quota     int    `json:"quota"`
+			Context   string `json:"billing_context_ref"`
+			Requests  int64  `json:"request_count"`
+			Available bool   `json:"metering_available"`
+			Input     *int64 `json:"input_tokens"`
+			Cache     *int64 `json:"cache_read_tokens"`
+			Output    *int64 `json:"output_tokens"`
 		} `json:"data"`
 	}
-	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &result))
+	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
 	assert.Equal(t, 40, result.Data.Quota)
+	assert.True(t, result.Data.Available)
 	assert.Equal(t, ref, result.Data.Context)
+	assert.EqualValues(t, 2, result.Data.Requests)
+	require.NotNil(t, result.Data.Input)
+	require.NotNil(t, result.Data.Cache)
+	require.NotNil(t, result.Data.Output)
+	assert.EqualValues(t, 320, *result.Data.Input)
+	assert.EqualValues(t, 20, *result.Data.Cache)
+	assert.EqualValues(t, 6, *result.Data.Output)
+	longResponse := httptest.NewRecorder()
+	longContext, _ := gin.CreateTestContext(longResponse)
+	longContext.Request = httptest.NewRequest("GET", "/api/log/stat?include_metering=true&type=2&user_id=7&token_id=13&model_name=model&start_timestamp=100&end_timestamp=7300&billing_context_ref="+ref, nil)
+	GetLogsStat(longContext)
+	var longResult struct {
+		Data struct {
+			Quota     int  `json:"quota"`
+			Available bool `json:"metering_available"`
+		} `json:"data"`
+	}
+	require.NoError(t, common.Unmarshal(longResponse.Body.Bytes(), &longResult))
+	assert.Equal(t, http.StatusOK, longResponse.Code)
+	assert.Equal(t, 40, longResult.Data.Quota)
+	assert.False(t, longResult.Data.Available)
+	// Unknown cache usage must not become zero or a partial total.
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("id = ?", rows[1].Id).Update("other", "{}").Error)
+	stat, err := model.SumUsedQuota(2, 100, 200, "model", "", "", 0, "",
+		model.LogFilter{UserID: &rows[0].UserId, TokenID: &rows[0].TokenId, BillingContextRef: &ref, IncludeMetering: true})
+	require.NoError(t, err)
+	assert.Nil(t, stat.CacheReadTokens)
+	assert.Equal(t, 40, stat.Quota)
+	assert.EqualValues(t, 2, stat.RequestCount)
+	for _, other := range []string{"invalid", `{"input_tokens_total":18446744073709551615,"cache_tokens":0}`} {
+		require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("id = ?", rows[1].Id).Update("other", other).Error)
+		stat, err = model.SumUsedQuota(2, 100, 200, "model", "", "", 0, "",
+			model.LogFilter{UserID: &rows[0].UserId, TokenID: &rows[0].TokenId, BillingContextRef: &ref, IncludeMetering: true})
+		require.NoError(t, err)
+		assert.Equal(t, 40, stat.Quota)
+		assert.True(t, stat.MeteringAvailable)
+		assert.Nil(t, stat.InputTokens)
+	}
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("id = ?", rows[1].Id).Update("other", `{"claude":true,"cache_tokens":20,"cache_creation_tokens":5}`).Error)
+	stat, err = model.SumUsedQuota(2, 100, 200, "model", "", "", 0, "",
+		model.LogFilter{UserID: &rows[0].UserId, TokenID: &rows[0].TokenId, BillingContextRef: &ref, IncludeMetering: true})
+	require.NoError(t, err)
+	require.NotNil(t, stat.InputTokens)
+	assert.EqualValues(t, 345, *stat.InputTokens) // 120 total + (200 uncached + 20 cached + 5 cache writes).
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("id = ?", rows[0].Id).Update("other", `{"input_tokens_total":9007199254740991,"cache_tokens":20}`).Error)
+	stat, err = model.SumUsedQuota(2, 100, 200, "model", "", "", 0, "",
+		model.LogFilter{UserID: &rows[0].UserId, TokenID: &rows[0].TokenId, BillingContextRef: &ref, IncludeMetering: true})
+	require.NoError(t, err)
+	assert.Nil(t, stat.InputTokens)
+	assert.Equal(t, 40, stat.Quota)
+	stat, err = model.SumUsedQuota(2, 300, 400, "model", "", "", 0, "",
+		model.LogFilter{UserID: &rows[0].UserId, TokenID: &rows[0].TokenId, BillingContextRef: &ref, IncludeMetering: true})
+	require.NoError(t, err)
+	assert.Zero(t, stat.RequestCount)
+	require.NotNil(t, stat.InputTokens)
+	assert.Zero(t, *stat.InputTokens)
+	require.NotNil(t, stat.CacheReadTokens)
+	assert.Zero(t, *stat.CacheReadTokens)
 }
 
 func securityEnrollmentRequest(method, path, body, proof string, identity service.AuthIdentity, handler gin.HandlerFunc) *httptest.ResponseRecorder {

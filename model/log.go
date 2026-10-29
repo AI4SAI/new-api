@@ -10,6 +10,7 @@ import (
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
+	"github.com/shopspring/decimal"
 
 	"gorm.io/gorm"
 )
@@ -55,29 +56,30 @@ func sanitizeClickHouseLikePattern(input string) (string, error) {
 }
 
 type Log struct {
-	Id                int    `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
-	UserId            int    `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
-	CreatedAt         int64  `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
-	Type              int    `json:"type" gorm:"index:idx_created_at_type"`
-	Content           string `json:"content"`
-	Username          string `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
-	TokenName         string `json:"token_name" gorm:"index;default:''"`
-	ModelName         string `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
-	Quota             int    `json:"quota" gorm:"default:0"`
-	PromptTokens      int    `json:"prompt_tokens" gorm:"default:0"`
-	CompletionTokens  int    `json:"completion_tokens" gorm:"default:0"`
-	UseTime           int    `json:"use_time" gorm:"default:0"`
-	IsStream          bool   `json:"is_stream"`
-	ChannelId         int    `json:"channel" gorm:"index"`
-	ChannelName       string `json:"channel_name" gorm:"->"`
-	TokenId           int    `json:"token_id" gorm:"default:0;index"`
-	BillingContextRef string `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index"`
-	BillingProduct    string `json:"billing_product,omitempty" gorm:"type:varchar(256)"`
-	Group             string `json:"group" gorm:"index"`
-	Ip                string `json:"ip" gorm:"index;default:''"`
-	RequestId         string `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
-	UpstreamRequestId string `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
-	Other             string `json:"other"`
+	Id                int               `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
+	UserId            int               `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
+	CreatedAt         int64             `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
+	Type              int               `json:"type" gorm:"index:idx_created_at_type"`
+	Content           string            `json:"content"`
+	Username          string            `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
+	TokenName         string            `json:"token_name" gorm:"index;default:''"`
+	ModelName         string            `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
+	Quota             int               `json:"quota" gorm:"default:0"`
+	PromptTokens      int               `json:"prompt_tokens" gorm:"default:0"`
+	CompletionTokens  int               `json:"completion_tokens" gorm:"default:0"`
+	UseTime           int               `json:"use_time" gorm:"default:0"`
+	IsStream          bool              `json:"is_stream"`
+	ChannelId         int               `json:"channel" gorm:"index"`
+	ChannelName       string            `json:"channel_name" gorm:"->"`
+	TokenId           int               `json:"token_id" gorm:"default:0;index"`
+	BillingContextRef string            `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index"`
+	BillingProduct    string            `json:"billing_product,omitempty" gorm:"type:varchar(256)"`
+	Group             string            `json:"group" gorm:"index"`
+	Ip                string            `json:"ip" gorm:"index;default:''"`
+	RequestId         string            `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
+	UpstreamRequestId string            `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
+	Other             string            `json:"other"`
+	Metering          *LogTokenMetering `json:"metering,omitempty" gorm:"-"`
 }
 
 // don't use iota, avoid change log type value
@@ -115,6 +117,9 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 
 func formatUserLogs(logs []*Log, startIdx int) {
 	for i := range logs {
+		if logs[i].Type == LogTypeConsume {
+			logs[i].Metering = logs[i].TokenMetering()
+		}
 		logs[i].ChannelName = ""
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
 	}
@@ -125,6 +130,9 @@ func formatUserLogs(logs []*Log, startIdx int) {
 // admin_info. Root callers must not pass their results through this formatter.
 func FormatAdminLogs(logs []*Log) {
 	for i := range logs {
+		if logs[i].Type == LogTypeConsume {
+			logs[i].Metering = logs[i].TokenMetering()
+		}
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityAdmin)
 	}
 }
@@ -133,6 +141,9 @@ func FormatAdminLogs(logs []*Log) {
 // without removing root-only diagnostics.
 func FormatRootLogs(logs []*Log) {
 	for i := range logs {
+		if logs[i].Type == LogTypeConsume {
+			logs[i].Metering = logs[i].TokenMetering()
+		}
 		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityRoot)
 	}
 }
@@ -485,10 +496,15 @@ type LogFilter struct {
 	TokenID           *int
 	BillingContextRef *string
 	BillingProduct    string
+	IncludeMetering   bool
+	Context           context.Context
 }
 
 func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	var err error
+	if f.Context != nil {
+		tx = tx.WithContext(f.Context)
+	}
 	if f.UserID != nil {
 		tx = tx.Where("logs.user_id = ?", *f.UserID)
 	}
@@ -692,13 +708,57 @@ func streamLogs(tx *gorm.DB, order string, fn func(*Log) error) error {
 }
 
 type Stat struct {
-	Quota int `json:"quota"`
-	Rpm   int `json:"rpm"`
-	Tpm   int `json:"tpm"`
+	Quota             int    `json:"quota"`
+	Rpm               int    `json:"rpm"`
+	Tpm               int    `json:"tpm"`
+	RequestCount      int64  `json:"request_count"`
+	InputTokens       *int64 `json:"input_tokens"`
+	CacheReadTokens   *int64 `json:"cache_read_tokens"`
+	OutputTokens      *int64 `json:"output_tokens"`
+	MeteringAvailable bool   `json:"metering_available" gorm:"-"`
+}
+
+// Metering uses the same source rows as the charge. Parse optional metadata in
+// Go so malformed historical JSON or an oversized counter cannot break quota SUM.
+func (stat *Stat) readMetering(query *gorm.DB) {
+	rows, err := query.Session(&gorm.Session{}).Select("quota, prompt_tokens, completion_tokens, other").Rows()
+	if err != nil {
+		common.SysError(common.LogText("failed to query log stat: %s", err.Error()))
+		return
+	}
+	defer rows.Close()
+	total := LogTokenMetering{InputTokens: new(int64), CacheReadTokens: new(int64), OutputTokens: new(int64)}
+	count, quota := int64(0), decimal.Zero
+	for rows.Next() {
+		var entry Log
+		if err = LOG_DB.ScanRows(rows, &entry); err != nil {
+			break
+		}
+		count++
+		quota = quota.Add(decimal.NewFromInt(int64(entry.Quota)))
+		measured := entry.TokenMetering()
+		total.InputTokens = addLogTokenCounts(total.InputTokens, measured.InputTokens)
+		total.CacheReadTokens = addLogTokenCounts(total.CacheReadTokens, measured.CacheReadTokens)
+		total.OutputTokens = addLogTokenCounts(total.OutputTokens, measured.OutputTokens)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	if err != nil {
+		common.SysError(common.LogText("failed to query log stat: %s", err.Error()))
+		return
+	}
+	// A log may arrive or expire between these reads. Do not attach counters from
+	// a different source set to the original charge observation.
+	if count != stat.RequestCount || !quota.Equal(decimal.NewFromInt(int64(stat.Quota))) {
+		return
+	}
+	stat.InputTokens, stat.CacheReadTokens, stat.OutputTokens = total.InputTokens, total.CacheReadTokens, total.OutputTokens
+	stat.MeteringAvailable = true
 }
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string, nativeIdentity ...LogFilter) (stat Stat, err error) {
-	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota")
+	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota, COUNT(*) request_count")
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
@@ -756,6 +816,9 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 	if err := tx.Scan(&stat).Error; err != nil {
 		common.SysError(common.LogText("failed to query log stat: %s", err.Error()))
 		return stat, common.NewMessage("Failed to query statistics")
+	}
+	if len(nativeIdentity) == 1 && nativeIdentity[0].IncludeMetering {
+		stat.readMetering(tx)
 	}
 	var rateStat struct {
 		Rpm int

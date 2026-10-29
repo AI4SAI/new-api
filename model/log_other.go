@@ -9,6 +9,86 @@ import (
 	"github.com/QuantumNous/new-api/common"
 )
 
+// LogTokenMetering reports normalized total input, its cache-read subset and
+// output. Nil means unavailable, never zero. Counters must be exact in JSON/JS.
+type LogTokenMetering struct {
+	InputTokens     *int64 `json:"input_tokens"`
+	CacheReadTokens *int64 `json:"cache_read_tokens"`
+	OutputTokens    *int64 `json:"output_tokens"`
+}
+
+func (metering *LogTokenMetering) validateCacheSubset() {
+	if metering.InputTokens != nil && metering.CacheReadTokens != nil && *metering.CacheReadTokens > *metering.InputTokens {
+		metering.CacheReadTokens = nil
+	}
+}
+
+func logTokenCount(value int64) *int64 {
+	if value < 0 || value > common.MaxWalletQuota {
+		return nil
+	}
+	return &value
+}
+
+func addLogTokenCounts(left, right *int64) *int64 {
+	if left == nil || right == nil || *right > common.MaxWalletQuota-*left {
+		return nil
+	}
+	return logTokenCount(*left + *right)
+}
+
+func logJSONTokenCount(fields map[string]json.RawMessage, key string) *int64 {
+	var value *int64
+	if common.Unmarshal(fields[key], &value) != nil || value == nil {
+		return nil
+	}
+	return logTokenCount(*value)
+}
+
+func (entry *Log) TokenMetering() *LogTokenMetering {
+	result := &LogTokenMetering{OutputTokens: logTokenCount(int64(entry.CompletionTokens))}
+	defer result.validateCacheSubset()
+	fields := map[string]json.RawMessage{}
+	if strings.TrimSpace(entry.Other) != "" && common.UnmarshalJsonStr(entry.Other, &fields) != nil {
+		return result
+	}
+	result.CacheReadTokens = logJSONTokenCount(fields, "cache_tokens")
+	if _, present := fields["input_tokens_total"]; present {
+		result.InputTokens = logJSONTokenCount(fields, "input_tokens_total")
+		return result
+	}
+	var claude bool
+	var semantic string
+	if raw, present := fields["claude"]; present && common.Unmarshal(raw, &claude) != nil {
+		return result
+	}
+	if raw, present := fields["usage_semantic"]; present && common.Unmarshal(raw, &semantic) != nil {
+		return result
+	}
+	result.InputTokens = logTokenCount(int64(entry.PromptTokens))
+	if !claude && semantic != "anthropic" {
+		return result
+	}
+	written := logJSONTokenCount(fields, "cache_write_tokens")
+	if _, present := fields["cache_write_tokens"]; !present {
+		_, short := fields["cache_creation_tokens_5m"]
+		_, long := fields["cache_creation_tokens_1h"]
+		if short || long {
+			// The native writer omits zero-valued split cache-creation buckets.
+			written = new(int64)
+			for _, name := range []string{"cache_creation_tokens_5m", "cache_creation_tokens_1h"} {
+				if _, present := fields[name]; present {
+					written = addLogTokenCounts(written, logJSONTokenCount(fields, name))
+				}
+			}
+		} else {
+			written = logJSONTokenCount(fields, "cache_creation_tokens")
+		}
+	}
+	result.InputTokens = addLogTokenCounts(addLogTokenCounts(result.InputTokens, result.CacheReadTokens), written)
+	return result
+}
+
 const (
 	logOtherAdminInfoKey    = "admin_info"
 	logOtherRootInfoKey     = "root_info"
