@@ -257,7 +257,7 @@ func SendPasswordResetEmail(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if user, err := model.GetUniqueUserByEmail(email); err == nil {
+	if user, err := model.GetUniqueUserByEmail(email); err == nil && !console_setting.ModelServiceOnly(user.Role) {
 		code := common.GenerateVerificationCode(0)
 		common.RegisterVerificationCodeWithKey(email, code, common.PasswordResetPurpose)
 		link := fmt.Sprintf("%s/user/reset?email=%s&token=%s", system_setting.ServerAddress, email, code)
@@ -307,6 +307,11 @@ func ResetPassword(c *gin.Context) {
 		return
 	}
 	if !common.VerifyCodeWithKey(req.Email, req.Token, common.PasswordResetPurpose) {
+		common.ApiErrorT(c, "Password reset link is invalid or has expired")
+		return
+	}
+	user, lookupErr := model.GetUniqueUserByEmail(req.Email)
+	if lookupErr != nil || console_setting.ModelServiceOnly(user.Role) {
 		common.ApiErrorT(c, "Password reset link is invalid or has expired")
 		return
 	}

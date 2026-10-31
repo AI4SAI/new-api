@@ -22,6 +22,7 @@ import type { LoginChallenge } from '@/features/auth/secure-verification/types'
 import type { AdminCapabilities } from '@/lib/admin-permissions'
 
 export type UserPermissions = {
+  model_service_only?: boolean
   sidebar_settings?: boolean
   sidebar_modules?: Record<string, unknown>
   admin_permissions?: AdminCapabilities

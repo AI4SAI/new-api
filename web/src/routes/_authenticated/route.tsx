@@ -20,6 +20,7 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 
 import { AuthenticatedLayout } from '@/components/layout'
 import { resolveAuthentication } from '@/lib/auth-session'
+import { isConsoleRouteAllowed } from '@/lib/nav-modules'
 import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated')({
@@ -37,6 +38,9 @@ export const Route = createFileRoute('/_authenticated')({
         to: '/sign-in',
         search: { redirect: location.href },
       })
+    }
+    if (!isConsoleRouteAllowed(auth.user, location.pathname)) {
+      throw redirect({ to: '/keys', replace: true })
     }
   },
   component: AuthenticatedLayout,

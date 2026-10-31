@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -79,6 +80,7 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	var confirmedUsage *dto.Usage
 	// upstreamFailure is the upstream or conversion failure the client was
 	// told about with response.failed.
 	var upstreamFailure *types.NewAPIError
@@ -156,6 +158,9 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		}
 
 		info.ObserveResponseModel(chunk.Model)
+		if info.RequireConfirmedStreamUsage && service.ConfirmedOpenAIStreamUsage([]byte(data), chunk.Usage, false) {
+			confirmedUsage = chunk.Usage
+		}
 		results, err := service.ConvertStreamResponseChunk(c, info, state, &chunk)
 		if err != nil {
 			if failResponsesStream(err) {
@@ -186,7 +191,18 @@ func OaiChatToResponsesStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	usage := state.Usage()
+	if info.RequireConfirmedStreamUsage {
+		if confirmedUsage != nil {
+			usage = confirmedUsage
+			state.SetUsage(usage)
+		} else {
+			common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+		}
+	}
 	noUpstreamUsage := usage == nil || usage.TotalTokens == 0
+	if confirmedUsage != nil {
+		noUpstreamUsage = false
+	}
 	if upstreamFailure != nil && noUpstreamUsage && state.UsageText() == "" {
 		// The stream failed before any output reached the client, which
 		// already received response.failed: the request is not charged.

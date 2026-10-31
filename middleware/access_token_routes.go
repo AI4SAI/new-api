@@ -3,11 +3,16 @@ package middleware
 import (
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
+	"strings"
 	"sync"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/console_setting"
+	"github.com/gin-gonic/gin"
 )
 
 type accessTokenRuleKind int
@@ -23,13 +28,16 @@ const (
 )
 
 type accessTokenRouteRule struct {
-	kind  accessTokenRuleKind
-	scope string
+	kind                accessTokenRuleKind
+	scope               string
+	modelConsoleAllowed bool
+	accountSettings     bool
 }
 
 var (
-	accessTokenAnyRule     = accessTokenRouteRule{kind: accessTokenRuleAny}
-	accessTokenSessionRule = accessTokenRouteRule{kind: accessTokenRuleSession}
+	accessTokenAnyRule            = accessTokenRouteRule{kind: accessTokenRuleAny}
+	accessTokenSessionRule        = accessTokenRouteRule{kind: accessTokenRuleSession}
+	accessTokenAccountSessionRule = accessTokenRouteRule{kind: accessTokenRuleSession, accountSettings: true}
 )
 
 func accessTokenScopeRule(scope string) accessTokenRouteRule {
@@ -53,7 +61,7 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/oauth/email/bind/resend":   accessTokenScopeRule("account_security:write"),
 	"POST /api/oauth/email/bind":          accessTokenScopeRule("account_security:write"),
 	"POST /api/oauth/wechat/bind":         accessTokenScopeRule("account_security:write"),
-	"POST /api/oauth/telegram/bind/start": accessTokenSessionRule,
+	"POST /api/oauth/telegram/bind/start": accessTokenAccountSessionRule,
 	"GET /api/oauth/:provider":            accessTokenSessionRule,
 	"GET /api/verify/methods":             accessTokenAnyRule,
 	"POST /api/verify":                    accessTokenAnyRule,
@@ -65,15 +73,15 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/user/self/groups":                    accessTokenScopeRule("profile:read"),
 	"GET /api/user/self":                           accessTokenScopeRule("profile:read"),
 	"GET /api/user/models":                         accessTokenScopeRule("profile:read"),
-	"PUT /api/user/self":                           accessTokenScopeRule("profile:write"),
+	"PUT /api/user/self":                           {kind: accessTokenRuleScope, scope: "profile:write", modelConsoleAllowed: true}, // Handler permits only language preferences in model-only mode.
 	"DELETE /api/user/self":                        accessTokenScopeRule("account_security:write"),
-	"GET /api/user/access_tokens":                  accessTokenSessionRule,
-	"GET /api/user/access_tokens/catalog":          accessTokenSessionRule,
-	"GET /api/user/access_tokens/scopes":           accessTokenSessionRule,
-	"POST /api/user/access_tokens":                 accessTokenSessionRule,
-	"PATCH /api/user/access_tokens/:id":            accessTokenSessionRule,
-	"DELETE /api/user/access_tokens/:id":           accessTokenSessionRule,
-	"DELETE /api/user/access_tokens/legacy":        accessTokenSessionRule,
+	"GET /api/user/access_tokens":                  accessTokenAccountSessionRule,
+	"GET /api/user/access_tokens/catalog":          accessTokenAccountSessionRule,
+	"GET /api/user/access_tokens/scopes":           accessTokenAccountSessionRule,
+	"POST /api/user/access_tokens":                 accessTokenAccountSessionRule,
+	"PATCH /api/user/access_tokens/:id":            accessTokenAccountSessionRule,
+	"DELETE /api/user/access_tokens/:id":           accessTokenAccountSessionRule,
+	"DELETE /api/user/access_tokens/legacy":        accessTokenAccountSessionRule,
 	"GET /api/user/passkey":                        accessTokenScopeRule("account_security:read"),
 	"POST /api/user/passkey/register/begin":        accessTokenScopeRule("account_security:write"),
 	"POST /api/user/passkey/register/finish":       accessTokenScopeRule("account_security:write"),
@@ -343,6 +351,21 @@ func AccessTokenRouteRule(key string) (accessTokenRouteRule, bool) {
 	defer permissionRouteRulesMu.RUnlock()
 	rule, ok := permissionRouteRules[key]
 	return rule, ok
+}
+
+// Dashboard sessions and personal PATs share the existing operation scopes.
+// Managed service credentials keep their independently checked grants.
+func enforceUserConsoleRoute(c *gin.Context) bool {
+	if !console_setting.ModelServiceOnly(c.GetInt("role")) || c.GetBool("access_token_managed") {
+		return true
+	}
+	rule, known := AccessTokenRouteRule(c.Request.Method + " " + c.FullPath())
+	if known && !rule.accountSettings && (rule.modelConsoleAllowed || (rule.scope != "profile:write" &&
+		!strings.HasPrefix(rule.scope, "account_security:") && !strings.HasPrefix(rule.scope, "wallet:"))) {
+		return true
+	}
+	abortWithWebMessage(c, http.StatusForbidden, "AUTH_INSUFFICIENT_PRIVILEGE", common.NewMessage("Unauthorized, insufficient privileges"))
+	return false
 }
 
 // AccessTokenRouteRuleKeys lists every declared route key, sorted.

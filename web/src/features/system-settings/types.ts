@@ -358,6 +358,7 @@ export type BillingSettings = {
 }
 
 export type OperationsSettings = {
+  'console_setting.user_model_only': boolean
   DefaultCollapseSidebar: boolean
   DemoSiteEnabled: boolean
   SelfUseModeEnabled: boolean

@@ -16,9 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { isConsoleRouteAllowed, isModelServiceOnly } from '@/lib/nav-modules'
 import type { AuthUser } from '@/stores/auth-store'
 
 const allowedRedirectProtocols = new Set(['http:', 'https:'])
+
+export function resolveLoginRedirect(
+  user: AuthUser,
+  target: unknown,
+  origin: string
+): string {
+  const redirect = sanitizeAuthRedirect(target, origin)
+  if (redirect && isConsoleRouteAllowed(user, redirect)) return redirect
+  return isModelServiceOnly(user) ? '/keys' : '/dashboard'
+}
 
 export function getSavedLanguage(user: AuthUser): string | undefined {
   if (typeof user.language === 'string') {

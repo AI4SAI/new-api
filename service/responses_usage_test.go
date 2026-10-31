@@ -1,13 +1,17 @@
 package service
 
 import (
+	"net/http/httptest"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -28,7 +32,8 @@ func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {
 	} {
 		t.Run(tc.eventType, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
-			accumulator := NewResponsesUsageAccumulator(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			accumulator := NewResponsesUsageAccumulator(c, info)
 			for _, item := range []dto.ResponsesOutput{
 				{Type: dto.BuildInCallWebSearchCall},
 				{Type: dto.BuildInCallFileSearchCall},
@@ -57,6 +62,8 @@ func TestResponsesUsageAccumulatorTerminalAccounting(t *testing.T) {
 			assert.Equal(t, 5, usage.CompletionTokens)
 			assert.Equal(t, 25, usage.TotalTokens)
 			assert.Equal(t, 4, usage.PromptTokensDetails.CachedTokens)
+			assert.False(t, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+			assert.Equal(t, usageBillingPathOpenAI, usageBillingPathForLog(false, usage))
 			require.NotNil(t, usage.BillingUsage)
 			assert.Equal(t, upstream.BillingUsage, usage.BillingUsage)
 			assert.NotSame(t, upstream.BillingUsage, usage.BillingUsage)
@@ -81,7 +88,8 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
 			info.SetEstimatePromptTokens(100)
-			accumulator := NewResponsesUsageAccumulator(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			accumulator := NewResponsesUsageAccumulator(c, info)
 			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: "hello"}, nil)
 			if withUsage {
 				upstream := &dto.Usage{InputTokens: 20, InputTokensDetails: &dto.InputTokenDetails{CachedTokens: 4}}
@@ -90,6 +98,13 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 			}
 			usage := accumulator.Finish()
 			assert.Equal(t, 1, usage.CompletionTokens)
+			local := common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens)
+			assert.True(t, local)
+			other := model.NewLogOther()
+			AppendRelayLogAdminInfo(c, info, other)
+			appendUsageBillingPathForLog(other, local, usage)
+			adminInfo := other.Snapshot()["admin_info"].(map[string]any)
+			assert.Equal(t, true, adminInfo["local_count_tokens"])
 			if withUsage {
 				assert.Equal(t, 20, usage.PromptTokens)
 				assert.Equal(t, 21, usage.TotalTokens)
@@ -100,9 +115,11 @@ func TestResponsesUsageAccumulatorInterruptedTextFallback(t *testing.T) {
 				require.True(t, ok)
 				assert.Equal(t, 4, canonical.PromptTokensDetails.CachedTokens)
 				assert.Equal(t, 1, canonical.CompletionTokens)
+				assert.Equal(t, usageBillingPathOpenAIEstimated, adminInfo["usage_billing_path"])
 			} else {
 				assert.Equal(t, 100, usage.PromptTokens)
 				assert.Equal(t, 101, usage.TotalTokens)
+				assert.Equal(t, usageBillingPathLocal, adminInfo["usage_billing_path"])
 			}
 			accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.output_text.delta", Delta: " late output"}, nil)
 			assert.Equal(t, usage, accumulator.Finish())
@@ -141,7 +158,8 @@ func TestObserveResponsesOutcomeRecordsProtocolFacts(t *testing.T) {
 
 func TestResponsesUsageAccumulatorDisconnectBillsCompletedImage(t *testing.T) {
 	info := &relaycommon.RelayInfo{OriginModelName: "gpt-5.1", StreamStatus: relaycommon.NewStreamStatus()}
-	accumulator := NewResponsesUsageAccumulator(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	accumulator := NewResponsesUsageAccumulator(c, info)
 	accumulator.Observe(&dto.ResponsesStreamResponse{
 		Type: dto.ResponsesOutputTypeItemDone,
 		Item: &dto.ResponsesOutput{ID: "complete-image", Type: dto.ResponsesOutputTypeImageGenerationCall, Status: "completed", Result: "final-image-data"},
@@ -263,6 +281,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 		events         []dto.ResponsesStreamResponse
 		wantPrompt     int
 		wantCompletion int
+		wantLocal      bool
 	}{
 		{
 			name: "tool call stream cut before terminal usage",
@@ -274,6 +293,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 			},
 			wantPrompt:     100,
 			wantCompletion: tokenkit.Count(model, summary+arguments),
+			wantLocal:      true,
 		},
 		{
 			name: "created only then disconnect bills the prompt",
@@ -281,6 +301,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 				{Type: "response.created", Response: inProgress},
 			},
 			wantPrompt: 100,
+			wantLocal:  true,
 		},
 		{
 			name: "incomplete without usage bills the prompt",
@@ -289,6 +310,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 				{Type: "response.incomplete", Response: &dto.OpenAIResponsesResponse{Status: []byte(`"incomplete"`)}},
 			},
 			wantPrompt: 100,
+			wantLocal:  true,
 		},
 		{
 			name: "completed without usage estimates from terminal output",
@@ -304,6 +326,7 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 			},
 			wantPrompt:     100,
 			wantCompletion: tokenkit.Count(model, "final answer"),
+			wantLocal:      true,
 		},
 		{
 			name: "explicit failure without usage bills nothing",
@@ -329,7 +352,8 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 				StreamStatus: relaycommon.NewStreamStatus(),
 			}
 			info.SetEstimatePromptTokens(100)
-			accumulator := NewResponsesUsageAccumulator(info)
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			accumulator := NewResponsesUsageAccumulator(c, info)
 			for i := range tc.events {
 				accumulator.Observe(&tc.events[i], nil)
 			}
@@ -337,6 +361,59 @@ func TestResponsesUsageAccumulatorMissingUsageEstimation(t *testing.T) {
 			assert.Equal(t, tc.wantPrompt, usage.PromptTokens)
 			assert.Equal(t, tc.wantCompletion, usage.CompletionTokens)
 			assert.Equal(t, tc.wantPrompt+tc.wantCompletion, usage.TotalTokens)
+			assert.Equal(t, tc.wantLocal, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
 		})
 	}
+}
+
+func TestConfirmedResponsesUsagePreservesZeroAndRejectsIncompleteSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		confirmed bool
+	}{
+		{"explicit zero", `{"input_tokens":0,"output_tokens":0,"total_tokens":0}`, true},
+		{"optional cache absent", `{"input_tokens":7,"output_tokens":5}`, true},
+		{"known cache", `{"input_tokens":7,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}`, true},
+		{"missing usage", `null`, false},
+		{"empty usage", `{}`, false},
+		{"missing output", `{"input_tokens":7}`, false},
+		{"negative count", `{"input_tokens":-1,"output_tokens":5}`, false},
+		{"inconsistent total", `{"input_tokens":7,"output_tokens":5,"total_tokens":11}`, false},
+		{"cache exceeds input", `{"input_tokens":7,"output_tokens":5,"input_tokens_details":{"cached_tokens":8}}`, false},
+		{"different billing snapshot", `{"input_tokens":7,"output_tokens":5,"billing_usage":{"source":"oai_responses","semantic":"openai","openai_usage":{"input_tokens":700,"output_tokens":5}}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := []byte(`{"type":"response.completed","response":{"status":"completed","usage":` + tc.raw + `}}`)
+			var event dto.ResponsesStreamResponse
+			require.NoError(t, common.Unmarshal(raw, &event))
+			assert.Equal(t, tc.confirmed, ConfirmedOpenAIStreamUsage(raw, event.Response.Usage, true))
+			c, _ := gin.CreateTestContext(httptest.NewRecorder())
+			info := &relaycommon.RelayInfo{RequireConfirmedStreamUsage: true, StreamStatus: relaycommon.NewStreamStatus()}
+			info.SetEstimatePromptTokens(100)
+			accumulator := NewResponsesUsageAccumulator(c, info)
+			accumulator.Observe(&event, raw)
+			usage := accumulator.Finish()
+			assert.Equal(t, !tc.confirmed, common.GetContextKeyBool(c, constant.ContextKeyLocalCountTokens))
+			if tc.confirmed && event.Response.Usage.InputTokens == 0 {
+				assert.Zero(t, usage.TotalTokens, "explicit upstream zero must not become an estimate")
+			}
+			assert.Same(t, usage, accumulator.Finish())
+		})
+	}
+
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	info := &relaycommon.RelayInfo{RequireConfirmedStreamUsage: true, StreamStatus: relaycommon.NewStreamStatus()}
+	accumulator := NewResponsesUsageAccumulator(c, info)
+	for _, raw := range []string{
+		`{"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":5,"input_tokens_details":{"cached_tokens":3}}}}`,
+		`{"type":"response.completed","response":{"usage":{"input_tokens":700}}}`,
+	} {
+		var event dto.ResponsesStreamResponse
+		require.NoError(t, common.Unmarshal([]byte(raw), &event))
+		accumulator.Observe(&event, []byte(raw))
+	}
+	usage := accumulator.Finish()
+	assert.Equal(t, 7, usage.PromptTokens)
+	assert.Equal(t, 5, usage.CompletionTokens)
+	assert.Equal(t, 3, usage.PromptTokensDetails.CachedTokens)
 }

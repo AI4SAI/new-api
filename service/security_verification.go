@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
+	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"gorm.io/gorm"
 )
@@ -311,6 +312,9 @@ type VerificationRequirements struct {
 // securityVerificationPolicy is the only operation-to-method policy. Device
 // support and disabled providers never turn an enrolled factor into an absent one.
 func securityVerificationPolicy(scope string, state model.UserVerificationState) ([]VerificationMethodOption, error) {
+	if console_setting.ModelServiceOnly(state.Role) && scope != VerificationScopeLogin {
+		return nil, ErrVerificationForbidden
+	}
 	var methods []string
 	if state.HasTwoFA {
 		methods = append(methods, VerificationMethodTwoFA)

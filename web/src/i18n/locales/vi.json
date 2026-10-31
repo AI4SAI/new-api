@@ -7329,5 +7329,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom"
   },
-  "Account synchronization is pending. Please try again later.": "Tài khoản đang được đồng bộ. Vui lòng thử lại sau."
+  "Account synchronization is pending. Please try again later.": "Tài khoản đang được đồng bộ. Vui lòng thử lại sau.",
+  "Limit ordinary users to models, API Keys and usage": "Chỉ cho phép người dùng thông thường truy cập mô hình, khóa API và mức sử dụng",
+  "Token usage was not confirmed; no token charge was applied": "Chưa xác nhận được lượng token sử dụng; không tính phí token"
 }

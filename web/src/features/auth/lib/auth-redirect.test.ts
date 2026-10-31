@@ -18,9 +18,14 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { describe, expect, test } from 'vitest'
 
+import { isConsoleRouteAllowed } from '@/lib/nav-modules'
 import type { AuthUser } from '@/stores/auth-store'
 
-import { getSavedLanguage, sanitizeAuthRedirect } from './auth-redirect'
+import {
+  getSavedLanguage,
+  resolveLoginRedirect,
+  sanitizeAuthRedirect,
+} from './auth-redirect'
 
 const origin = 'https://dashboard.example.com'
 
@@ -87,5 +92,52 @@ describe('saved authentication language', () => {
     expect(getSavedLanguage({ ...user, setting: { language: 123 } })).toBe(
       undefined
     )
+  })
+})
+
+describe('model service console navigation', () => {
+  const user: AuthUser = {
+    id: 1,
+    username: 'user',
+    role: 1,
+    permissions: { model_service_only: true },
+  }
+
+  test('preserves organization key and model detail destinations', () => {
+    for (const target of [
+      '/keys?workspace_key=org%3Aexample',
+      '/pricing/deepseek-flash',
+      '/usage-logs/common',
+    ]) {
+      expect(resolveLoginRedirect(user, target, origin)).toBe(target)
+      expect(isConsoleRouteAllowed(user, target)).toBe(true)
+    }
+  })
+
+  test('direct routes and login returns cannot reopen hidden account pages', () => {
+    for (const target of [
+      '/profile',
+      '/wallet?show_history=true',
+      '/security',
+      '/dashboard',
+      '/console/personal',
+      '/keys-other',
+      '/usage-logs/audit',
+      '/usage-logs/task',
+      '/usage-logs/drawing',
+      '/usage-logs/new-feature',
+      '/pricing/model/new-feature',
+    ]) {
+      expect(isConsoleRouteAllowed(user, target)).toBe(false)
+      expect(resolveLoginRedirect(user, target, origin)).toBe('/keys')
+    }
+    expect(resolveLoginRedirect(user, undefined, origin)).toBe('/keys')
+    expect(
+      resolveLoginRedirect(
+        { ...user, role: 100, permissions: { model_service_only: false } },
+        '/security',
+        origin
+      )
+    ).toBe('/security')
   })
 })

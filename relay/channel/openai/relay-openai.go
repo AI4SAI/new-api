@@ -119,6 +119,8 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 	var usage = &dto.Usage{}
 	var lastStreamData string
 	var secondLastStreamData string // 保留倒数第二个stream data；部分兼容网关把完整usage放在倒数第二个事件
+	var confirmedUsage *dto.Usage
+	var confirmedUsageFrame string
 	seenStreamToolCalls := make(map[string]struct{})
 	var streamFunctionCallNames []string
 
@@ -135,6 +137,14 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 			}
 
 			lastStreamData = data
+			if info.RequireConfirmedStreamUsage {
+				var chunk struct {
+					Usage *dto.Usage `json:"usage"`
+				}
+				if common.UnmarshalJsonStr(data, &chunk) == nil && service.ConfirmedOpenAIStreamUsage([]byte(data), chunk.Usage, false) {
+					confirmedUsage, confirmedUsageFrame = chunk.Usage, data
+				}
+			}
 			observeStreamChoices(info, data, seenStreamToolCalls, &streamFunctionCallNames)
 			if err := processTokenData(info, data, &responseTextBuilder, &toolCount); err != nil {
 				logger.LogError(c, common.LogText("error processing stream token data: %s", err.Error()))
@@ -181,6 +191,12 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		}
 	}
 
+	if info.RequireConfirmedStreamUsage {
+		containStreamUsage = confirmedUsage != nil
+		if containStreamUsage {
+			usage, usageFrame = confirmedUsage, confirmedUsageFrame
+		}
+	}
 	if !containStreamUsage {
 		usage = service.ResponseText2Usage(c, responseTextBuilder.String(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		usage.CompletionTokens += toolCount * 7

@@ -7329,5 +7329,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom"
   },
-  "Account synchronization is pending. Please try again later.": "Аккаунт синхронизируется. Повторите попытку позже."
+  "Account synchronization is pending. Please try again later.": "Аккаунт синхронизируется. Повторите попытку позже.",
+  "Limit ordinary users to models, API Keys and usage": "Ограничить обычных пользователей моделями, API-ключами и использованием",
+  "Token usage was not confirmed; no token charge was applied": "Использование токенов не подтверждено; плата за токены не начислена"
 }

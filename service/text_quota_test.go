@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,7 +81,7 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 			model.DB, model.LOG_DB = db, logDB
 			common.SetDatabaseTypes(dialect.name, dialect.name)
 			t.Cleanup(func() { model.DB, model.LOG_DB = oldDB, oldLogDB; common.SetDatabaseTypes(oldMainType, oldLogType) })
-			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}))
+			require.NoError(t, db.AutoMigrate(&model.User{}, &model.Token{}, &model.Channel{}, &model.SubscriptionPlan{}, &model.UserSubscription{}, &model.SubscriptionPreConsumeRecord{}))
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			versionQuery := "select version()"
 			if dialect.name == common.DatabaseTypeSQLite {
@@ -98,25 +99,51 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 	t.Helper()
 	const mixed = `len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2)`
 	const flat = `tier("request", fixed(0.01))`
+	const tokenExpression = `tier("tokens", p * 2 + c * 8 + cr * 0.2)`
 	const startingQuota = 2_000_000
+	mixedUsage := &dto.Usage{PromptTokens: 20, CompletionTokens: 1, TotalTokens: 21, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 4}}
+	mixedUsage.BillingUsage = dto.NewOpenAIChatBillingUsage(mixedUsage)
+	mixedUsage.BillingUsage.Estimated = true
 	const imageExpression = `tier("standard", p * 5 + cr * 1.25 + img * 8 + img_cr * 2 + c * 30)`
 	imageUsage := &dto.Usage{PromptTokens: 1000, CompletionTokens: 100, TotalTokens: 1100,
 		PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 300, ImageTokens: 600, CachedTokensDetails: &dto.CachedTokenDetails{ImageTokens: common.GetPointer(200)}}}
 	operation_setting.SetToolPriceForTest("fixed_billing_tool", 4)
 	t.Cleanup(func() { operation_setting.DeleteToolPriceForTest("fixed_billing_tool") })
 	for index, tc := range []struct {
-		name, expression                          string
-		estimate                                  int
-		usage                                     *dto.Usage
-		audio, stream, refund, insufficient, tool bool
-		realtime, reserveInsufficient             bool
-		wallet, outboundImages                    int
-		groupRatio                                float64
-		want                                      int
-		unit                                      billingexpr.BillingUnit
-		requestedImages, actualImages             int
-		searchLog                                 *relaycommon.DirectSearchLog
+		name, expression                                string
+		estimate                                        int
+		usage                                           *dto.Usage
+		audio, stream, refund, insufficient, tool       bool
+		realtime, reserveInsufficient                   bool
+		confirmedOnly, localUsage, subscription, waived bool
+		wallet, outboundImages                          int
+		groupRatio                                      float64
+		want                                            int
+		unit                                            billingexpr.BillingUnit
+		requestedImages, actualImages                   int
+		searchLog                                       *relaycommon.DirectSearchLog
 	}{
+		{name: "confirmed-only missing usage returns wallet reservation", expression: tokenExpression, estimate: 100,
+			stream: true, confirmedOnly: true, waived: true, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only local usage returns wallet and token reservation", expression: tokenExpression, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}, stream: true, confirmedOnly: true, localUsage: true, waived: true, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only local usage returns subscription and token reservation", expression: tokenExpression, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}, stream: true, confirmedOnly: true, localUsage: true, subscription: true, waived: true, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only mixed usage waives the token component", expression: tokenExpression, estimate: 100,
+			usage: mixedUsage, stream: true, confirmedOnly: true, waived: true, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only cached usage still charges", expression: tokenExpression, estimate: 100,
+			usage:  &dto.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, PromptTokensDetails: dto.InputTokenDetails{CachedTokens: 80}},
+			stream: true, confirmedOnly: true, want: 68, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only explicit zero usage stays zero", expression: tokenExpression, estimate: 100,
+			usage: &dto.Usage{}, stream: true, confirmedOnly: true, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only tools remain charged without token usage", expression: tokenExpression, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, stream: true, confirmedOnly: true, localUsage: true, tool: true, waived: true, want: 2000, unit: billingexpr.BillingUnitToken},
+		{name: "default policy keeps estimated charges", expression: tokenExpression, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110}, stream: true, localUsage: true, want: 140, unit: billingexpr.BillingUnitToken},
+		{name: "confirmed-only independent per-request price is unchanged", expression: flat, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, stream: true, confirmedOnly: true, localUsage: true, want: 5000, unit: billingexpr.BillingUnitRequest},
+		{name: "confirmed-only cannot select a fixed tier from estimated length", expression: mixed, estimate: 100,
+			usage: &dto.Usage{PromptTokens: 100, TotalTokens: 100}, stream: true, confirmedOnly: true, localUsage: true, waived: true, unit: billingexpr.BillingUnitRequest},
 		{name: "missing usage charges once", expression: flat, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "zero usage charges once", expression: flat, usage: &dto.Usage{}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "Search metadata keeps zero-token request charge", expression: `tier("request", fixed(0.00075))`,
@@ -181,8 +208,28 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			snapshot.EstimatedImageCount = trace.ImageCount
 			info := &relaycommon.RelayInfo{UserId: user.Id, TokenId: token.Id, TokenKey: token.Key, ChannelMeta: &relaycommon.ChannelMeta{ChannelId: channel.Id}, OriginModelName: "fixed-test", UsingGroup: "default", UserGroup: "default", UserSetting: dto.UserSetting{BillingPreference: "wallet_only"}, ForcePreConsume: true, StartTime: time.Now(), IsStream: tc.stream, RelayFormat: types.RelayFormatOpenAI, PriceData: hosttypes.PriceData{GroupRatioInfo: hosttypes.GroupRatioInfo{GroupRatio: group}}, TieredBillingSnapshot: snapshot, BillingRequestInput: request}
 			info.SetEstimatePromptTokens(tc.estimate)
+			info.RequireConfirmedStreamUsage = tc.confirmedOnly
+			var subscription model.UserSubscription
+			if tc.subscription {
+				plan := model.SubscriptionPlan{Title: "confirmed-usage-test", QuotaResetPeriod: model.SubscriptionResetNever, TotalAmount: startingQuota}
+				require.NoError(t, db.Create(&plan).Error)
+				subscription = model.UserSubscription{UserId: user.Id, PlanId: plan.Id, AmountTotal: startingQuota,
+					Status: "active", StartTime: time.Now().Unix(), EndTime: time.Now().Add(time.Hour).Unix()}
+				require.NoError(t, db.Create(&subscription).Error)
+				info.UserSetting.BillingPreference = "subscription_only"
+				info.RequestId = fmt.Sprintf("confirmed-usage-%d-%s", user.Id, common.MainDatabaseType())
+				t.Cleanup(func() {
+					require.NoError(t, db.Where("user_id = ?", user.Id).Delete(&model.SubscriptionPreConsumeRecord{}).Error)
+					require.NoError(t, db.Delete(&subscription).Error)
+					require.NoError(t, db.Delete(&plan).Error)
+					model.InvalidateSubscriptionPlanCache(plan.Id)
+				})
+			}
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
+			if tc.localUsage {
+				common.SetContextKey(ctx, constant.ContextKeyLocalCountTokens, true)
+			}
 			if tc.searchLog != nil {
 				ctx.Request.URL.Path = "/v1/tools/search"
 				info.RelayMode, info.OriginModelName, info.SearchRequest = relayconstant.RelayModeToolsSearch, constant.DeepSeekSearchModel, tc.searchLog
@@ -199,7 +246,11 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 				require.Nil(t, apiErr)
 				held, err := model.GetUserQuota(user.Id, true)
 				require.NoError(t, err)
-				assert.Equal(t, quota-reservation, held)
+				if tc.subscription {
+					assert.Equal(t, quota, held)
+				} else {
+					assert.Equal(t, quota-reservation, held)
+				}
 				if tc.outboundImages > 0 {
 					reserveErr := PrepareImageBillingForRequest(ctx, info, tc.outboundImages)
 					if tc.reserveInsufficient {
@@ -245,14 +296,26 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 						PostTextConsumeQuota(ctx, info, tc.usage, nil)
 					}
 					require.NoError(t, info.Billing.Settle(tc.want), "a repeated settlement must not charge again")
+					info.Billing.Refund(ctx)
 					var log model.Log
 					require.NoError(t, logDB.Where("user_id = ?", user.Id).Take(&log).Error)
 					assert.Equal(t, tc.want, log.Quota)
 					assert.Equal(t, tc.stream, log.IsStream)
-					assert.NotContains(t, log.Content, "nothing was charged")
+					assert.Equal(t, tc.waived, strings.Contains(log.Content, "Token usage was not confirmed"))
 					var other map[string]any
 					require.NoError(t, common.UnmarshalJsonStr(log.Other, &other))
-					assert.Equal(t, string(tc.unit), other["billing_unit"])
+					if tc.waived {
+						adminInfo, ok := other["admin_info"].(map[string]any)
+						require.True(t, ok)
+						assert.NotEqual(t, usageBillingPathUpstream, adminInfo["usage_billing_path"])
+						if tc.usage == nil {
+							assert.Equal(t, true, adminInfo["local_count_tokens"])
+							assert.Equal(t, usageBillingPathLocal, adminInfo["usage_billing_path"])
+						}
+					}
+					if tc.usage != nil || !tc.waived {
+						assert.Equal(t, string(tc.unit), other["billing_unit"])
+					}
 					if tc.searchLog != nil {
 						assert.Equal(t, map[string]any{"query": tc.searchLog.Query, "count": float64(8),
 							"need_content": false, "result_count": float64(3), "outcome": "success"}, other["search_request"])
@@ -309,11 +372,17 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			}
 			require.NoError(t, db.First(&user, user.Id).Error)
 			require.NoError(t, db.First(&token, token.Id).Error)
-			assert.Equal(t, quota-tc.want, user.Quota)
+			if tc.subscription {
+				require.NoError(t, db.First(&subscription, subscription.Id).Error)
+				assert.Equal(t, int64(tc.want), subscription.AmountUsed)
+				assert.Equal(t, quota, user.Quota)
+			} else {
+				assert.Equal(t, quota-tc.want, user.Quota)
+			}
 			assert.Equal(t, startingQuota-tc.want, token.RemainQuota)
 			assert.Equal(t, tc.want, user.UsedQuota)
 			assert.Equal(t, tc.want, token.UsedQuota)
-			if !tc.refund && !tc.insufficient {
+			if !tc.refund && !tc.insufficient && (tc.usage == nil || tc.usage.TotalTokens != 0 || tc.unit == billingexpr.BillingUnitRequest) {
 				assert.Equal(t, 1, user.RequestCount)
 			}
 		})

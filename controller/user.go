@@ -18,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -528,9 +529,10 @@ func buildSelfUserData(user *model.User) map[string]any {
 // 计算用户权限的辅助函数
 func calculateUserPermissions(userRole int) map[string]any {
 	permissions := map[string]any{}
+	permissions["model_service_only"] = console_setting.ModelServiceOnly(userRole)
 
 	// 根据用户角色计算权限
-	if userRole == common.RoleRootUser {
+	if userRole == common.RoleRootUser || console_setting.ModelServiceOnly(userRole) {
 		// 超级管理员不需要边栏设置功能
 		permissions["sidebar_settings"] = false
 		permissions["sidebar_modules"] = map[string]any{}
@@ -783,6 +785,13 @@ func UpdateSelf(c *gin.Context) {
 	if err := common.DecodeJson(c.Request.Body, &requestData); err != nil {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
+	}
+	if console_setting.ModelServiceOnly(c.GetInt("role")) {
+		_, languageOnly := requestData["language"].(string)
+		if len(requestData) != 1 || !languageOnly {
+			common.ApiErrorStatus(c, http.StatusForbidden, service.ErrVerificationForbidden)
+			return
+		}
 	}
 
 	passwordRequested := false

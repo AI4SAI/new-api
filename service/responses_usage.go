@@ -5,10 +5,12 @@ import (
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/relayconvert"
 	"github.com/QuantumNous/new-api/tokenkit"
+	"github.com/gin-gonic/gin"
 )
 
 // ResponsesUsageAccumulator owns the accounting facts for one Responses stream.
@@ -16,6 +18,7 @@ import (
 // Finish's usage through the normal text billing path, including interrupted
 // streams. Observe and Finish must be called by the same stream owner.
 type ResponsesUsageAccumulator struct {
+	context        *gin.Context
 	info           *relaycommon.RelayInfo
 	usage          *dto.Usage
 	outputText     strings.Builder
@@ -23,10 +26,11 @@ type ResponsesUsageAccumulator struct {
 	imageCommitted bool
 	started        bool
 	finished       bool
+	confirmedUsage bool
 }
 
-func NewResponsesUsageAccumulator(info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
-	return &ResponsesUsageAccumulator{info: info, usage: &dto.Usage{}}
+func NewResponsesUsageAccumulator(c *gin.Context, info *relaycommon.RelayInfo) *ResponsesUsageAccumulator {
+	return &ResponsesUsageAccumulator{context: c, info: info, usage: &dto.Usage{}}
 }
 
 // Observe feeds one decoded stream event. raw is the same event's wire bytes;
@@ -43,7 +47,13 @@ func (a *ResponsesUsageAccumulator) Observe(event *dto.ResponsesStreamResponse, 
 	switch event.Type {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
 		if event.Response != nil {
-			ApplyResponsesUsage(a.usage, event.Response.Usage)
+			if a.info.RequireConfirmedStreamUsage && ConfirmedOpenAIStreamUsage(raw, event.Response.Usage, true) {
+				a.usage = &dto.Usage{}
+				ApplyResponsesUsage(a.usage, event.Response.Usage)
+				a.confirmedUsage = true
+			} else if !a.confirmedUsage {
+				ApplyResponsesUsage(a.usage, event.Response.Usage)
+			}
 			if a.outputText.Len() == 0 {
 				// Some upstreams carry the output only on the terminal event.
 				a.outputText.WriteString(relayconvert.ExtractOutputTextFromResponses(event.Response))
@@ -96,17 +106,22 @@ func (a *ResponsesUsageAccumulator) Finish() *dto.Usage {
 		a.imageCounter.Commit(a.info)
 		a.imageCommitted = true
 	}
-	if a.usage.CompletionTokens == 0 {
+	if a.info.RequireConfirmedStreamUsage && !a.confirmedUsage {
+		common.SetContextKey(a.context, constant.ContextKeyLocalCountTokens, true)
+	}
+	if a.usage.CompletionTokens == 0 && !a.confirmedUsage {
 		if output := a.outputText.String(); output != "" {
 			a.usage.CompletionTokens = tokenkit.Count(a.info.GetUpstreamModelName(), output)
+			common.SetContextKey(a.context, constant.ContextKeyLocalCountTokens, true)
 		}
 	}
 	// Upstream bills the prompt as soon as it starts generating, so a stream
 	// that produced any event but no usage still owes its input tokens unless
 	// upstream reported an explicit failure.
 	billsPrompt := a.usage.CompletionTokens != 0 || (a.started && !a.info.StreamStatus.ResponseFailed())
-	if a.usage.PromptTokens == 0 && billsPrompt {
+	if a.usage.PromptTokens == 0 && billsPrompt && !a.confirmedUsage {
 		a.usage.PromptTokens = a.info.GetEstimatePromptTokens()
+		common.SetContextKey(a.context, constant.ContextKeyLocalCountTokens, true)
 	}
 	a.usage.TotalTokens = a.usage.PromptTokens + a.usage.CompletionTokens
 	if a.usage.BillingUsage != nil {

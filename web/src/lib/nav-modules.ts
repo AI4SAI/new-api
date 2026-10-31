@@ -19,6 +19,27 @@ For commercial licensing, please contact support@quantumnous.com
 import type { QueryClient } from '@tanstack/react-query'
 
 import { readCachedStatus, statusQueryOptions } from '@/lib/status-query'
+import type { AuthUser } from '@/stores/auth-store'
+
+export function isModelServiceOnly(user?: AuthUser | null): boolean {
+  return user?.permissions?.model_service_only === true
+}
+
+// Shared by authenticated route guards, navigation and login redirects.
+export function isConsoleRouteAllowed(
+  user: AuthUser | null | undefined,
+  href: string
+): boolean {
+  if (!isModelServiceOnly(user)) return true
+  const path = href.split(/[?#]/, 1)[0].replace(/\/+$/, '')
+  return (
+    path === '/keys' ||
+    path === '/pricing' ||
+    /^\/pricing\/[^/]+$/.test(path) ||
+    path === '/usage-logs' ||
+    path === '/usage-logs/common'
+  )
+}
 
 export type ModuleAccess = { enabled: boolean; requireAuth: boolean }
 

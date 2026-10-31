@@ -17,7 +17,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, renderHook } from '@testing-library/react'
+import { act, cleanup, renderHook } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -117,6 +117,29 @@ describe('security sidebar visibility', () => {
         .flatMap((group) => group.items)
         .some((item) => item.title === 'Security & Access')
     ).toBe(true)
+  })
+
+  it('model service users only see model keys and usage regardless of sidebar preferences', () => {
+    const { result } = sidebarFor()
+    act(() => {
+      useAuthStore.getState().auth.setUser({
+        id: 1,
+        username: 'alice',
+        role: 1,
+        permissions: { sidebar_settings: false, model_service_only: true },
+      })
+    })
+    const titles = result.current
+      .flatMap((group) => group.items)
+      .map((item) => item.title)
+    expect(titles).not.toContain('Profile')
+    expect(titles).not.toContain('Wallet')
+    expect(titles).not.toContain('Security & Access')
+    expect(titles).not.toContain('Overview')
+    expect(titles).not.toContain('Audit Logs')
+    expect(titles).not.toContain('Task Logs')
+    expect(titles).toContain('API Keys')
+    expect(titles).toContain('Usage Logs')
   })
 })
 

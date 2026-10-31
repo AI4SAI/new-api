@@ -1,8 +1,12 @@
 package console_setting
 
-import "github.com/QuantumNous/new-api/setting/config"
+import (
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/setting/config"
+)
 
 type ConsoleSetting struct {
+	UserModelOnly        bool   `json:"user_model_only"`       // 普通用户仅使用模型目录、Key 和用量；管理员不受限制
 	ApiInfo              string `json:"api_info"`              // 控制台 API 信息 (JSON 数组字符串)
 	UptimeKumaGroups     string `json:"uptime_kuma_groups"`    // Uptime Kuma 分组配置 (JSON 数组字符串)
 	Announcements        string `json:"announcements"`         // 系统公告 (JSON 数组字符串)
@@ -36,4 +40,8 @@ func init() {
 // GetConsoleSetting 获取 ConsoleSetting 配置实例
 func GetConsoleSetting() *ConsoleSetting {
 	return &consoleSetting
+}
+
+func ModelServiceOnly(role int) bool {
+	return consoleSetting.UserModelOnly && role == common.RoleCommonUser
 }

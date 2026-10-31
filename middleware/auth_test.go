@@ -16,6 +16,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
+	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/golang-jwt/jwt/v5"
@@ -133,6 +134,59 @@ func TestUserAuthAllowsOpaqueDottedPAT(t *testing.T) {
 	}
 	require.NoError(t, common.Unmarshal(response.Body.Bytes(), &body))
 	assert.Equal(t, user.Id, body.ID)
+}
+
+func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServices(t *testing.T) {
+	setupDashboardAuthMiddlewareTest(t)
+	settings := console_setting.GetConsoleSetting()
+	previous := *settings
+	t.Cleanup(func() { *settings = previous })
+	settings.UserModelOnly = true
+	user := createMiddlewarePATUser(t, "model-console-user", "model-console-legacy")
+	bundle, err := service.CreateLoginSession(user.Id, "oidc", "127.0.0.1", "test")
+	require.NoError(t, err)
+	admin := createMiddlewarePATUser(t, "model-console-admin", "model-console-admin-legacy")
+	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleRootUser).Error)
+	adminBundle, err := service.CreateLoginSession(admin.Id, "password", "127.0.0.1", "test")
+	require.NoError(t, err)
+	personal, _ := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write")
+	managed, managedToken := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write")
+	require.NoError(t, model.DB.Model(managedToken).Update("managed", true).Error)
+
+	router := gin.New()
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/api/user/self"}, {http.MethodGet, "/api/token/"},
+		{http.MethodGet, "/api/log/self"}, {http.MethodPost, "/api/user/topup"},
+		{http.MethodGet, "/api/subscription/plans"}, {http.MethodDelete, "/api/user/self"},
+		{http.MethodPut, "/api/user/setting"}, {http.MethodGet, "/api/user/access_tokens"},
+		{http.MethodPost, "/api/oauth/email/bind"},
+	} {
+		router.Handle(route.method, route.path, UserAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	}
+	for _, test := range []struct {
+		method, path, credential string
+		status                   int
+	}{
+		{http.MethodGet, "/api/user/self", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/token/", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/log/self", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodPost, "/api/user/topup", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodPost, "/api/user/topup", personal, http.StatusForbidden},
+		{http.MethodPost, "/api/user/topup", managed, http.StatusNoContent},
+		{http.MethodGet, "/api/subscription/plans", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodDelete, "/api/user/self", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodPut, "/api/user/setting", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodGet, "/api/user/access_tokens", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodPost, "/api/oauth/email/bind", bundle.AccessToken, http.StatusForbidden},
+		{http.MethodGet, "/api/user/access_tokens", adminBundle.AccessToken, http.StatusNoContent},
+		{http.MethodPost, "/api/user/topup", adminBundle.AccessToken, http.StatusNoContent},
+	} {
+		request := httptest.NewRequest(test.method, test.path, nil)
+		request.Header.Set("Authorization", "Bearer "+test.credential)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		assert.Equal(t, test.status, response.Code, "%s %s: %s", test.method, test.path, response.Body.String())
+	}
 }
 
 func TestUserAuthNeverFallsBackForRecognizedInvalidInternalJWT(t *testing.T) {

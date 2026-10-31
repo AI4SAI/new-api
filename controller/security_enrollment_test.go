@@ -29,6 +29,7 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
@@ -210,6 +211,61 @@ func TestManagedOIDCAccountPreservesIdentityAndFunds(t *testing.T) {
 	var count int64
 	require.NoError(t, model.DB.Model(&model.User{}).Where("username = ?", "new-org").Count(&count).Error)
 	assert.EqualValues(t, 1, count)
+}
+
+func TestModelServiceConsolePreservesLoginAndLanguageButRejectsAccountChanges(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	settings := console_setting.GetConsoleSetting()
+	previous, previousLogin := *settings, common.PasswordLoginEnabled
+	t.Cleanup(func() { *settings = previous; common.PasswordLoginEnabled = previousLogin })
+	settings.UserModelOnly = false
+	proof, err := service.VerifySecurityInput(identity, service.VerificationInput{
+		Method: service.VerificationMethodPassword, Scope: service.VerificationScopeAccountDelete,
+		Password: "enrollment-password",
+	})
+	require.NoError(t, err)
+	settings.UserModelOnly, common.PasswordLoginEnabled = true, true
+	access, _, err := service.IssueAccessToken(identity)
+	require.NoError(t, err)
+	router := gin.New()
+	router.GET("/api/user/self", middleware.UserAuth(), GetSelf)
+	router.PUT("/api/user/self", middleware.UserAuth(), UpdateSelf)
+	router.POST("/api/user/login", Login)
+	for _, test := range []struct {
+		method, path, body string
+		status             int
+	}{
+		{http.MethodGet, "/api/user/self", "", http.StatusOK},
+		{http.MethodPut, "/api/user/self", `{"language":"zh"}`, http.StatusOK},
+		{http.MethodPut, "/api/user/self", `{"language":"zh","display_name":"changed"}`, http.StatusForbidden},
+		{http.MethodPut, "/api/user/self", `{"sidebar_modules":"{}"}`, http.StatusForbidden},
+		{http.MethodPost, "/api/user/login", `{"username":"enrollment-user","password":"enrollment-password"}`, http.StatusOK},
+	} {
+		request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Authorization", "Bearer "+access)
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		require.Equal(t, test.status, response.Code, response.Body.String())
+		if test.status == http.StatusOK {
+			assert.Contains(t, response.Body.String(), `"success":true`)
+		}
+		if test.method == http.MethodGet {
+			assert.Contains(t, response.Body.String(), `"model_service_only":true`)
+			assert.Contains(t, response.Body.String(), `"sidebar_settings":false`)
+		}
+	}
+	_, err = service.ConsumeOperationProof(proof.ProofToken, identity, service.VerificationOperation{Scope: service.VerificationScopeAccountDelete})
+	assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+	_, err = service.GetVerificationRequirements(identity, service.VerificationScopeAccountBind)
+	assert.ErrorIs(t, err, service.ErrVerificationForbidden)
+	var after model.User
+	require.NoError(t, model.DB.First(&after, user.Id).Error)
+	assert.Equal(t, user.Password, after.Password)
+	assert.Equal(t, user.DisplayName, after.DisplayName)
+	assert.Equal(t, "zh", after.GetSetting().Language)
+	assert.Equal(t, false, calculateUserPermissions(common.RoleRootUser)["model_service_only"])
+	assert.Equal(t, false, calculateUserPermissions(common.RoleAdminUser)["model_service_only"])
 }
 
 func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {

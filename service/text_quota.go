@@ -392,6 +392,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 	billingUsage := effectiveBillingUsage(usage)
 	if usage == nil {
 		extraContent = append(extraContent, common.NewMessage("Upstream returned no usage"))
+		common.SetContextKey(ctx, constant.ContextKeyLocalCountTokens, true)
 	}
 	if originUsage != nil {
 		ObserveChannelAffinityUsageCacheByRelayFormat(ctx, billingUsage, relayInfo.GetFinalRequestRelayFormat())
@@ -428,6 +429,30 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		}
 	}
 
+	// Missing or partly estimated token usage is borne by the platform. Keep
+	// independent tool/image surcharges and the original per-request contract.
+	// Apply this after expression settlement so its fallback cannot re-charge
+	// the reservation. SettleBilling below returns any unused reservation once.
+	independentRequestPrice := summary.FixedPriceBilling || relayInfo.PriceData.UsePrice
+	if independentRequestPrice && snap != nil {
+		used := billingexpr.UsedVarsByHash(snap.ExprString, snap.ExprHash)
+		for _, name := range []string{"p", "c", "len", "cr", "cc", "cc1h", "img", "img_cr", "img_o", "ai", "ao"} {
+			if used[name] {
+				independentRequestPrice = false
+				break
+			}
+		}
+	}
+	unconfirmedTokenUsage := relayInfo.RequireConfirmedStreamUsage && relayInfo.IsStream && !independentRequestPrice &&
+		(originUsage == nil || common.GetContextKeyBool(ctx, constant.ContextKeyLocalCountTokens) ||
+			(originUsage.BillingUsage != nil && originUsage.BillingUsage.Estimated))
+	if unconfirmedTokenUsage {
+		var clamp *common.QuotaClamp
+		summary.Quota, clamp = common.QuotaFromDecimalChecked(summary.ToolCallSurchargeQuota)
+		noteQuotaClamp(relayInfo, clamp)
+		extraContent = append(extraContent, common.NewMessage("Token usage was not confirmed; no token charge was applied"))
+	}
+
 	for _, item := range summary.ToolSurchargeItems {
 		q := decimal.NewFromFloat(item.Price).
 			Mul(decimal.NewFromInt(int64(item.Count))).
@@ -445,7 +470,7 @@ func PostTextConsumeQuota(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, us
 		extraContent = append(extraContent, common.NewMessage("Audio input cost {{quota}}", map[string]any{"quota": logger.FormatQuota(common.QuotaFromDecimal(q))}))
 	}
 
-	if !summary.hasBillableUsage() {
+	if !summary.hasBillableUsage() && !unconfirmedTokenUsage {
 		extraContent = append(extraContent, common.NewMessage("Upstream returned no usage, so nothing was charged (possibly an upstream timeout)"))
 		logger.LogError(ctx, common.LogText("total tokens is 0, cannot consume quota, userId %d, channelId %d, tokenId %d, model %s， pre-consumed quota %d", relayInfo.UserId, relayInfo.ChannelId, relayInfo.TokenId, summary.ModelName, relayInfo.FinalPreConsumedQuota))
 	} else {

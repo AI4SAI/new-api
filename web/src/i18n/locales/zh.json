@@ -7329,5 +7329,7 @@
     "Zhipu V4": "智谱 V4",
     "Zoom": "缩放"
   },
-  "Account synchronization is pending. Please try again later.": "账户同步中，请稍后重试。"
+  "Account synchronization is pending. Please try again later.": "账户同步中，请稍后重试。",
+  "Limit ordinary users to models, API Keys and usage": "普通用户仅开放模型、API Key 和用量",
+  "Token usage was not confirmed; no token charge was applied": "用量未确认，未收取 token 费用"
 }

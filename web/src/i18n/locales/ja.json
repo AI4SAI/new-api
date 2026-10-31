@@ -7329,5 +7329,7 @@
     "Zhipu V4": "Zhipu V 4",
     "Zoom": "ズーム"
   },
-  "Account synchronization is pending. Please try again later.": "アカウントを同期中です。しばらくしてから再試行してください。"
+  "Account synchronization is pending. Please try again later.": "アカウントを同期中です。しばらくしてから再試行してください。",
+  "Limit ordinary users to models, API Keys and usage": "一般ユーザーはモデル、APIキー、使用量のみ利用可能",
+  "Token usage was not confirmed; no token charge was applied": "トークン使用量が確認できなかったため、トークン料金は請求されませんでした"
 }

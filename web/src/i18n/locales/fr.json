@@ -7329,5 +7329,7 @@
     "Zhipu V4": "Zhipu V4",
     "Zoom": "Zoom"
   },
-  "Account synchronization is pending. Please try again later.": "La synchronisation du compte est en cours. Veuillez réessayer plus tard."
+  "Account synchronization is pending. Please try again later.": "La synchronisation du compte est en cours. Veuillez réessayer plus tard.",
+  "Limit ordinary users to models, API Keys and usage": "Limiter les utilisateurs ordinaires aux modèles, aux clés API et à l’utilisation",
+  "Token usage was not confirmed; no token charge was applied": "L’utilisation des tokens n’a pas été confirmée ; aucun frais de tokens n’a été appliqué"
 }

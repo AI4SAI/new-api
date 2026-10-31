@@ -70,3 +70,5 @@ and other third-party components. Electron and Chromium third-party license
 notices must remain available with desktop installers and installed apps.
 
 ==== End of Notices ====
+
+SAI modifications (2026-11-01): optional ordinary-user model console boundaries and confirmed stream-usage billing; retain upstream stream fixes from 0c2af978, 7e659672 and 55515dba.
