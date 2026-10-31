@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"unicode/utf8"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -122,6 +125,27 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 		return nil
 	}
 
+	if info.RelayMode == relayconstant.RelayModeToolsSearch {
+		// Record the effective outbound values after channel overrides, never the
+		// raw request or original question. Missing optional fields use API defaults.
+		var requestFields struct {
+			Query       string `json:"query"`
+			Count       *int   `json:"count"`
+			NeedContent bool   `json:"need_content"`
+		}
+		if common.Unmarshal(jsonData, &requestFields) == nil && utf8.ValidString(requestFields.Query) &&
+			strings.TrimSpace(requestFields.Query) != "" && utf8.RuneCountInString(requestFields.Query) <= 128 {
+			count := 10
+			if requestFields.Count != nil {
+				count = *requestFields.Count
+			}
+			if count >= 1 && count <= 50 {
+				info.WebSearch = &relaycommon.WebSearchLog{Query: requestFields.Query, Count: count,
+					NeedContent: requestFields.NeedContent,
+					ResultCount: len(gjson.GetBytes(responseBody, "results").Array()), Outcome: "success"}
+			}
+		}
+	}
 	service.PostTextConsumeQuota(c, info, &dto.Usage{}, nil)
 	return nil
 }

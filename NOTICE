@@ -13,7 +13,8 @@ login, idempotent account and budget provisioning, and external billing admissio
 with immutable usage attribution. Upstream new-api and QuantumNous attribution
 and license terms remain in force. These modifications do not imply upstream
 endorsement. Authentication form ordering and responsive layout are also
-corrected in this modified version.
+corrected in this modified version. Direct Search consumption logs also retain
+bounded query parameters and result counts through the existing log metadata.
 
 ==== Additional Terms under AGPLv3 Section 7 ====
 
