@@ -92,12 +92,12 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 		channelType, status        int
 		settled                    []int
 		refunded                   bool
-		searchLog                  *relaycommon.WebSearchLog
+		searchLog                  *relaycommon.DirectSearchLog
 		override                   map[string]any
 	}{
 		{name: "search with results", path: search, body: `{"query":"deepseek site:example.com","count":2,"need_content":true,"ori_question":"private original prompt","headers":{"Authorization":"private credential"},"future_field":{"nested":true}}`,
 			response: results, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{375},
-			searchLog: &relaycommon.WebSearchLog{Query: "deepseek site:example.com", Count: 2, NeedContent: true, ResultCount: 1, Outcome: "success"}},
+			searchLog: &relaycommon.DirectSearchLog{Query: "deepseek site:example.com", Count: 2, NeedContent: true, ResultCount: 1, Outcome: "success"}},
 		{name: "search without results", path: search, body: `{"query":"site:none.invalid deepseek"}`,
 			response: `{"results":[]}`, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, refunded: true},
 		{name: "fetch with page content", path: fetch, body: `{"url":"https://example.com/"}`,
@@ -107,11 +107,11 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 			channelType: constant.ChannelTypeDeepSeek, status: http.StatusNotFound},
 		{name: "search through a New API channel", path: search, body: `{"query":"deepseek"}`,
 			response: results, channelType: constant.ChannelTypeNewAPI, status: http.StatusOK, settled: []int{375},
-			searchLog: &relaycommon.WebSearchLog{Query: "deepseek", Count: 10, ResultCount: 1, Outcome: "success"}},
+			searchLog: &relaycommon.DirectSearchLog{Query: "deepseek", Count: 10, ResultCount: 1, Outcome: "success"}},
 		{name: "search metadata follows effective override", path: search, body: `{"query":"original","count":2,"need_content":true}`,
 			response: results, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{375},
 			override:  map[string]any{"query": "资料 after:2026-01-01", "count": 4, "need_content": false},
-			searchLog: &relaycommon.WebSearchLog{Query: "资料 after:2026-01-01", Count: 4, ResultCount: 1, Outcome: "success"}},
+			searchLog: &relaycommon.DirectSearchLog{Query: "资料 after:2026-01-01", Count: 4, ResultCount: 1, Outcome: "success"}},
 		{name: "invalid metadata does not change upstream billing", path: search, body: `{"query":"deepseek","count":51}`,
 			response: results, channelType: constant.ChannelTypeDeepSeek, status: http.StatusOK, settled: []int{375}},
 		{name: "channel without the endpoint", path: search, body: `{"query":"deepseek"}`, channelType: constant.ChannelTypeOpenAI},
@@ -150,7 +150,7 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 			require.NoError(t, err, "the routing name is priced out of the box")
 			settlement := &recordedSettlement{}
 			info.Billing = settlement
-			info.WebSearch = &relaycommon.WebSearchLog{Query: "previous attempt", Outcome: "success"}
+			info.SearchRequest = &relaycommon.DirectSearchLog{Query: "previous attempt", Outcome: "success"}
 
 			apiErr := DeepSeekToolsHelper(c, info)
 			if tc.status == 0 {
@@ -167,13 +167,14 @@ func TestDeepSeekToolsHelper(t *testing.T) {
 			}
 			assert.Equal(t, tc.settled, settlement.settled)
 			assert.Equal(t, tc.refunded, settlement.refunded)
-			assert.Equal(t, tc.searchLog, info.WebSearch)
+			assert.Equal(t, tc.searchLog, info.SearchRequest)
 			other := service.GenerateTextOtherInfo(c, info, 0, 1, 0, 0, 0, 0, 1).Snapshot()
 			if tc.searchLog == nil {
-				assert.NotContains(t, other, "web_search")
+				assert.NotContains(t, other, "search_request")
 			} else {
-				assert.Equal(t, *tc.searchLog, other["web_search"])
-				encoded, err := common.Marshal(other["web_search"])
+				assert.Equal(t, *tc.searchLog, other["search_request"])
+				assert.NotContains(t, other, "web_search")
+				encoded, err := common.Marshal(other["search_request"])
 				require.NoError(t, err)
 				for _, excluded := range []string{"private original prompt", "private credential", "headers", "ori_question", "future_field"} {
 					assert.NotContains(t, string(encoded), excluded)

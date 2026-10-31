@@ -115,13 +115,13 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		want                                      int
 		unit                                      billingexpr.BillingUnit
 		requestedImages, actualImages             int
-		searchLog                                 *relaycommon.WebSearchLog
+		searchLog                                 *relaycommon.DirectSearchLog
 	}{
 		{name: "missing usage charges once", expression: flat, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "zero usage charges once", expression: flat, usage: &dto.Usage{}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "Search metadata keeps zero-token request charge", expression: `tier("request", fixed(0.00075))`,
 			usage: &dto.Usage{}, want: 375, unit: billingexpr.BillingUnitRequest,
-			searchLog: &relaycommon.WebSearchLog{Query: "论文 site:example.com", Count: 8, ResultCount: 3, Outcome: "success"}},
+			searchLog: &relaycommon.DirectSearchLog{Query: "论文 site:example.com", Count: 8, ResultCount: 3, Outcome: "success"}},
 		{name: "stream charges once", expression: flat, stream: true, usage: &dto.Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "audio zero usage charges once", expression: flat, audio: true, usage: &dto.Usage{}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "audio missing usage charges once", expression: flat, audio: true, want: 5000, unit: billingexpr.BillingUnitRequest},
@@ -185,7 +185,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			if tc.searchLog != nil {
 				ctx.Request.URL.Path = "/v1/tools/search"
-				info.RelayMode, info.OriginModelName, info.WebSearch = relayconstant.RelayModeToolsSearch, constant.DeepSeekSearchModel, tc.searchLog
+				info.RelayMode, info.OriginModelName, info.SearchRequest = relayconstant.RelayModeToolsSearch, constant.DeepSeekSearchModel, tc.searchLog
 			}
 			if tc.expression == imageExpression {
 				ctx.Request.URL.Path = "/v1/images/generations"
@@ -255,7 +255,8 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					assert.Equal(t, string(tc.unit), other["billing_unit"])
 					if tc.searchLog != nil {
 						assert.Equal(t, map[string]any{"query": tc.searchLog.Query, "count": float64(8),
-							"need_content": false, "result_count": float64(3), "outcome": "success"}, other["web_search"])
+							"need_content": false, "result_count": float64(3), "outcome": "success"}, other["search_request"])
+						assert.NotContains(t, other, "web_search")
 						assert.Zero(t, log.PromptTokens)
 						assert.Zero(t, log.CompletionTokens)
 						assert.Equal(t, constant.DeepSeekSearchModel, log.ModelName)
@@ -264,7 +265,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 						require.Equal(t, int64(1), total)
 						var public map[string]any
 						require.NoError(t, common.UnmarshalJsonStr(visible[0].Other, &public))
-						assert.Equal(t, other["web_search"], public["web_search"])
+						assert.Equal(t, other["search_request"], public["search_request"])
 						assert.NotContains(t, public, "admin_info")
 					}
 					if tc.requestedImages > 0 {

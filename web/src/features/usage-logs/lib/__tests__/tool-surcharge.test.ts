@@ -22,6 +22,42 @@ import type { LogOtherData } from '../../types'
 import { hasToolSurcharge } from '../format'
 
 describe('tool surcharge detection', () => {
+  const directSearch = {
+    search_request: {
+      query: 'site:example.com research',
+      count: 8,
+      need_content: false,
+      result_count: 3,
+      outcome: 'success',
+    },
+  }
+
+  test('does not treat direct Search metadata as a model tool surcharge', () => {
+    expect(hasToolSurcharge({ ...directSearch, billing_unit: 'request' })).toBe(
+      false
+    )
+  })
+
+  test('preserves an independent historical Search surcharge beside direct metadata', () => {
+    const other = {
+      ...directSearch,
+      web_search: true,
+      web_search_call_count: 2,
+      web_search_price: 10,
+    }
+    expect(hasToolSurcharge(other)).toBe(true)
+    expect(other.web_search_call_count * other.web_search_price).toBe(20)
+  })
+
+  test('preserves structured surcharges beside direct Search metadata', () => {
+    expect(
+      hasToolSurcharge({
+        ...directSearch,
+        tool_surcharges: [{ name: 'web_search', count: 1, price: 10 }],
+      })
+    ).toBe(true)
+  })
+
   test('shows the marker for a charged structured tool surcharge', () => {
     expect(
       hasToolSurcharge({
