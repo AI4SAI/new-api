@@ -19,6 +19,8 @@ Managed-account authorization now preserves
 the signed-in operator while scoping key management and usage to an authorized
 account. Key quota updates preserve concurrent consumption and reject repeated
 adjustments against an older revision.
+Application-managed key metadata and billing facts remain visible without
+revealing their credentials or private request content.
 
 ==== Additional Terms under AGPLv3 Section 7 ====
 

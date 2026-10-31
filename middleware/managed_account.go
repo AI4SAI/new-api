@@ -22,13 +22,13 @@ func ManagedAccountAuthorization(operation string) gin.HandlerFunc {
 			return
 		}
 		if account := service.ManagementAccount(c); account != nil && operation == "model.usage.read" {
-			ids, err := model.ExternalTokenIDs(account.OwnerID)
+			visibility, err := model.UserTokenLogVisibility(account.OwnerID)
 			if err != nil {
 				common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Managed account access is unavailable"))
 				c.Abort()
 				return
 			}
-			c.Set("management_token_ids", ids)
+			c.Set("management_token_visibility", visibility)
 		}
 		c.Next()
 	}

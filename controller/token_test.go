@@ -37,14 +37,18 @@ type tokenAPIResponse struct {
 
 type tokenPageResponse struct {
 	Items []tokenResponseItem `json:"items"`
+	Total int                 `json:"total"`
 }
 
 type tokenResponseItem struct {
-	ID          int    `json:"id"`
-	Name        string `json:"name"`
-	Key         string `json:"key"`
-	Status      int    `json:"status"`
-	RemainQuota *int   `json:"remain_quota"`
+	ID                int     `json:"id"`
+	Name              string  `json:"name"`
+	Key               string  `json:"key"`
+	Status            int     `json:"status"`
+	RemainQuota       *int    `json:"remain_quota"`
+	Managed           bool    `json:"managed"`
+	ManagedBindingRef string  `json:"managed_binding_ref"`
+	AllowIps          *string `json:"allow_ips"`
 }
 
 func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
@@ -56,6 +60,8 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	internal := seedToken(t, db, 41, "internal", "internal-key")
 	other := seedToken(t, db, 42, "other-org", "other-key")
 	require.NoError(t, db.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+	require.NoError(t, db.Model(internal).Update("allow_ips", "192.0.2.3").Error)
+	require.NoError(t, db.Model(external).Update("management_creator_id", 7).Error)
 	request := func(method, path string, body any) (*gin.Context, *httptest.ResponseRecorder) {
 		c, w := newAuthenticatedContext(t, method, path, body, 7)
 		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org"})
@@ -67,11 +73,61 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.True(t, response.Success)
 	var page tokenPageResponse
 	require.NoError(t, common.Unmarshal(response.Data, &page))
-	require.Len(t, page.Items, 1)
-	require.Equal(t, external.Id, page.Items[0].ID)
+	require.Len(t, page.Items, 2)
+	require.Equal(t, 2, page.Total)
+	require.Equal(t, internal.Id, page.Items[0].ID)
+	require.True(t, page.Items[0].Managed)
+	require.Equal(t, "Pilot", page.Items[0].Name)
+	require.Empty(t, page.Items[0].Key)
+	require.Empty(t, page.Items[0].ManagedBindingRef)
+	require.Nil(t, page.Items[0].AllowIps)
+	require.Equal(t, external.Id, page.Items[1].ID)
+	require.False(t, page.Items[1].Managed)
+	require.NotEmpty(t, page.Items[1].Key)
 	require.NotNil(t, page.Items[0].RemainQuota)
 	require.Equal(t, 100, *page.Items[0].RemainQuota)
 	require.Equal(t, 7, c.GetInt("id"))
+	for _, query := range []struct {
+		query string
+		count int
+	}{{"?keyword=Pilot", 1}, {"?keyword=internal", 0}, {"?keyword=external", 1}, {"?token=internal%25", 0}, {"?token=internal-key", 0}, {"?keyword=Pilot&token=internal%25", 0}} {
+		c, w = request("GET", "/api/token/search"+query.query, nil)
+		SearchTokens(c)
+		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
+		require.Len(t, page.Items, query.count)
+		require.Equal(t, query.count, page.Total)
+	}
+	for _, machine := range []bool{false, true} {
+		c, w = request("GET", "/api/token/1", nil)
+		c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(internal.Id)}}
+		c.Set("access_token_managed", machine)
+		GetToken(c)
+		var detail tokenResponseItem
+		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &detail))
+		require.True(t, detail.Managed)
+		if machine {
+			require.Equal(t, internal.Name, detail.Name)
+			require.Equal(t, internal.GetMaskedKey(), detail.Key)
+			require.NotEmpty(t, detail.ManagedBindingRef)
+			require.NotNil(t, detail.AllowIps)
+			require.Equal(t, "192.0.2.3", *detail.AllowIps)
+		} else {
+			require.Equal(t, "Pilot", detail.Name)
+			require.Empty(t, detail.Key)
+			require.Empty(t, detail.ManagedBindingRef)
+			require.Nil(t, detail.AllowIps)
+		}
+	}
+	for _, operation := range []struct {
+		method, path string
+		handler      gin.HandlerFunc
+		body         any
+	}{{"PUT", "/api/token/", UpdateToken, map[string]any{"id": internal.Id, "name": "forged"}}, {"PUT", "/api/token/?status_only=true", UpdateToken, map[string]any{"id": internal.Id, "status": 2}}, {"DELETE", "/api/token/1", DeleteToken, nil}} {
+		c, w = request(operation.method, operation.path, operation.body)
+		c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(internal.Id)}}
+		operation.handler(c)
+		require.False(t, decodeAPIResponse(t, w).Success)
+	}
 	c, w = request("POST", "/api/token/", map[string]any{"name": "device", "remain_quota": 100, "expired_time": -1})
 	AddToken(c)
 	require.True(t, decodeAPIResponse(t, w).Success)
@@ -98,6 +154,12 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(internal.Id)}}
 	GetTokenKey(c)
 	require.False(t, decodeAPIResponse(t, w).Success)
+	c, w = request("POST", "/api/token/1/key", nil)
+	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(internal.Id)}}
+	c.Set("access_token_managed", true)
+	GetTokenKey(c)
+	require.True(t, decodeAPIResponse(t, w).Success)
+	require.Contains(t, w.Body.String(), internal.Key)
 	ids := []int{personal.Id, external.Id, internal.Id, other.Id}
 	c, w = request("POST", "/api/token/batch/keys", map[string]any{"ids": ids})
 	GetTokenKeysBatch(c)
@@ -114,10 +176,18 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", internal.Id).Count(&count).Error)
 	require.EqualValues(t, 1, count)
-	historical, err := model.ExternalTokenIDs(41)
+	historical, err := model.UserTokenLogVisibility(41)
 	require.NoError(t, err)
-	require.Contains(t, historical, external.Id)
-	require.NotContains(t, historical, internal.Id)
+	require.True(t, historical[external.Id].FullDetails)
+	require.True(t, historical[internal.Id].Managed)
+	require.False(t, historical[internal.Id].FullDetails)
+	c, w = request("GET", "/api/token/", nil)
+	GetAllTokens(c)
+	require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
+	require.Equal(t, 2, page.Total)
+	for _, row := range page.Items {
+		require.NotEqual(t, external.Id, row.ID)
+	}
 }
 
 type tokenKeyResponse struct {

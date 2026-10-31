@@ -111,6 +111,7 @@ const (
 	logOtherVisibilityUser logOtherVisibility = iota
 	logOtherVisibilityAdmin
 	logOtherVisibilityRoot
+	logOtherVisibilityBillingFacts
 )
 
 // LogOther separates usage-log metadata by the audience allowed to see it.
@@ -323,7 +324,24 @@ func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
 	}
 
 	changed := false
-	if visibility == logOtherVisibilityUser {
+	if visibility == logOtherVisibilityBillingFacts {
+		facts := map[string]json.RawMessage{}
+		for _, key := range []string{"input_tokens_total", "cache_tokens", "cache_write_tokens",
+			"cache_creation_tokens", "cache_creation_tokens_5m", "cache_creation_tokens_1h",
+			"model_price", "model_ratio", "group_ratio", "completion_ratio", "cache_ratio", "user_group_ratio", "fixed_price", "image_count"} {
+			var number *float64
+			if raw, exists := values[key]; exists && common.Unmarshal(raw, &number) == nil && number != nil {
+				facts[key] = raw
+			}
+		}
+		for key, allowed := range map[string][]string{"billing_unit": {"token", "request"}, "billing_mode": {"tiered_expr"}} {
+			var label string
+			if raw, exists := values[key]; exists && common.Unmarshal(raw, &label) == nil && slices.Contains(allowed, label) {
+				facts[key] = raw
+			}
+		}
+		values, changed = facts, true
+	} else if visibility == logOtherVisibilityUser {
 		for _, key := range []string{logOtherAdminInfoKey, logOtherRootInfoKey, logOtherAuditInfoKey} {
 			if _, exists := values[key]; exists {
 				delete(values, key)

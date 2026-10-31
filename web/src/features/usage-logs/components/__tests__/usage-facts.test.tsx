@@ -110,6 +110,17 @@ test('shows the recorded request and response models in log details', () => {
 })
 
 describe('usage facts billing details', () => {
+  test('shows recorded per-request price when the expression is not shared', () => {
+    const queryClient = renderDetails({
+      billing_mode: 'tiered_expr',
+      billing_unit: 'request',
+      fixed_price: 0.00075,
+    })
+    expect(screen.getAllByText(/\/request/).length).toBeGreaterThan(0)
+    expect(screen.getAllByText(/0\.00075/).length).toBeGreaterThan(0)
+    queryClient.clear()
+  })
+
   test('shows the settled image count and a per-image price', () => {
     const queryClient = renderDetails({
       billing_mode: 'tiered_expr',

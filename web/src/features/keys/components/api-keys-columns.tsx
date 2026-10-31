@@ -99,6 +99,9 @@ export function useApiKeysColumns(
               table.toggleAllPageRowsSelected(!!value)
             }
             aria-label={t('Select all')}
+            disabled={
+              !table.getRowModel().rows.some((row) => row.getCanSelect())
+            }
             className='translate-y-[2px]'
           />
         ),
@@ -107,6 +110,7 @@ export function useApiKeysColumns(
             checked={row.getIsSelected()}
             onCheckedChange={(value) => row.toggleSelected(!!value)}
             aria-label={t('Select row')}
+            disabled={!row.getCanSelect()}
             className='translate-y-[2px]'
           />
         ),

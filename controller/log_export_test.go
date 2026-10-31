@@ -33,10 +33,10 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 	ctx.Set("id", userId)
 	ctx.Set("role", role)
 	if len(managedOwner) == 1 {
-		ids, err := model.ExternalTokenIDs(managedOwner[0])
+		visibility, err := model.UserTokenLogVisibility(managedOwner[0])
 		require.NoError(t, err)
 		ctx.Set("managed_account", &service.ManagedAccount{OwnerID: managedOwner[0]})
-		ctx.Set("management_token_ids", ids)
+		ctx.Set("management_token_visibility", visibility)
 	}
 	handler(ctx)
 	var lines []map[string]any
@@ -48,7 +48,7 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 	return lines
 }
 
-func TestManagedLogsKeepDeletedExternalHistoryWithoutInternalKeys(t *testing.T) {
+func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 	for _, database := range []struct {
 		name, env string
 		kind      common.DatabaseType
@@ -67,23 +67,111 @@ func TestManagedLogsKeepDeletedExternalHistoryWithoutInternalKeys(t *testing.T) 
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			require.NoError(t, mainDB.Create(&model.User{Id: 41, Username: "org-owner", Group: "default", AffCode: "logs-owner"}).Error)
 			external := seedToken(t, mainDB, 41, "device", "external-log-key")
-			internal := seedToken(t, mainDB, 41, "pilot", "internal-log-key")
+			internal := seedToken(t, mainDB, 41, "pilot-private-name", "internal-log-key")
+			legacy := seedToken(t, mainDB, 41, "unknown-old-source", "legacy-log-key")
+			require.NoError(t, mainDB.Model(external).Update("management_creator_id", 7).Error)
 			require.NoError(t, mainDB.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+			for _, search := range []struct {
+				name  string
+				human bool
+				count int
+			}{{"Pilot", true, 1}, {internal.Name, true, 0}, {internal.Name, false, 1}, {"Pilot", false, 0}} {
+				rows, total, err := model.SearchUserTokens(41, search.name, "", 0, 10, search.human)
+				require.NoError(t, err)
+				require.EqualValues(t, search.count, total)
+				require.Len(t, rows, search.count)
+			}
 			now := time.Now().Unix()
-			for _, entry := range []model.Log{{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5}, {UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100}, {UserId: 42, TokenId: external.Id, RequestId: "another-owner", Quota: 1000}} {
+			for _, entry := range []model.Log{
+				{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5, TokenName: "device"},
+				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100, TokenName: internal.Name},
+				{UserId: 41, TokenId: legacy.Id, RequestId: "legacy-private", Quota: 20, TokenName: legacy.Name},
+				{UserId: 41, TokenId: 9999, RequestId: "missing-key-private", Quota: 10},
+				{UserId: 41, TokenId: 0, RequestId: "playground-private", Quota: 7},
+				{UserId: 41, TokenId: external.Id, TokenName: "Pilot", RequestId: "external-same-display", Quota: 3},
+				{UserId: 42, TokenId: external.Id, RequestId: "another-owner", Quota: 1000},
+			} {
 				entry.Type = model.LogTypeConsume
 				entry.CreatedAt = now
 				entry.Username = "former-org-name"
+				entry.ModelName = "fixture-model"
+				entry.BillingProduct = "charged-model"
+				entry.Group = "charged-group"
+				entry.PromptTokens = 120
+				entry.CompletionTokens = 30
+				entry.Content = "private research prompt"
+				entry.Ip = "192.0.2.3"
+				entry.ChannelId = 17
+				entry.UpstreamRequestId = "upstream-private"
+				entry.BillingContextRef = "private-context"
+				entry.Other = `{"search_request":{"query":"private search query"},"content_parts":[{"message":"private details"}],"input_tokens_total":120,"cache_tokens":40,"model_price":0.002,"billing_unit":"request","billing_mode":"tiered_expr","fixed_price":0.00075,"expr_b64":"private-expression","admin_info":{"credential":"private"}}`
 				require.NoError(t, logDB.Create(&entry).Error)
 			}
+			require.NoError(t, logDB.Create(&model.Log{UserId: 41, TokenId: 0, Type: model.LogTypeTopup, Quota: 10000, CreatedAt: now, Content: "unrelated owner payment"}).Error)
 			require.NoError(t, external.Delete())
+			require.NoError(t, legacy.Delete())
 			listed := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
-			require.EqualValues(t, 1, listed["data"].(map[string]any)["total"])
-			require.NotContains(t, fmt.Sprint(listed), "pilot-private")
+			require.EqualValues(t, 6, listed["data"].(map[string]any)["total"])
+			rows := listed["data"].(map[string]any)["items"].([]any)
+			for _, item := range rows {
+				row := item.(map[string]any)
+				if int(row["token_id"].(float64)) == external.Id {
+					require.Equal(t, "private research prompt", row["content"])
+					continue
+				}
+				for _, field := range []string{"content", "ip", "username"} {
+					require.Empty(t, row[field])
+				}
+				require.EqualValues(t, 0, row["channel"])
+				for _, field := range []string{"request_id", "upstream_request_id", "billing_context_ref"} {
+					require.NotContains(t, row, field)
+				}
+				require.Equal(t, "fixture-model", row["model_name"])
+				require.Equal(t, "charged-model", row["billing_product"])
+				require.Equal(t, "charged-group", row["group"])
+				require.NotContains(t, row["other"], "private")
+				require.NotContains(t, row["other"], "search_request")
+				var billing map[string]any
+				require.NoError(t, common.UnmarshalJsonStr(row["other"].(string), &billing))
+				require.Equal(t, "request", billing["billing_unit"])
+				require.Equal(t, "tiered_expr", billing["billing_mode"])
+				require.Equal(t, 0.00075, billing["fixed_price"])
+				require.EqualValues(t, 40, row["metering"].(map[string]any)["cache_read_tokens"])
+				if int(row["token_id"].(float64)) == internal.Id {
+					require.Equal(t, "Pilot", row["token_name"])
+				} else {
+					if int(row["token_id"].(float64)) == legacy.Id {
+						require.Equal(t, legacy.Name, row["token_name"])
+					} else if int(row["token_id"].(float64)) > 0 {
+						require.Equal(t, "Key #9999", row["token_name"])
+					} else {
+						require.Empty(t, row["token_name"])
+					}
+				}
+			}
 			stat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "", 41)[0]
-			require.EqualValues(t, 5, stat["data"].(map[string]any)["quota"])
+			require.EqualValues(t, 145, stat["data"].(map[string]any)["quota"])
 			exported := callLogHandler(t, ExportUserLogs, 7, common.RoleAdminUser, "", 41)
-			require.Equal(t, []any{"external-history"}, exportedRequestIds(exported))
+			require.Len(t, exported, 7)
+			for _, row := range exported[:6] {
+				if int(row["token_id"].(float64)) != external.Id {
+					require.NotContains(t, fmt.Sprint(row), "private")
+				}
+			}
+			byAlias := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
+			require.EqualValues(t, 2, byAlias["data"].(map[string]any)["total"])
+			aliasStat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
+			require.EqualValues(t, 103, aliasStat["data"].(map[string]any)["quota"])
+			hiddenName := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name="+internal.Name, 41)[0]
+			require.EqualValues(t, 0, hiddenName["data"].(map[string]any)["total"])
+			query := fmt.Sprintf("token_id=%d", internal.Id)
+			own := callLogHandler(t, GetUserLogs, 41, common.RoleCommonUser, query)[0]
+			require.Contains(t, fmt.Sprint(own), "private research prompt")
+			require.NoError(t, internal.Delete())
+			historical := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
+			require.EqualValues(t, 1, historical["data"].(map[string]any)["total"])
+			require.NotContains(t, fmt.Sprint(historical), "private")
+
 		})
 	}
 }

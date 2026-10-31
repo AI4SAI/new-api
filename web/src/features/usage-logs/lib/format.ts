@@ -346,10 +346,9 @@ export function getTieredBillingSummary(
 ): TieredBillingSummary | null {
   if (!other || other.billing_mode !== 'tiered_expr') return null
   const exprStr = decodeBillingExprB64(other.expr_b64)
-  if (!exprStr) return null
-  const tiers = parseTiersFromExpr(
-    splitBillingExprAndRequestRules(exprStr).billingExpr
-  )
+  const tiers = exprStr
+    ? parseTiersFromExpr(splitBillingExprAndRequestRules(exprStr).billingExpr)
+    : []
   const tier = resolveMatchedTier(tiers, other.matched_tier)
   if (
     other.billing_unit === 'request' &&
