@@ -140,7 +140,7 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 				count = *requestFields.Count
 			}
 			if count >= 1 && count <= 50 {
-				info.WebSearch = &relaycommon.WebSearchLog{Query: requestFields.Query, Count: count,
+				info.SearchRequest = &relaycommon.DirectSearchLog{Query: requestFields.Query, Count: count,
 					NeedContent: requestFields.NeedContent,
 					ResultCount: len(gjson.GetBytes(responseBody, "results").Array()), Outcome: "success"}
 			}
