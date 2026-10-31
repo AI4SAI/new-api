@@ -80,6 +80,16 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// WebSearchLog is bounded request/result metadata for a completed direct Search.
+// It deliberately excludes the original prompt, credentials and response content.
+type WebSearchLog struct {
+	Query       string `json:"query"`
+	Count       int    `json:"count"`
+	NeedContent bool   `json:"need_content"`
+	ResultCount int    `json:"result_count"`
+	Outcome     string `json:"outcome"`
+}
+
 type RelayInfo struct {
 	TokenId           int
 	TokenKey          string
@@ -99,6 +109,7 @@ type RelayInfo struct {
 	RelayMode              int
 	OriginModelName        string
 	ResponseModel          *ResponseModel
+	WebSearch              *WebSearchLog
 
 	// BillingModelName is the pricing identity for this request. It is kept
 	// separate from OriginModelName and UpstreamModelName so virtual pricing
@@ -267,6 +278,7 @@ func (info *RelayInfo) RequestedImageCount() int {
 
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	info.ResponseModel = nil
+	info.WebSearch = nil
 	info.FinalRequestRelayFormat = ""
 	info.RequestConversionChain = nil
 	info.InitRequestConversionChain()
