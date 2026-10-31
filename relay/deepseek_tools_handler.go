@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
-	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -68,8 +68,22 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 			return newAPIErrorFromParamOverride(err)
 		}
 	}
+	var fetchURL, displayFetchURL string
+	var redactError func(string) string
+	if info.RelayMode == relayconstant.RelayModeToolsFetch {
+		fetchURL, displayFetchURL = deepSeekFetchTarget(jsonData)
+		if fetchURL != "" && displayFetchURL != fetchURL {
+			errorTarget := displayFetchURL
+			if errorTarget == "" {
+				errorTarget = "[redacted URL]"
+			}
+			raw, _ := common.Marshal(fetchURL)
+			display, _ := common.Marshal(errorTarget)
+			redactError = strings.NewReplacer(string(raw[1:len(raw)-1]), string(display[1:len(display)-1]),
+				fetchURL, errorTarget).Replace
+		}
+	}
 
-	logger.LogDebug(c, "requestBody: %s", jsonData)
 	body, closer, err := relaycommon.NewOutboundJSONBody(jsonData)
 	if err != nil {
 		return types.NewError(err, types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
@@ -95,7 +109,7 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 	defer httpResp.Body.Close()
 
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false)
+		newAPIError = service.RelayErrorHandler(c.Request.Context(), httpResp, false, redactError)
 		service.ResetStatusCode(newAPIError, statusCodeMappingStr)
 		return newAPIError
 	}
@@ -111,12 +125,15 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 	// call settles at the routing name's request price; any other response
 	// releases the reservation.
 	var billable bool
-	switch info.RelayMode {
-	case relayconstant.RelayModeToolsFetch:
-		billable = gjson.GetBytes(responseBody, "content").String() != ""
-	default:
-		results := gjson.GetBytes(responseBody, "results")
-		billable = results.IsArray() && len(results.Array()) > 0
+	content := gjson.GetBytes(responseBody, "content")
+	if httpResp.StatusCode == http.StatusOK && utf8.Valid(responseBody) && gjson.ValidBytes(responseBody) {
+		switch info.RelayMode {
+		case relayconstant.RelayModeToolsFetch:
+			billable = content.Type == gjson.String && utf8.ValidString(content.Str) && content.Str != ""
+		default:
+			results := gjson.GetBytes(responseBody, "results")
+			billable = results.IsArray() && len(results.Array()) > 0
+		}
 	}
 	if !billable {
 		if info.Billing != nil {
@@ -133,7 +150,7 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 			Count       *int   `json:"count"`
 			NeedContent bool   `json:"need_content"`
 		}
-		if common.Unmarshal(jsonData, &requestFields) == nil && utf8.ValidString(requestFields.Query) &&
+		if utf8.Valid(jsonData) && common.Unmarshal(jsonData, &requestFields) == nil && utf8.ValidString(requestFields.Query) &&
 			strings.TrimSpace(requestFields.Query) != "" && utf8.RuneCountInString(requestFields.Query) <= 128 {
 			count := 10
 			if requestFields.Count != nil {
@@ -146,6 +163,39 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 			}
 		}
 	}
+	if info.OriginModelName == constant.DeepSeekFetchModel && displayFetchURL != "" {
+		info.FetchRequest = &relaycommon.DirectFetchLog{URL: displayFetchURL, URLRedacted: displayFetchURL != fetchURL,
+			ContentBytes: len(content.Str), Outcome: "success"}
+	}
 	service.PostTextConsumeQuota(c, info, &dto.Usage{}, nil)
 	return nil
+}
+
+// deepSeekFetchTarget supplies the same safe URL to usage metadata and errors.
+// It never changes the request sent to the provider.
+func deepSeekFetchTarget(body []byte) (rawURL, displayURL string) {
+	var fields struct {
+		URL string `json:"url"`
+	}
+	if common.Unmarshal(body, &fields) != nil {
+		return "", ""
+	}
+	if !utf8.Valid(body) || !utf8.ValidString(fields.URL) || utf8.RuneCountInString(fields.URL) > 8192 {
+		return fields.URL, ""
+	}
+	target, err := url.Parse(fields.URL)
+	if err != nil || target.Hostname() == "" || (target.Scheme != "http" && target.Scheme != "https") {
+		return fields.URL, ""
+	}
+	// Preserve Unicode and encoded separators in the original path.
+	displayURL = fields.URL
+	if end := strings.IndexAny(displayURL, "?#"); end >= 0 {
+		displayURL = displayURL[:end]
+	}
+	if target.User != nil {
+		start := strings.Index(displayURL, "://") + 3
+		authority, _, _ := strings.Cut(displayURL[start:], "/")
+		displayURL = displayURL[:start] + displayURL[start+strings.LastIndexByte(authority, '@')+1:]
+	}
+	return fields.URL, displayURL
 }

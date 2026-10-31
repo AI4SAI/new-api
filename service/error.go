@@ -84,7 +84,7 @@ func ClaudeErrorWrapperLocal(err error, code string, statusCode int) *dto.Claude
 	return claudeErr
 }
 
-func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool) (newApiErr *types.NewAPIError) {
+func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFail bool, redactors ...func(string) string) (newApiErr *types.NewAPIError) {
 	newApiErr = types.InitOpenAIError(types.ErrorCodeBadResponseStatusCode, resp.StatusCode)
 
 	responseBody, err := io.ReadAll(resp.Body)
@@ -94,15 +94,28 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 	CloseResponseBodyGracefully(resp)
 	var errResponse dto.GeneralErrorResponse
 	responseBodyText := string(responseBody)
+	hasRedactions := false
+	for _, redact := range redactors {
+		if redact != nil {
+			hasRedactions = true
+			responseBodyText = redact(responseBodyText)
+		}
+	}
 	responseBodyPreview := common.LocalLogPreview(responseBodyText)
+	responseBodyForError := responseBodyText
+	if hasRedactions {
+		// Invalid JSON can quote sensitive input using arbitrary escape forms.
+		// Keep its status without storing a raw body that cannot be decoded safely.
+		responseBodyPreview, responseBodyForError = "[redacted]", "[redacted]"
+	}
 	buildErrWithBody := func(message string) error {
 		if message == "" {
-			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyText)
+			return fmt.Errorf("bad response status code %d, body: %s", resp.StatusCode, responseBodyForError)
 		}
-		return fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, message, responseBodyText)
+		return fmt.Errorf("bad response status code %d, message: %s, body: %s", resp.StatusCode, message, responseBodyForError)
 	}
 
-	err = common.Unmarshal(responseBody, &errResponse)
+	err = common.UnmarshalJsonStr(responseBodyText, &errResponse)
 	if err != nil {
 		if showBodyWhenFail {
 			newApiErr.Err = buildErrWithBody("")
@@ -117,6 +130,14 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		// General format error (OpenAI, Anthropic, Gemini, etc.)
 		oaiError := errResponse.TryToOpenAIError()
 		if oaiError != nil {
+			for _, redact := range redactors {
+				if redact != nil {
+					oaiError.Message, oaiError.Type, oaiError.Param = redact(oaiError.Message), redact(oaiError.Type), redact(oaiError.Param)
+					if code, ok := oaiError.Code.(string); ok {
+						oaiError.Code = redact(code)
+					}
+				}
+			}
 			newApiErr = types.WithOpenAIError(*oaiError, resp.StatusCode)
 			if showBodyWhenFail {
 				newApiErr.Err = buildErrWithBody(newApiErr.Error())
@@ -125,6 +146,11 @@ func RelayErrorHandler(ctx context.Context, resp *http.Response, showBodyWhenFai
 		}
 	}
 	message := errResponse.ToMessage()
+	for _, redact := range redactors {
+		if redact != nil {
+			message = redact(message)
+		}
+	}
 	if message == "" {
 		// The body parsed as JSON but carried no usable error message; log the
 		// raw body so the upstream failure remains diagnosable.

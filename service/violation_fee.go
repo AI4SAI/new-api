@@ -104,6 +104,11 @@ func ChargeViolationFeeIfNeeded(ctx *gin.Context, relayInfo *relaycommon.RelayIn
 	if ctx == nil || relayInfo == nil || apiErr == nil {
 		return false
 	}
+	// DeepSeek Search/Fetch charge only successful results, including when a
+	// safety refusal happens to contain a Grok violation marker.
+	if relayInfo.RelayFormat == types.RelayFormatDeepSeekTools {
+		return false
+	}
 	//if relayInfo.IsPlayground {
 	//	return false
 	//}

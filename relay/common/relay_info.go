@@ -90,6 +90,14 @@ type DirectSearchLog struct {
 	Outcome     string `json:"outcome"`
 }
 
+// DirectFetchLog retains only a redacted target and the completed content size.
+type DirectFetchLog struct {
+	URL          string `json:"url"`
+	URLRedacted  bool   `json:"url_redacted"`
+	ContentBytes int    `json:"content_bytes"`
+	Outcome      string `json:"outcome"`
+}
+
 type RelayInfo struct {
 	TokenId           int
 	TokenKey          string
@@ -110,6 +118,7 @@ type RelayInfo struct {
 	OriginModelName        string
 	ResponseModel          *ResponseModel
 	SearchRequest          *DirectSearchLog
+	FetchRequest           *DirectFetchLog
 
 	// BillingModelName is the pricing identity for this request. It is kept
 	// separate from OriginModelName and UpstreamModelName so virtual pricing
@@ -279,6 +288,7 @@ func (info *RelayInfo) RequestedImageCount() int {
 func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 	info.ResponseModel = nil
 	info.SearchRequest = nil
+	info.FetchRequest = nil
 	info.FinalRequestRelayFormat = ""
 	info.RequestConversionChain = nil
 	info.InitRequestConversionChain()
