@@ -36,6 +36,9 @@ export function resolveLogsViewAccess(
 }
 
 interface UsageLogsContextValue {
+  workspaceKey?: string
+  accountLabel?: string
+  scopeKey: string
   selectedUserId: number | null
   setSelectedUserId: (userId: number | null) => void
   userInfoDialogOpen: boolean
@@ -54,7 +57,17 @@ const UsageLogsContext = createContext<UsageLogsContextValue | undefined>(
   undefined
 )
 
-export function UsageLogsProvider({ children }: { children: ReactNode }) {
+export function UsageLogsProvider({
+  children,
+  workspaceKey,
+  accountLabel,
+  scopeKey = 'personal',
+}: {
+  children: ReactNode
+  workspaceKey?: string
+  accountLabel?: string
+  scopeKey?: string
+}) {
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
   const [userInfoDialogOpen, setUserInfoDialogOpen] = useState(false)
   const [affinityTarget, setAffinityTarget] =
@@ -66,6 +79,9 @@ export function UsageLogsProvider({ children }: { children: ReactNode }) {
   return (
     <UsageLogsContext.Provider
       value={{
+        workspaceKey,
+        accountLabel,
+        scopeKey,
         selectedUserId,
         setSelectedUserId,
         userInfoDialogOpen,
@@ -103,9 +119,12 @@ export function useUsageLogsContext() {
  */
 export function useLogsViewScope() {
   const role = useAuthStore((state) => state.auth.user?.role ?? ROLE.GUEST)
-  const { viewScope, setViewScope } = useUsageLogsContext()
-  const canManageScope = role >= ROLE.ADMIN
-  const viewAccess = resolveLogsViewAccess(role, viewScope)
+  const { viewScope, setViewScope, workspaceKey } = useUsageLogsContext()
+  const canManageScope = !workspaceKey && role >= ROLE.ADMIN
+  const viewAccess = resolveLogsViewAccess(
+    role,
+    workspaceKey ? 'self' : viewScope
+  )
   const isAdminView = viewAccess !== 'self'
   const isRootView = viewAccess === 'root'
 

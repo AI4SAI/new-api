@@ -30,6 +30,7 @@ import {
   useDebouncedColumnFilter,
   useDataTable,
 } from '@/components/data-table'
+import { ErrorState } from '@/components/error-state'
 import { StatusBadge } from '@/components/status-badge'
 import {
   Empty,
@@ -217,9 +218,9 @@ function ApiKeysMobileList({
 
 export function ApiKeysTable() {
   const { t } = useTranslation()
-  const { refreshTrigger } = useApiKeys()
+  const { workspaceKey, scopeKey } = useApiKeys()
   const [now, setNow] = useState(() => Date.now())
-  const columns = useApiKeysColumns(now)
+  const columns = useApiKeysColumns(now, workspaceKey, scopeKey)
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -261,27 +262,35 @@ export function ApiKeysTable() {
 
   // Fetch data with React Query
   // eslint-disable-next-line @tanstack/query/exhaustive-deps
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, isError, refetch } = useQuery({
     queryKey: [
       'keys',
+      scopeKey,
       pagination.pageIndex + 1,
       pagination.pageSize,
       globalFilter,
       tokenFilter,
-      refreshTrigger,
     ],
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const result = shouldSearch
-        ? await searchApiKeys({
-            keyword: globalFilter,
-            token: tokenFilter,
-            p: pagination.pageIndex + 1,
-            size: pagination.pageSize,
-          })
-        : await getApiKeys({
-            p: pagination.pageIndex + 1,
-            size: pagination.pageSize,
-          })
+        ? await searchApiKeys(
+            {
+              keyword: globalFilter,
+              token: tokenFilter,
+              p: pagination.pageIndex + 1,
+              size: pagination.pageSize,
+            },
+            workspaceKey,
+            signal
+          )
+        : await getApiKeys(
+            {
+              p: pagination.pageIndex + 1,
+              size: pagination.pageSize,
+            },
+            workspaceKey,
+            signal
+          )
 
       if (!result.success) {
         throw createServerError(
@@ -338,7 +347,9 @@ export function ApiKeysTable() {
     }
   }, [columnVisibility, table])
 
-  return (
+  return isError ? (
+    <ErrorState onRetry={() => void refetch()} />
+  ) : (
     <DataTablePage
       table={table}
       columns={columns}

@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQueryClient } from '@tanstack/react-query'
 import React, { useState, useCallback, useRef, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
 
@@ -27,11 +28,12 @@ import { ERROR_MESSAGES } from '../constants'
 import type { ApiKey, ApiKeysDialogType } from '../types'
 
 type ApiKeysContextType = {
+  workspaceKey?: string
+  scopeKey: string
   open: ApiKeysDialogType | null
   setOpen: (str: ApiKeysDialogType | null) => void
   currentRow: ApiKey | null
   setCurrentRow: React.Dispatch<React.SetStateAction<ApiKey | null>>
-  refreshTrigger: number
   triggerRefresh: () => void
   resolvedKey: string
   setResolvedKey: React.Dispatch<React.SetStateAction<string>>
@@ -45,11 +47,19 @@ type ApiKeysContextType = {
 
 const ApiKeysContext = React.createContext<ApiKeysContextType | null>(null)
 
-export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
+export function ApiKeysProvider({
+  children,
+  workspaceKey,
+  scopeKey = 'personal',
+}: {
+  children: React.ReactNode
+  workspaceKey?: string
+  scopeKey?: string
+}) {
   const { t } = useTranslation()
+  const queryClient = useQueryClient()
   const [open, setOpen] = useDialogState<ApiKeysDialogType>(null)
   const [currentRow, setCurrentRow] = useState<ApiKey | null>(null)
-  const [refreshTrigger, setRefreshTrigger] = useState(0)
   const [resolvedKey, setResolvedKey] = useState('')
 
   const [resolvedKeys, setResolvedKeys] = useState<Record<number, string>>({})
@@ -58,9 +68,15 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
 
   const [copiedKeyId, setCopiedKeyId] = useState<number | null>(null)
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined)
+  const requestAbort = useRef(new AbortController())
 
   useEffect(() => {
-    return () => clearTimeout(copiedTimerRef.current)
+    const controller = new AbortController()
+    requestAbort.current = controller
+    return () => {
+      clearTimeout(copiedTimerRef.current)
+      controller.abort()
+    }
   }, [])
 
   const markKeyCopied = useCallback((id: number) => {
@@ -70,18 +86,20 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const triggerRefresh = useCallback(() => {
-    setRefreshTrigger((prev) => prev + 1)
-  }, [])
+    void queryClient.invalidateQueries({ queryKey: ['keys', scopeKey] })
+  }, [queryClient, scopeKey])
 
   const resolveRealKey = useCallback(
     async (id: number): Promise<string | null> => {
-      if (resolvedKeys[id]) return resolvedKeys[id]
+      if (!workspaceKey && resolvedKeys[id]) return resolvedKeys[id]
       if (id in pendingRequests.current) return pendingRequests.current[id]
 
       const request = (async () => {
+        const signal = requestAbort.current.signal
         setLoadingKeys((prev) => ({ ...prev, [id]: true }))
         try {
-          const res = await fetchTokenKey(id)
+          const res = await fetchTokenKey(id, workspaceKey, signal)
+          if (signal.aborted) return null
           if (res.success && res.data?.key) {
             const fullKey = `sk-${res.data.key}`
             setResolvedKeys((prev) => ({ ...prev, [id]: fullKey }))
@@ -90,6 +108,7 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
           handleServerError(res, t(ERROR_MESSAGES.UNEXPECTED))
           return null
         } catch (error) {
+          if (signal.aborted) return null
           handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
           return null
         } finally {
@@ -105,12 +124,14 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
       pendingRequests.current[id] = request
       return request
     },
-    [resolvedKeys, t]
+    [resolvedKeys, t, workspaceKey]
   )
 
   const resolveRealKeysBatch = useCallback(
     async (ids: number[]): Promise<Record<number, string>> => {
-      const uncachedIds = ids.filter((id) => !resolvedKeys[id])
+      const uncachedIds = workspaceKey
+        ? ids
+        : ids.filter((id) => !resolvedKeys[id])
       if (uncachedIds.length === 0) {
         const result: Record<number, string> = {}
         for (const id of ids) result[id] = resolvedKeys[id]
@@ -121,8 +142,10 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
         setLoadingKeys((prev) => ({ ...prev, [id]: true }))
       }
 
+      const signal = requestAbort.current.signal
       try {
-        const res = await fetchTokenKeysBatch(uncachedIds)
+        const res = await fetchTokenKeysBatch(uncachedIds, workspaceKey, signal)
+        if (signal.aborted) return {}
         if (res.success && res.data?.keys) {
           const newKeys: Record<number, string> = {}
           for (const [idStr, key] of Object.entries(res.data.keys)) {
@@ -132,13 +155,14 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
 
           const result: Record<number, string> = { ...newKeys }
           for (const id of ids) {
-            if (resolvedKeys[id]) result[id] = resolvedKeys[id]
+            if (!workspaceKey && resolvedKeys[id]) result[id] = resolvedKeys[id]
           }
           return result
         }
         handleServerError(res, t(ERROR_MESSAGES.UNEXPECTED))
         return {}
       } catch (error) {
+        if (signal.aborted) return {}
         handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
         return {}
       } finally {
@@ -151,17 +175,18 @@ export function ApiKeysProvider({ children }: { children: React.ReactNode }) {
         }
       }
     },
-    [resolvedKeys, t]
+    [resolvedKeys, t, workspaceKey]
   )
 
   return (
     <ApiKeysContext
       value={{
+        workspaceKey,
+        scopeKey,
         open,
         setOpen,
         currentRow,
         setCurrentRow,
-        refreshTrigger,
         triggerRefresh,
         resolvedKey,
         setResolvedKey,

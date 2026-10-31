@@ -16,13 +16,15 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { getRouteApi, useNavigate } from '@tanstack/react-router'
+import { getRouteApi, Link, useNavigate } from '@tanstack/react-router'
 import { useCallback, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { SectionPageLayout } from '@/components/layout'
 import type { NavGroup } from '@/components/layout/types'
+import { Button } from '@/components/ui/button'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ManagedAccountBoundary } from '@/features/keys/components/managed-account-boundary'
 import { CacheStatsDialog } from '@/features/system-settings/general/channel-affinity/cache-stats-dialog'
 import { useSidebarConfig } from '@/hooks/use-sidebar-config'
 
@@ -70,6 +72,8 @@ function UsageLogsContent() {
     affinityTarget,
     affinityDialogOpen,
     setAffinityDialogOpen,
+    accountLabel,
+    workspaceKey,
   } = useUsageLogsContext()
   const { canManageScope, viewScope, setViewScope } = useLogsViewScope()
   const tabNavGroups = useMemo<NavGroup[]>(
@@ -103,9 +107,10 @@ function UsageLogsContent() {
       void navigate({
         to: '/usage-logs/$section',
         params: { section: section as UsageLogsSectionId },
+        search: { workspace_key: workspaceKey },
       })
     },
-    [navigate]
+    [navigate, workspaceKey]
   )
 
   const handleViewScopeChange = useCallback(
@@ -124,11 +129,26 @@ function UsageLogsContent() {
 
   return (
     <>
-      <SectionPageLayout fixedContent>
+      <SectionPageLayout
+        fixedContent
+        stackActionsOnMobile={Boolean(workspaceKey)}
+      >
         <SectionPageLayout.Title>
-          {t(pageMeta.titleKey)}
+          {accountLabel
+            ? `${accountLabel} · ${t(pageMeta.titleKey)}`
+            : t(pageMeta.titleKey)}
         </SectionPageLayout.Title>
         <SectionPageLayout.Actions>
+          {workspaceKey && (
+            <Button
+              variant='outline'
+              render={
+                <Link to='/keys' search={{ workspace_key: workspaceKey }} />
+              }
+            >
+              {t('API Keys')}
+            </Button>
+          )}
           {canManageScope && (
             <Tabs value={viewScope} onValueChange={handleViewScopeChange}>
               <TabsList>
@@ -186,9 +206,19 @@ function UsageLogsContent() {
 }
 
 export function UsageLogs() {
+  const workspaceKey = route.useSearch().workspace_key
   return (
-    <UsageLogsProvider>
-      <UsageLogsContent />
-    </UsageLogsProvider>
+    <ManagedAccountBoundary workspaceKey={workspaceKey}>
+      {(account, scopeKey) => (
+        <UsageLogsProvider
+          key={scopeKey}
+          workspaceKey={workspaceKey}
+          accountLabel={account?.account_label}
+          scopeKey={scopeKey}
+        >
+          <UsageLogsContent />
+        </UsageLogsProvider>
+      )}
+    </ManagedAccountBoundary>
   )
 }

@@ -18,6 +18,18 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
+export const managedWorkspaceKeySchema = z
+  .string()
+  .regex(/^(org|project):[0-9a-f-]{36}$/)
+  .optional()
+
+export interface ManagedAccountContext {
+  workspace_key: string
+  native_owner_id: number
+  account_label: string
+  account_kind: 'org' | 'project'
+}
+
 // ============================================================================
 // API Key Schema & Types
 // ============================================================================
@@ -29,6 +41,7 @@ export const apiKeySchema = z.object({
   status: z.number(), // 1: enabled, 2: disabled, 3: expired, 4: exhausted
   remain_quota: z.number(),
   used_quota: z.number(),
+  quota_revision: z.number().int().nonnegative().optional().default(0),
   unlimited_quota: z.boolean(),
   expired_time: z.number(), // -1 for never expires
   created_time: z.number(),
@@ -86,7 +99,9 @@ export interface SearchApiKeysParams {
 
 export interface ApiKeyFormData {
   name: string
-  remain_quota: number
+  remain_quota?: number
+  quota_delta?: number
+  expected_quota_revision?: number
   expired_time: number
   unlimited_quota: boolean
   model_limits_enabled: boolean

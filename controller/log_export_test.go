@@ -25,13 +25,19 @@ import (
 
 // callLogHandler runs a log handler as the given user and returns the JSON
 // lines of the response.
-func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int, query string) []map[string]any {
+func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int, query string, managedOwner ...int) []map[string]any {
 	t.Helper()
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/log?"+query, nil)
 	ctx.Set("id", userId)
 	ctx.Set("role", role)
+	if len(managedOwner) == 1 {
+		ids, err := model.ExternalTokenIDs(managedOwner[0])
+		require.NoError(t, err)
+		ctx.Set("managed_account", &service.ManagedAccount{OwnerID: managedOwner[0]})
+		ctx.Set("management_token_ids", ids)
+	}
 	handler(ctx)
 	var lines []map[string]any
 	for line := range strings.SplitSeq(strings.TrimSpace(recorder.Body.String()), "\n") {
@@ -40,6 +46,46 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 		lines = append(lines, value)
 	}
 	return lines
+}
+
+func TestManagedLogsKeepDeletedExternalHistoryWithoutInternalKeys(t *testing.T) {
+	for _, database := range []struct {
+		name, env string
+		kind      common.DatabaseType
+	}{
+		{"sqlite", "", common.DatabaseTypeSQLite}, {"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL}, {"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL},
+	} {
+		t.Run(database.name, func(t *testing.T) {
+			dsn := os.Getenv(database.env)
+			if database.env != "" && dsn == "" {
+				t.Skip(database.env + " is not configured")
+			}
+			mainDB, _ := newAuditTestDatabase(t, database.name, dsn)
+			logDB, _ := newAuditTestDatabase(t, database.name, dsn)
+			useLogExportDatabases(t, mainDB, logDB, database.kind, database.kind)
+			require.NoError(t, mainDB.AutoMigrate(&model.Token{}, &model.User{}))
+			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
+			require.NoError(t, mainDB.Create(&model.User{Id: 41, Username: "org-owner", Group: "default", AffCode: "logs-owner"}).Error)
+			external := seedToken(t, mainDB, 41, "device", "external-log-key")
+			internal := seedToken(t, mainDB, 41, "pilot", "internal-log-key")
+			require.NoError(t, mainDB.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+			now := time.Now().Unix()
+			for _, entry := range []model.Log{{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5}, {UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100}, {UserId: 42, TokenId: external.Id, RequestId: "another-owner", Quota: 1000}} {
+				entry.Type = model.LogTypeConsume
+				entry.CreatedAt = now
+				entry.Username = "former-org-name"
+				require.NoError(t, logDB.Create(&entry).Error)
+			}
+			require.NoError(t, external.Delete())
+			listed := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
+			require.EqualValues(t, 1, listed["data"].(map[string]any)["total"])
+			require.NotContains(t, fmt.Sprint(listed), "pilot-private")
+			stat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "", 41)[0]
+			require.EqualValues(t, 5, stat["data"].(map[string]any)["quota"])
+			exported := callLogHandler(t, ExportUserLogs, 7, common.RoleAdminUser, "", 41)
+			require.Equal(t, []any{"external-history"}, exportedRequestIds(exported))
+		})
+	}
 }
 
 func exportedRequestIds(lines []map[string]any) []any {

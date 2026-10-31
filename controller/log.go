@@ -51,6 +51,13 @@ func logFilterFromQuery(c *gin.Context, admin bool) model.LogFilter {
 	if value, exists := c.GetQuery("billing_context_ref"); exists {
 		filter.BillingContextRef = &value
 	}
+	if service.ManagementAccount(c) != nil {
+		value, _ := c.Get("management_token_ids")
+		ids, _ := value.([]int)
+		filter.ExternalTokenIDs = &ids
+		owner := service.ManagementOwnerID(c)
+		filter.UserID = &owner
+	}
 	return filter
 }
 
@@ -101,7 +108,7 @@ func GetUserLogs(c *gin.Context) {
 		}
 		filter.StartTimestamp = startTimestamp
 	}
-	logs, total, err := model.GetUserLogs(c.GetInt("id"), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	logs, total, err := model.GetUserLogs(service.ManagementOwnerID(c), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -139,7 +146,7 @@ func exportLogs(c *gin.Context, all bool) {
 	}
 	filter.StartTimestamp = startTimestamp
 
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	release, ok, err := service.AcquireLogExportLock(userId)
 	if err != nil {
 		common.SysError(common.LogText("failed to lock log export: %s", err.Error()))
@@ -274,6 +281,9 @@ func GetLogsStat(c *gin.Context) {
 
 func GetLogsSelfStat(c *gin.Context) {
 	username := c.GetString("username")
+	if service.ManagementAccount(c) != nil {
+		username = ""
+	}
 	logType, _ := strconv.Atoi(c.Query("type"))
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
@@ -285,10 +295,11 @@ func GetLogsSelfStat(c *gin.Context) {
 		}
 	}
 	tokenName := c.Query("token_name")
-	modelName := c.Query("model_name")
 	channel, _ := strconv.Atoi(c.Query("channel"))
 	group := c.Query("group")
-	quotaNum, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group)
+	filter := logFilterFromQuery(c, false)
+	filter.StartTimestamp = startTimestamp
+	quotaNum, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, "", username, tokenName, channel, group, filter)
 	if err != nil {
 		common.ApiError(c, err)
 		return

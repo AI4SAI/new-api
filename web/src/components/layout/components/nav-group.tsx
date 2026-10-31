@@ -122,18 +122,22 @@ function NavBadge({ children }: { children: ReactNode }) {
  */
 function SidebarMenuLink({ item, href }: { item: NavLink; href: string }) {
   const { isMobile, setOpenMobile } = useSidebar()
+  const workspaceKey = new URL(
+    href,
+    'https://navigation.invalid'
+  ).searchParams.get('workspace_key')
+  let link = <Link to={item.url} preload={isMobile ? false : undefined} onClick={() => setOpenMobile(false)} />
+  if (workspaceKey && item.url === '/keys') {
+    link = <Link to='/keys' search={{ workspace_key: workspaceKey }} preload={isMobile ? false : undefined} onClick={() => setOpenMobile(false)} />
+  } else if (workspaceKey && item.url === '/usage-logs/common') {
+    link = <Link to='/usage-logs/$section' params={{ section: 'common' }} search={{ workspace_key: workspaceKey }} preload={isMobile ? false : undefined} onClick={() => setOpenMobile(false)} />
+  }
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
         isActive={checkIsActive(href, item)}
         tooltip={item.title}
-        render={
-          <Link
-            to={item.url}
-            preload={isMobile ? false : undefined}
-            onClick={() => setOpenMobile(false)}
-          />
-        }
+        render={link}
       >
         {item.icon && <item.icon className='shrink-0' />}
         <span className='min-w-0 flex-1 truncate'>{item.title}</span>

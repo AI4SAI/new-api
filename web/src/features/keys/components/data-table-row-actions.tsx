@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useNavigate } from '@tanstack/react-router'
 import type { Row } from '@tanstack/react-table'
 import {
   Trash2,
@@ -80,6 +81,7 @@ export function DataTableRowActions<TData>({
   row,
 }: DataTableRowActionsProps<TData>) {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const apiKey = apiKeySchema.parse(row.original)
   const {
     setOpen,
@@ -88,6 +90,7 @@ export function DataTableRowActions<TData>({
     setResolvedKey,
     resolveRealKey,
     loadingKeys,
+    workspaceKey,
   } = useApiKeys()
   const isEnabled = apiKey.status === API_KEY_STATUS.ENABLED
   const { chatPresets, serverAddress } = useChatPresets()
@@ -148,7 +151,11 @@ export function DataTableRowActions<TData>({
 
     setIsTogglingStatus(true)
     try {
-      const result = await updateApiKeyStatus(apiKey.id, newStatus)
+      const result = await updateApiKeyStatus(
+        apiKey.id,
+        newStatus,
+        workspaceKey
+      )
       if (result.success) {
         const message = isEnabled
           ? t(SUCCESS_MESSAGES.API_KEY_DISABLED)
@@ -220,6 +227,21 @@ export function DataTableRowActions<TData>({
         contentClassName='w-[200px]'
         modal={false}
       >
+        <DropdownMenuItem
+          onClick={() =>
+            void navigate({
+              to: '/usage-logs/$section',
+              params: { section: 'common' },
+              search: {
+                workspace_key: workspaceKey,
+                token: apiKey.name,
+                token_id: workspaceKey ? apiKey.id : undefined,
+              },
+            })
+          }
+        >
+          {t('Usage')}
+        </DropdownMenuItem>
         <DropdownMenuItem
           disabled={isRealKeyLoading}
           onClick={async () => {

@@ -41,6 +41,7 @@ const baseApiKey: ApiKey = {
   status: 1,
   remain_quota: 0,
   used_quota: 0,
+  quota_revision: 0,
   unlimited_quota: true,
   expired_time: -1,
   created_time: 1,

@@ -36,7 +36,7 @@ afterEach(() => {
 })
 
 function renderDialog(models = ['gpt-5.4', 'claude-sonnet-4-6']) {
-  queryClient.setQueryData(['user-models-ccswitch'], {
+  queryClient.setQueryData(['user-models-ccswitch', undefined], {
     success: true,
     data: models,
   })
@@ -104,7 +104,7 @@ describe('CC Switch model selection', () => {
 
     expect(await screen.findByText('No models found')).toBeVisible()
     await act(async () => {
-      queryClient.setQueryData(['user-models-ccswitch'], {
+      queryClient.setQueryData(['user-models-ccswitch', undefined], {
         success: true,
         data: ['gpt-5.4'],
       })

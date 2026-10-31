@@ -39,6 +39,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { modelAccountRequest } from '@/features/keys/api'
 import { getGroups } from '@/features/users/api'
 import { useMediaQuery } from '@/hooks'
 import { getUserGroups } from '@/lib/api'
@@ -125,7 +126,8 @@ export function CommonLogsFilterBar<TData>(
   const queryClient = useQueryClient()
   const searchParams = route.useSearch()
   const { isAdminView: isAdmin } = useLogsViewScope()
-  const { sensitiveVisible, setSensitiveVisible } = useUsageLogsContext()
+  const { sensitiveVisible, setSensitiveVisible, workspaceKey, scopeKey } =
+    useUsageLogsContext()
   const fetchingLogs = useIsFetching({ queryKey: ['logs'] })
   const { data: adminGroups } = useQuery({
     queryKey: ['groups'],
@@ -133,8 +135,11 @@ export function CommonLogsFilterBar<TData>(
     enabled: isAdmin,
   })
   const { data: userGroups } = useQuery({
-    queryKey: ['user-groups'],
-    queryFn: async () => requireServerSuccess(await getUserGroups()),
+    queryKey: ['user-groups', scopeKey],
+    queryFn: async () =>
+      requireServerSuccess(
+        await getUserGroups(modelAccountRequest(workspaceKey))
+      ),
     enabled: !isAdmin,
   })
   const groupOptions = useMemo(() => {
@@ -219,6 +224,11 @@ export function CommonLogsFilterBar<TData>(
         params: { section: 'common' },
         search: {
           ...filterParams,
+          workspace_key: workspaceKey,
+          token_id:
+            nextFilters.token === searchParams.token
+              ? searchParams.token_id
+              : undefined,
           type: [logType],
           page: 1,
         },
@@ -226,7 +236,15 @@ export function CommonLogsFilterBar<TData>(
       queryClient.invalidateQueries({ queryKey: ['logs'] })
       queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
     },
-    [filters, logType, navigate, queryClient]
+    [
+      filters,
+      logType,
+      navigate,
+      queryClient,
+      workspaceKey,
+      searchParams.token,
+      searchParams.token_id,
+    ]
   )
 
   const handleReset = useCallback(() => {
@@ -249,11 +267,12 @@ export function CommonLogsFilterBar<TData>(
       search: {
         page: 1,
         ...resetSearch,
+        workspace_key: workspaceKey,
       },
     })
     queryClient.invalidateQueries({ queryKey: ['logs'] })
     queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
-  }, [navigate, queryClient])
+  }, [navigate, queryClient, workspaceKey])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {

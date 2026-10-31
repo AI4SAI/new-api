@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import type { TFunction } from 'i18next'
 import { z } from 'zod'
 
-import { parseQuotaFromDollars, quotaUnitsToDollars } from '@/lib/format'
+import { parseQuotaFromDollars } from '@/lib/format'
 
 import { DEFAULT_GROUP } from '../constants'
 import type { ApiKey, ApiKeyFormData } from '../types'
@@ -28,7 +28,11 @@ import type { ApiKey, ApiKeyFormData } from '../types'
 // Form Schema
 // ============================================================================
 
-export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
+export function getApiKeyFormSchema(
+  t: TFunction,
+  maxAutoGroups = 5,
+  updating = false
+) {
   const autoGroupLimit =
     Number.isInteger(maxAutoGroups) && maxAutoGroups > 0 ? maxAutoGroups : 5
 
@@ -87,7 +91,7 @@ export function getApiKeyFormSchema(t: TFunction, maxAutoGroups = 5) {
 
       if (
         data.remain_quota_dollars === undefined ||
-        data.remain_quota_dollars < 0
+        (!updating && data.remain_quota_dollars < 0)
       ) {
         ctx.addIssue({
           code: 'custom',
@@ -139,13 +143,19 @@ export function getApiKeyFormDefaultValues(
  * Transform form data to API payload
  */
 export function transformFormDataToPayload(
-  data: ApiKeyFormValues
+  data: ApiKeyFormValues,
+  updating = false
 ): ApiKeyFormData {
+  const delta = parseQuotaFromDollars(data.remain_quota_dollars || 0)
+  const quotaFields: Pick<ApiKeyFormData, 'remain_quota' | 'quota_delta'> = {}
+  if (updating) {
+    if (delta !== 0) quotaFields.quota_delta = delta
+  } else {
+    quotaFields.remain_quota = data.unlimited_quota ? 0 : delta
+  }
   return {
     name: data.name,
-    remain_quota: data.unlimited_quota
-      ? 0
-      : parseQuotaFromDollars(data.remain_quota_dollars || 0),
+    ...quotaFields,
     expired_time: data.expired_time
       ? Math.floor(data.expired_time.getTime() / 1000)
       : -1,
@@ -180,9 +190,7 @@ export function transformApiKeyToFormDefaults(
 
   return {
     name: apiKey.name,
-    remain_quota_dollars: apiKey.unlimited_quota
-      ? 0
-      : quotaUnitsToDollars(apiKey.remain_quota),
+    remain_quota_dollars: 0,
     expired_time:
       apiKey.expired_time > 0
         ? new Date(apiKey.expired_time * 1000)

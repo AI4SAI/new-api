@@ -425,6 +425,7 @@ export interface TaskArtifactsResponse {
 // ============================================================================
 
 export interface GetLogsParams {
+  token_id?: number
   p?: number
   page_size?: number
   type?: number
@@ -451,6 +452,7 @@ export interface GetLogsResponse {
 }
 
 export interface GetLogStatsParams {
+  token_id?: number
   type?: number
   username?: string
   token_name?: string

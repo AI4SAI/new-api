@@ -18,6 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
+import axios from 'axios'
 import { ChevronDown, KeyRound, Settings2, WalletCards } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type SubmitErrorHandler } from 'react-hook-form'
@@ -34,6 +35,7 @@ import {
   sideDrawerHeaderClassName,
   sideDrawerSwitchItemClassName,
 } from '@/components/drawer-layout'
+import { ErrorState } from '@/components/error-state'
 import { MultiSelect } from '@/components/multi-select'
 import { Button } from '@/components/ui/button'
 import {
@@ -78,6 +80,7 @@ import {
   updateApiKey,
   getApiKey,
   getTokenAutoGroups,
+  modelAccountRequest,
 } from '../api'
 import { ERROR_MESSAGES, SUCCESS_MESSAGES } from '../constants'
 import {
@@ -109,9 +112,13 @@ export function ApiKeysMutateDrawer({
   const { t } = useTranslation()
   const isUpdate = !!currentRow
   const currentRowId = currentRow?.id
-  const { triggerRefresh } = useApiKeys()
+  const { triggerRefresh, workspaceKey, scopeKey } = useApiKeys()
   const { status, loading: statusLoading } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [needsReview, setNeedsReview] = useState<'unknown' | 'changed' | null>(
+    null
+  )
+  const [quotaRevision, setQuotaRevision] = useState<number | undefined>()
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [initializedTarget, setInitializedTarget] = useState<string | null>(
     null
@@ -119,9 +126,16 @@ export function ApiKeysMutateDrawer({
   const defaultUseAutoGroup = status?.default_use_auto_group === true
 
   // Fetch models
-  const { data: modelsData } = useQuery({
-    queryKey: ['user-models'],
-    queryFn: async () => requireServerSuccess(await getUserModels()),
+  const {
+    data: modelsData,
+    isError: modelsFailed,
+    refetch: retryModels,
+  } = useQuery({
+    queryKey: ['user-models', scopeKey],
+    queryFn: async () =>
+      requireServerSuccess(
+        await getUserModels(modelAccountRequest(workspaceKey))
+      ),
     enabled: open,
     staleTime: 0,
   })
@@ -131,9 +145,14 @@ export function ApiKeysMutateDrawer({
     data: groupsData,
     isFetched: groupsFetched,
     isFetching: groupsFetching,
+    isError: groupsFailed,
+    refetch: retryGroups,
   } = useQuery({
-    queryKey: ['user-groups'],
-    queryFn: async () => requireServerSuccess(await getUserGroups()),
+    queryKey: ['user-groups', scopeKey],
+    queryFn: async () =>
+      requireServerSuccess(
+        await getUserGroups(modelAccountRequest(workspaceKey))
+      ),
     enabled: open,
     staleTime: 0,
   })
@@ -142,10 +161,12 @@ export function ApiKeysMutateDrawer({
     data: apiKeyData,
     isFetched: apiKeyFetched,
     isFetching: apiKeyFetching,
+    isError: apiKeyFailed,
+    refetch: retryApiKey,
   } = useQuery({
-    queryKey: ['api-key', currentRowId],
+    queryKey: ['api-key', scopeKey, currentRowId],
     queryFn: async () =>
-      requireServerSuccess(await getApiKey(currentRowId ?? 0)),
+      requireServerSuccess(await getApiKey(currentRowId ?? 0, workspaceKey)),
     enabled: open && isUpdate && currentRowId !== undefined,
     staleTime: 0,
   })
@@ -154,14 +175,22 @@ export function ApiKeysMutateDrawer({
     data: autoGroupsData,
     isFetched: autoGroupsFetched,
     isFetching: autoGroupsFetching,
+    isError: autoGroupsFailed,
+    refetch: retryAutoGroups,
   } = useQuery({
-    queryKey: ['token-auto-groups'],
-    queryFn: async () => requireServerSuccess(await getTokenAutoGroups()),
+    queryKey: ['token-auto-groups', scopeKey],
+    queryFn: async () =>
+      requireServerSuccess(await getTokenAutoGroups(workspaceKey)),
     enabled: open,
     staleTime: 0,
   })
 
   const models = modelsData?.data || []
+  const readFailed =
+    modelsFailed ||
+    groupsFailed ||
+    autoGroupsFailed ||
+    (isUpdate && apiKeyFailed)
   const groups = useMemo<ApiKeyGroupOption[]>(
     () =>
       Object.entries(groupsData?.data || {}).map(([key, info]) => ({
@@ -196,8 +225,8 @@ export function ApiKeysMutateDrawer({
       ? Number(autoGroupsData?.data?.max_count)
       : 5
   const schema = useMemo(
-    () => getApiKeyFormSchema(t, maxAutoGroups),
-    [t, maxAutoGroups]
+    () => getApiKeyFormSchema(t, maxAutoGroups, isUpdate),
+    [t, maxAutoGroups, isUpdate]
   )
 
   const form = useForm<ApiKeyFormValues>({
@@ -209,6 +238,7 @@ export function ApiKeysMutateDrawer({
   useEffect(() => {
     if (!open) {
       setInitializedTarget(null)
+      setNeedsReview(null)
       return
     }
     if (
@@ -219,13 +249,14 @@ export function ApiKeysMutateDrawer({
     ) {
       return
     }
-    if (isUpdate && (!apiKeyFetched || apiKeyFetching)) return
+    if (readFailed || (isUpdate && (!apiKeyFetched || apiKeyFetching))) return
     if (!isUpdate && statusLoading) return
 
     const target = isUpdate && currentRow ? `update:${currentRow.id}` : 'create'
     if (initializedTarget === target) return
     if (isUpdate && currentRow) {
       if (apiKeyData?.success && apiKeyData.data) {
+        setQuotaRevision(apiKeyData.data.quota_revision)
         form.reset(
           transformApiKeyToFormDefaults(
             apiKeyData.data,
@@ -259,6 +290,7 @@ export function ApiKeysMutateDrawer({
     availableAutoGroupNames,
     maxAutoGroups,
     initializedTarget,
+    readFailed,
   ])
 
   const formTarget =
@@ -285,15 +317,27 @@ export function ApiKeysMutateDrawer({
   }, [groups, form, selectedGroup])
 
   const onSubmit = async (data: ApiKeyFormValues) => {
+    if (readFailed || needsReview || isSubmitting) return
     setIsSubmitting(true)
     try {
-      const basePayload = transformFormDataToPayload(data)
+      const basePayload = transformFormDataToPayload(data, isUpdate)
+      if (workspaceKey) basePayload.allow_user_quota_query = false
+      if (isUpdate && basePayload.quota_delta) {
+        if (!Number.isSafeInteger(quotaRevision)) {
+          setNeedsReview('changed')
+          return
+        }
+        basePayload.expected_quota_revision = quotaRevision
+      }
 
       if (isUpdate && currentRow) {
-        const result = await updateApiKey({
-          ...basePayload,
-          id: currentRow.id,
-        })
+        const result = await updateApiKey(
+          {
+            ...basePayload,
+            id: currentRow.id,
+          },
+          workspaceKey
+        )
         if (result.success) {
           toast.success(t(SUCCESS_MESSAGES.API_KEY_UPDATED))
           onOpenChange(false)
@@ -307,13 +351,16 @@ export function ApiKeysMutateDrawer({
         let successCount = 0
 
         for (let i = 0; i < count; i++) {
-          const result = await createApiKey({
-            ...basePayload,
-            name:
-              i === 0 && data.name
-                ? data.name
-                : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
-          })
+          const result = await createApiKey(
+            {
+              ...basePayload,
+              name:
+                i === 0 && data.name
+                  ? data.name
+                  : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
+            },
+            workspaceKey
+          )
           if (result.success) {
             successCount++
           } else {
@@ -333,6 +380,14 @@ export function ApiKeysMutateDrawer({
         }
       }
     } catch (error) {
+      if (
+        axios.isAxiosError(error) &&
+        (!error.response ||
+          error.response.status >= 500 ||
+          error.response.status === 409)
+      ) {
+        setNeedsReview(error.response?.status === 409 ? 'changed' : 'unknown')
+      }
       handleServerError(error, t(ERROR_MESSAGES.UNEXPECTED))
     } finally {
       setIsSubmitting(false)
@@ -360,7 +415,9 @@ export function ApiKeysMutateDrawer({
   const { meta: currencyMeta } = getCurrencyDisplay()
   const currencyLabel = getCurrencyLabel()
   const tokensOnly = currencyMeta.kind === 'tokens'
-  const quotaLabel = t('Quota ({{currency}})', { currency: currencyLabel })
+  const quotaLabel = isUpdate
+    ? t('Quota adjustment ({{currency}})', { currency: currencyLabel })
+    : t('Quota ({{currency}})', { currency: currencyLabel })
   const quotaPlaceholder = tokensOnly
     ? t('Enter quota in tokens')
     : t('Enter quota in {{currency}}', { currency: currencyLabel })
@@ -616,7 +673,7 @@ export function ApiKeysMutateDrawer({
                 icon={<WalletCards className='size-4' />}
                 iconTone='success'
               />
-              {!unlimitedQuota && (
+              {(!unlimitedQuota || isUpdate) && (
                 <FormField
                   control={form.control}
                   name='remain_quota_dollars'
@@ -753,30 +810,32 @@ export function ApiKeysMutateDrawer({
                       )}
                     />
 
-                    <FormField
-                      control={form.control}
-                      name='allow_user_quota_query'
-                      render={({ field }) => (
-                        <FormItem className={sideDrawerSwitchItemClassName()}>
-                          <div className='flex flex-col gap-0.5'>
-                            <FormLabel className='text-sm'>
-                              {t('Allow querying user quota')}
-                            </FormLabel>
-                            <FormDescription className='text-xs'>
-                              {t(
-                                "When enabled, this API key can be used to check your account's remaining and used quota."
-                              )}
-                            </FormDescription>
-                          </div>
-                          <FormControl>
-                            <Switch
-                              checked={field.value}
-                              onCheckedChange={field.onChange}
-                            />
-                          </FormControl>
-                        </FormItem>
-                      )}
-                    />
+                    {!workspaceKey && (
+                      <FormField
+                        control={form.control}
+                        name='allow_user_quota_query'
+                        render={({ field }) => (
+                          <FormItem className={sideDrawerSwitchItemClassName()}>
+                            <div className='flex flex-col gap-0.5'>
+                              <FormLabel className='text-sm'>
+                                {t('Allow querying user quota')}
+                              </FormLabel>
+                              <FormDescription className='text-xs'>
+                                {t(
+                                  "When enabled, this API key can be used to check your account's remaining and used quota."
+                                )}
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                    )}
                   </div>
                 </CollapsibleContent>
               </SideDrawerSection>
@@ -784,6 +843,40 @@ export function ApiKeysMutateDrawer({
           </form>
         </Form>
         <SheetFooter className={sideDrawerFooterClassName()}>
+          {readFailed && (
+            <ErrorState
+              className='min-h-0'
+              onRetry={() => {
+                void Promise.allSettled([
+                  retryModels(),
+                  retryGroups(),
+                  retryAutoGroups(),
+                  ...(isUpdate ? [retryApiKey()] : []),
+                ])
+              }}
+            />
+          )}
+          {needsReview && (
+            <div role='alert' className='flex flex-col gap-2'>
+              <p>
+                {t(
+                  needsReview === 'changed'
+                    ? 'Token quota changed; reload before adjusting it'
+                    : 'The result is unknown. Review the keys before submitting another change.'
+                )}
+              </p>
+              <Button
+                type='button'
+                variant='outline'
+                onClick={() => {
+                  triggerRefresh()
+                  onOpenChange(false)
+                }}
+              >
+                {t('Review keys')}
+              </Button>
+            </div>
+          )}
           <SheetClose
             render={<Button variant='outline' className='w-full sm:w-auto' />}
           >
@@ -792,7 +885,12 @@ export function ApiKeysMutateDrawer({
           <Button
             type='button'
             onClick={form.handleSubmit(onSubmit, onInvalid)}
-            disabled={!isFormInitialized || isSubmitting}
+            disabled={
+              !isFormInitialized ||
+              isSubmitting ||
+              Boolean(needsReview) ||
+              readFailed
+            }
             className='w-full sm:w-auto'
           >
             {isSubmitting ? t('Saving...') : t('Save changes')}

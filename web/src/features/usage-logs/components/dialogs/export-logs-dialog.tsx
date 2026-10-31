@@ -116,6 +116,7 @@ export function ExportLogsDialog() {
         },
         isAdminView,
         {
+          workspaceKey: searchParams.workspace_key,
           signal: controller.signal,
           onLog: (log) => {
             lines.push(toCsvLine(getLogCsvRow(log, isAdminView, t)))

@@ -20,6 +20,7 @@ import { useQuery } from '@tanstack/react-query'
 import { getRouteApi } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { formatLogQuota } from '@/lib/format'
 import { requireServerSuccess } from '@/lib/server-error-message'
@@ -52,10 +53,15 @@ export function CommonLogsStats() {
   const { t } = useTranslation()
   const { isAdminView: isAdmin } = useLogsViewScope()
   const searchParams = route.useSearch()
-  const { sensitiveVisible } = useUsageLogsContext()
+  const { sensitiveVisible, workspaceKey, scopeKey } = useUsageLogsContext()
 
-  const { data: stats, isLoading } = useQuery({
-    queryKey: ['usage-logs-stats', isAdmin, searchParams],
+  const {
+    data: stats,
+    isLoading,
+    isError,
+    refetch,
+  } = useQuery({
+    queryKey: ['usage-logs-stats', scopeKey, isAdmin, searchParams],
     queryFn: async () => {
       const params = buildApiParams({
         page: 1,
@@ -67,7 +73,7 @@ export function CommonLogsStats() {
 
       const result = isAdmin
         ? requireServerSuccess(await getLogStats(params))
-        : requireServerSuccess(await getUserLogStats(params))
+        : requireServerSuccess(await getUserLogStats(params, workspaceKey))
 
       return result.success
         ? result.data || DEFAULT_LOG_STATS
@@ -84,6 +90,10 @@ export function CommonLogsStats() {
         <Skeleton className='h-7 w-[120px] rounded-md' />
       </div>
     )
+  }
+
+  if (isError) {
+    return <ErrorState className='min-h-0' onRetry={() => void refetch()} />
   }
 
   return (

@@ -9,12 +9,43 @@ import (
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManagedAccountGroupChoicesUseOwner(t *testing.T) {
+	configureTokenAutoGroupsTest(t, "5", `["actor-group","owner-group"]`)
+	db := setupTokenControllerTestDB(t)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.Ability{}))
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"actor-group":1,"owner-group":2}`))
+	for _, user := range []model.User{{Id: 7, Username: "actor", Group: "actor-group", AffCode: "actor-aff"}, {Id: 41, Username: "owner", Group: "owner-group", AffCode: "owner-aff"}} {
+		require.NoError(t, db.Create(&user).Error)
+	}
+	for _, ability := range []model.Ability{{Group: "actor-group", Model: "actor-only", ChannelId: 1, Enabled: true}, {Group: "owner-group", Model: "owner-only", ChannelId: 2, Enabled: true}} {
+		require.NoError(t, db.Create(&ability).Error)
+	}
+	for _, tc := range []struct {
+		path     string
+		handler  gin.HandlerFunc
+		expected string
+	}{{"/api/token/auto-groups", GetTokenAutoGroups, `["owner-group"]`}, {"/api/user/models", GetUserModels, `["owner-only"]`}, {"/api/user/self/groups", GetUserGroups, `"owner-group"`}} {
+		c, w := newAuthenticatedContext(t, "GET", tc.path, nil, 7)
+		c.Set("group", "actor-group")
+		common.SetContextKey(c, constant.ContextKeyUserGroup, "actor-group")
+		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41})
+		tc.handler(c)
+		require.True(t, decodeAPIResponse(t, w).Success, w.Body.String())
+		require.Contains(t, w.Body.String(), tc.expected)
+		require.NotContains(t, w.Body.String(), "actor-group")
+		require.NotContains(t, w.Body.String(), "actor-only")
+		require.Equal(t, 7, c.GetInt("id"))
+	}
+}
 
 func configureTokenAutoGroupsTest(t *testing.T, maxCount string, autoGroups string) {
 	t.Helper()
@@ -66,6 +97,11 @@ func baseAutoTokenRequest(name string) map[string]any {
 
 func newTokenAutoGroupsAuthenticatedContext(t *testing.T, method string, target string, body any, userID int) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
+	if method == http.MethodPut {
+		if fields, ok := body.(map[string]any); ok {
+			delete(fields, "remain_quota")
+		}
+	}
 	ctx, recorder := newAuthenticatedContext(t, method, target, body, userID)
 	common.SetContextKey(ctx, constant.ContextKeyUserGroup, "default")
 	return ctx, recorder

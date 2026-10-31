@@ -40,10 +40,84 @@ type tokenPageResponse struct {
 }
 
 type tokenResponseItem struct {
-	ID     int    `json:"id"`
-	Name   string `json:"name"`
-	Key    string `json:"key"`
-	Status int    `json:"status"`
+	ID          int    `json:"id"`
+	Name        string `json:"name"`
+	Key         string `json:"key"`
+	Status      int    `json:"status"`
+	RemainQuota *int   `json:"remain_quota"`
+}
+
+func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB())
+	personal := seedToken(t, db, 7, "personal", "personal-key")
+	external := seedToken(t, db, 41, "external", "external-key")
+	internal := seedToken(t, db, 41, "internal", "internal-key")
+	other := seedToken(t, db, 42, "other-org", "other-key")
+	require.NoError(t, db.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+	request := func(method, path string, body any) (*gin.Context, *httptest.ResponseRecorder) {
+		c, w := newAuthenticatedContext(t, method, path, body, 7)
+		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org"})
+		return c, w
+	}
+	c, w := request("GET", "/api/token/", nil)
+	GetAllTokens(c)
+	response := decodeAPIResponse(t, w)
+	require.True(t, response.Success)
+	var page tokenPageResponse
+	require.NoError(t, common.Unmarshal(response.Data, &page))
+	require.Len(t, page.Items, 1)
+	require.Equal(t, external.Id, page.Items[0].ID)
+	require.NotNil(t, page.Items[0].RemainQuota)
+	require.Equal(t, 100, *page.Items[0].RemainQuota)
+	require.Equal(t, 7, c.GetInt("id"))
+	c, w = request("POST", "/api/token/", map[string]any{"name": "device", "remain_quota": 100, "expired_time": -1})
+	AddToken(c)
+	require.True(t, decodeAPIResponse(t, w).Success)
+	var created model.Token
+	require.NoError(t, db.Where("name = ?", "device").First(&created).Error)
+	require.Equal(t, 41, created.UserId)
+	require.Equal(t, 7, created.ManagementCreatorID)
+	require.False(t, created.AllowUserQuotaQuery)
+	adjustment := map[string]any{"id": created.Id, "name": "device", "expired_time": -1, "quota_delta": 25, "expected_quota_revision": 0}
+	c, w = request("PUT", "/api/token/", adjustment)
+	UpdateToken(c)
+	require.True(t, decodeAPIResponse(t, w).Success)
+	c, w = request("PUT", "/api/token/", adjustment)
+	UpdateToken(c)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "QUOTA_REVISION_CONFLICT")
+	c, w = request("PUT", "/api/token/", map[string]any{"id": created.Id, "allow_user_quota_query": true})
+	UpdateToken(c)
+	require.False(t, decodeAPIResponse(t, w).Success)
+	c, w = request("POST", "/api/token/", map[string]any{"name": "forged", "management_creator_id": 99})
+	AddToken(c)
+	require.False(t, decodeAPIResponse(t, w).Success)
+	c, w = request("POST", "/api/token/42/key", nil)
+	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(internal.Id)}}
+	GetTokenKey(c)
+	require.False(t, decodeAPIResponse(t, w).Success)
+	ids := []int{personal.Id, external.Id, internal.Id, other.Id}
+	c, w = request("POST", "/api/token/batch/keys", map[string]any{"ids": ids})
+	GetTokenKeysBatch(c)
+	response = decodeAPIResponse(t, w)
+	require.True(t, response.Success)
+	var keys struct {
+		Keys map[int]string `json:"keys"`
+	}
+	require.NoError(t, common.Unmarshal(response.Data, &keys))
+	require.Equal(t, map[int]string{external.Id: external.Key}, keys.Keys)
+	c, w = request("POST", "/api/token/batch", map[string]any{"ids": ids})
+	DeleteTokenBatch(c)
+	require.True(t, decodeAPIResponse(t, w).Success)
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", internal.Id).Count(&count).Error)
+	require.EqualValues(t, 1, count)
+	historical, err := model.ExternalTokenIDs(41)
+	require.NoError(t, err)
+	require.Contains(t, historical, external.Id)
+	require.NotContains(t, historical, internal.Id)
 }
 
 type tokenKeyResponse struct {
@@ -371,6 +445,24 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 		t.Fatalf("expected legacy token to inherit global Auto groups, got %q", migratedToken.AutoGroups)
 	}
 	require.True(t, db.Migrator().HasColumn(&model.Token{}, "allow_user_quota_query"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "management_creator_id"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "quota_revision"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "quota_mutation_ref"))
+	require.Zero(t, migratedToken.ManagementCreatorID)
+	require.Zero(t, migratedToken.QuotaRevision)
+	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", migratedToken.Id).Update("remain_quota", 70).Error)
+	migratedToken.Name = "migrated-renamed"
+	require.NoError(t, migratedToken.Update())
+	require.NoError(t, migratedToken.Update(model.TokenQuotaAdjustment{Delta: 25, ExpectedRevision: 0}))
+	require.ErrorIs(t, migratedToken.Update(model.TokenQuotaAdjustment{Delta: 25, ExpectedRevision: 0}), model.ErrTokenQuotaRevisionConflict)
+	var adjusted model.Token
+	require.NoError(t, db.First(&adjusted, migratedToken.Id).Error)
+	require.Equal(t, 95, adjusted.RemainQuota)
+	require.EqualValues(t, 1, adjusted.QuotaRevision)
+
+	for range 2 {
+		migrateTokenControllerTestDB(t, db)
+	}
 	assert.False(t, migratedToken.AllowUserQuotaQuery, "tokens created before the upgrade keep user quota queries off")
 
 	inserted := model.Token{
@@ -524,15 +616,16 @@ func TestUpdateTokenMasksKeyInResponse(t *testing.T) {
 	token := seedToken(t, db, 1, "editable-token", "yzab1234cdef5678")
 
 	body := map[string]any{
-		"id":                   token.Id,
-		"name":                 "updated-token",
-		"expired_time":         -1,
-		"remain_quota":         100,
-		"unlimited_quota":      true,
-		"model_limits_enabled": false,
-		"model_limits":         "",
-		"group":                "default",
-		"cross_group_retry":    false,
+		"id":                      token.Id,
+		"name":                    "updated-token",
+		"expired_time":            -1,
+		"quota_delta":             100,
+		"expected_quota_revision": 0,
+		"unlimited_quota":         true,
+		"model_limits_enabled":    false,
+		"model_limits":            "",
+		"group":                   "default",
+		"cross_group_retry":       false,
 	}
 
 	ctx, recorder := newAuthenticatedContext(t, http.MethodPut, "/api/token/", body, 1)
@@ -650,7 +743,9 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 		remoteAddr    string
 		wantStatus    int
 		wantUserQuota bool
+		creatorID     int
 	}{
+		{name: "managed external key never exposes owner funds", creatorID: 7, allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
 		{name: "switch off", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK},
 		{name: "switch on without IP whitelist", allow: true, remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
 		{name: "switch on with matching IP whitelist", allow: true, allowIps: "198.51.100.1\n203.0.113.0/24", remoteAddr: "203.0.113.7:4321", wantStatus: http.StatusOK, wantUserQuota: true},
@@ -668,7 +763,7 @@ func TestGetTokenUsageFollowsTheUserQuotaSwitchAndIPWhitelist(t *testing.T) {
 			user := &model.User{Username: "quota-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", Quota: 12345, UsedQuota: 678, AuthVersion: 1, AffCode: "quota-owner"}
 			require.NoError(t, db.Create(user).Error)
 			token := seedToken(t, db, user.Id, "usage-token", "usagekey1234")
-			updates := map[string]any{"allow_user_quota_query": tc.allow, "allow_ips": tc.allowIps, "used_quota": 30}
+			updates := map[string]any{"allow_user_quota_query": tc.allow, "allow_ips": tc.allowIps, "used_quota": 30, "management_creator_id": tc.creatorID}
 			if tc.expired {
 				updates["status"], updates["expired_time"] = common.TokenStatusExpired, 1
 			}
@@ -736,7 +831,7 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 				db, _ := newAuditTestDatabase(t, database.name, dsn)
 				model.DB = db
 				common.SetDatabaseTypes(database.typ, database.typ)
-				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}))
+				require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Token{}, &model.UserAccessToken{}))
 				// Initialize production column quoting as well as the existing audit table.
 				require.NoError(t, model.InitLogDB())
 				if separateLog {
@@ -764,9 +859,9 @@ func TestAPITokenAuditDatabaseMatrix(t *testing.T) {
 
 func verifyAPITokenAudit(t *testing.T) {
 	t.Helper()
-	pat := "api-token-audit-pat-secret"
-	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AccessToken: &pat, AffCode: "token-owner"}
+	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "token-owner"}
 	require.NoError(t, model.DB.Create(user).Error)
+	pat, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "api_key:reveal")
 	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
@@ -805,11 +900,11 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "malformed body", method: "POST", path: "/", body: `{"key":"raw-body-secret"`, action: "token.create", params: `{}`},
 		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
 		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","unlimited_quota":true}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
-		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"remain_quota":200,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
-		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"remain_quota":100,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
-		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
-		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
-		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"remain_quota":100,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
+		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"quota_delta":100,"expected_quota_revision":0,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","quota_delta":100,"changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
+		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
+		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
+		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
+		{name: "successful response exceeds audit buffer", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","model_limits":"` + strings.Repeat("m", 64*1024-128) + `"}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits"]}`},
 		{name: "update storage failure", method: "PUT", path: "/", body: `{"id":$id,"name":"failed-rename","unlimited_quota":true}`, action: "token.update", params: `{"id":$id,"name":"owned"}`, failWrite: true},
 		{name: "foreign update", method: "PUT", path: "/", body: `{"id":$other,"name":"forged-name","unlimited_quota":true}`, action: "token.update", params: `{"id":$other}`},
 		{name: "disable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":1,"to":2}`},

@@ -30,6 +30,8 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { getUserModels } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
+import { modelAccountRequest } from '../../api'
+
 const APP_CONFIGS = {
   claude: {
     label: 'Claude',
@@ -91,6 +93,8 @@ function buildCCSwitchURL(
 }
 
 interface Props {
+  workspaceKey?: string
+  scopeKey?: string
   open: boolean
   onOpenChange: (open: boolean) => void
   tokenKey: string
@@ -103,8 +107,11 @@ export function CCSwitchDialog(props: Props) {
   const [models, setModels] = useState<Record<string, string>>({})
 
   const { data: modelsData } = useQuery({
-    queryKey: ['user-models-ccswitch'],
-    queryFn: async () => requireServerSuccess(await getUserModels()),
+    queryKey: ['user-models-ccswitch', props.scopeKey],
+    queryFn: async () =>
+      requireServerSuccess(
+        await getUserModels(modelAccountRequest(props.workspaceKey))
+      ),
     enabled: props.open,
     staleTime: 5 * 60 * 1000,
   })

@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { api } from '@/lib/http-client'
+import { api, type ApiRequestConfig } from '@/lib/http-client'
 import { authRequestOptions, authResult } from '@/lib/secure-verification'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
@@ -48,21 +48,21 @@ export async function getSelf() {
   return res.data
 }
 
-export async function getUserModels(): Promise<{
+export async function getUserModels(config?: ApiRequestConfig): Promise<{
   success: boolean
   message?: string
   data?: string[]
 }> {
-  const res = await api.get('/api/user/models')
+  const res = await api.get('/api/user/models', config)
   return res.data
 }
 
-export async function getUserGroups(): Promise<{
+export async function getUserGroups(config?: ApiRequestConfig): Promise<{
   success: boolean
   message?: string
   data?: Record<string, { desc: string; ratio: number | string }>
 }> {
-  const res = await api.get('/api/user/self/groups')
+  const res = await api.get('/api/user/self/groups', config)
   return res.data
 }
 

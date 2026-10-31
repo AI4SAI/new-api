@@ -141,7 +141,10 @@ it('loads personal groups and filters choices without submitting until Search', 
       page: 1,
     })
   )
-  expect(api.get).toHaveBeenCalledWith('/api/user/self/groups')
+  expect(api.get).toHaveBeenCalledWith(
+    '/api/user/self/groups',
+    expect.objectContaining({ headers: undefined })
+  )
   expect(api.get).not.toHaveBeenCalledWith('/api/group/')
 })
 

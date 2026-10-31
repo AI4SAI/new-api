@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
+import { managedWorkspaceKeySchema } from '@/features/keys/types'
 import { UsageLogs } from '@/features/usage-logs'
 import {
   isUsageLogsSectionId,
@@ -27,13 +28,18 @@ import {
 
 const logTypeValues = ['0', '1', '2', '3', '4', '5', '6', '7'] as const
 const logTypeSearchSchema = z
-  .preprocess((value) => {
-    if (value == null || value === '') return undefined
-    return Array.isArray(value) ? value : [value]
-  }, z.array(z.enum(logTypeValues)).optional())
+  .preprocess(
+    (value) => {
+      if (value == null || value === '') return undefined
+      return Array.isArray(value) ? value : [value]
+    },
+    z.array(z.enum(logTypeValues)).optional()
+  )
   .catch([])
 
 const usageLogsSearchSchema = z.object({
+  workspace_key: managedWorkspaceKeySchema,
+  token_id: z.number().int().positive().optional(),
   page: z.number().optional().catch(1),
   pageSize: z.number().optional().catch(undefined),
   type: logTypeSearchSchema.optional(),
@@ -51,6 +57,14 @@ const usageLogsSearchSchema = z.object({
 
 export const Route = createFileRoute('/_authenticated/usage-logs/$section')({
   beforeLoad: ({ params, search }) => {
+    if (search.workspace_key && params.section !== 'common') {
+      throw redirect({
+        to: '/usage-logs/$section',
+        params: { section: 'common' },
+        search,
+        replace: true,
+      })
+    }
     if (!isUsageLogsSectionId(params.section)) {
       throw redirect({
         to: '/usage-logs/$section',

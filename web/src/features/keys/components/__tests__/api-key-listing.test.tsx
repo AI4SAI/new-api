@@ -53,6 +53,7 @@ import {
 import { apiKeySchema, type ApiKey } from '../../types'
 import { ApiKeyQuotaCell } from '../api-key-quota-cell'
 import { useApiKeysColumns } from '../api-keys-columns'
+import { ApiKeysDeleteDialog } from '../api-keys-delete-dialog'
 import { ApiKeysProvider } from '../api-keys-provider'
 import { ApiKeysTable } from '../api-keys-table'
 
@@ -298,6 +299,7 @@ function KeysPage() {
   return (
     <ApiKeysProvider>
       <ApiKeysTable />
+      <ApiKeysDeleteDialog />
       <Toaster />
     </ApiKeysProvider>
   )
@@ -305,10 +307,14 @@ function KeysPage() {
 
 async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
   let currentKey = { ...key, status, ...overrides }
+  let deleted = false
   vi.mocked(api.get).mockImplementation(async (url) => {
     if (url.startsWith('/api/token/')) {
       return {
-        data: { success: true, data: { items: [currentKey], total: 1 } },
+        data: {
+          success: true,
+          data: { items: deleted ? [] : [currentKey], total: deleted ? 0 : 1 },
+        },
       }
     }
     return { data: { success: true, data: { default: { ratio: 1 } } } }
@@ -321,8 +327,12 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
     currentKey = { ...currentKey, status: update.status }
     return { data: { success: true, data: currentKey } }
   })
+  vi.spyOn(api, 'delete').mockImplementation(async () => {
+    deleted = true
+    return { data: { success: true } }
+  })
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    defaultOptions: { queries: { retry: false, staleTime: 10_000 } },
   })
   client.setQueryData(['status'], {})
   clients.push(client)
@@ -333,8 +343,13 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
     path: 'keys/',
     component: KeysPage,
   })
+  const usageRoute = createRoute({
+    getParentRoute: () => auth,
+    path: 'usage-logs/common',
+    component: () => <div>Usage</div>,
+  })
   const router = createRouter({
-    routeTree: root.addChildren([auth.addChildren([keysRoute])]),
+    routeTree: root.addChildren([auth.addChildren([keysRoute, usageRoute])]),
     history: createMemoryHistory({ initialEntries: ['/keys/'] }),
   })
   await router.load()
@@ -346,8 +361,36 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
     </I18nextProvider>
   )
   await screen.findByText(currentKey.name)
-  return { post, put }
+  return { post, put, router }
 }
+
+it('keeps updated rows after navigation and removes a deleted key without reviving cached state', async () => {
+  const { router } = await renderKeysPage()
+  await userEvent.click(screen.getByRole('button', { name: 'Disable' }))
+  await screen.findByText('Disabled')
+  await act(() =>
+    router.navigate({
+      to: '/usage-logs/$section',
+      params: { section: 'common' },
+    })
+  )
+  await screen.findByText('Usage')
+  await act(() => router.navigate({ to: '/keys' }))
+  await screen.findByText('Disabled')
+  await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
+  await userEvent.click(screen.getByRole('menuitem', { name: /^Delete$/ }))
+  await userEvent.click(
+    within(screen.getByRole('alertdialog')).getByRole('button', {
+      name: /^Delete$/,
+    })
+  )
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('row', { name: /production/ })
+    ).not.toBeInTheDocument()
+  )
+  await screen.findByText('No API Keys Found')
+})
 
 it('combines creation and last use while keeping expiry, models and IP restrictions separate', async () => {
   await renderKeysPage()
@@ -400,10 +443,14 @@ it.each([
     act(() => button.focus())
     await user.keyboard('{Enter}')
     await waitFor(() =>
-      expect(put).toHaveBeenCalledWith('/api/token/?status_only=true', {
-        id: 7,
-        status: nextStatus,
-      })
+      expect(put).toHaveBeenCalledWith(
+        '/api/token/?status_only=true',
+        {
+          id: 7,
+          status: nextStatus,
+        },
+        expect.objectContaining({ headers: undefined })
+      )
     )
     await screen.findByText(nextLabel)
     expect(post).not.toHaveBeenCalled()
@@ -434,7 +481,16 @@ it.each([true, false])(
     await user.click(screen.getByRole('button', { name: 'Open menu' }))
     expect(post).not.toHaveBeenCalled()
     await user.click(screen.getByRole('menuitem', { name: 'Copy Key' }))
-    await waitFor(() => expect(post).toHaveBeenCalledWith('/api/token/7/key'))
+    await waitFor(() =>
+      expect(post).toHaveBeenCalledWith(
+        '/api/token/7/key',
+        undefined,
+        expect.objectContaining({
+          headers: undefined,
+          signal: expect.any(AbortSignal),
+        })
+      )
+    )
     if (success) {
       await waitFor(() =>
         expect(copy).toHaveBeenCalledWith('sk-fake-key-for-test-only')

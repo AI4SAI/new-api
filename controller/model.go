@@ -188,9 +188,16 @@ type modelListGroups struct {
 func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 	tokenGroup := common.GetContextKeyString(c, constant.ContextKeyTokenGroup)
 	userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup)
+	if service.ManagementAccount(c) != nil {
+		var err error
+		userGroup, err = model.GetUserGroup(service.ManagementOwnerID(c), false)
+		if err != nil {
+			return modelListGroups{}, err
+		}
+	}
 	if userGroup == "" && (tokenGroup == "" || tokenGroup == "auto") {
 		var err error
-		userGroup, err = model.GetUserGroup(c.GetInt("id"), false)
+		userGroup, err = model.GetUserGroup(service.ManagementOwnerID(c), false)
 		if err != nil {
 			return modelListGroups{}, err
 		}
@@ -218,7 +225,7 @@ func getModelListGroups(c *gin.Context) (modelListGroups, error) {
 func ListModels(c *gin.Context, modelType int) {
 	acceptUnsetRatioModel := operation_setting.SelfUseModeEnabled
 	if !acceptUnsetRatioModel {
-		userId := c.GetInt("id")
+		userId := service.ManagementOwnerID(c)
 		if userId > 0 {
 			userSettings, _ := model.GetUserSetting(userId, false)
 			if userSettings.AcceptUnsetRatioModel {

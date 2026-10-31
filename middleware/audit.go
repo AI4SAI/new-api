@@ -244,6 +244,10 @@ func TokenOperationAudit() gin.HandlerFunc {
 		writer := &auditResponseWriter{ResponseWriter: c.Writer, body: bytes.NewBuffer(nil), maxSize: 64 * 1024}
 		c.Writer = writer
 		c.Next()
+		if account := service.ManagementAccount(c); account != nil {
+			params["managed_owner_id"] = account.OwnerID
+			params["workspace_key"] = account.WorkspaceKey
+		}
 		entry.Status = writer.Status()
 		entry.Success = auditResponseSuccess(entry.Status, writer.body.Bytes())
 		if writer.body.Len() == writer.maxSize {

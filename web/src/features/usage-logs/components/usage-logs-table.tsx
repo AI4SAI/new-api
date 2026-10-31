@@ -27,6 +27,7 @@ import {
   DataTableRow,
   useDataTable,
 } from '@/components/data-table'
+import { ErrorState } from '@/components/error-state'
 import {
   getAdminPlans,
   getSelfSubscriptionFull,
@@ -50,7 +51,11 @@ import type { LogCategory } from '../types'
 import { CommonLogsFilterBar } from './common-logs-filter-bar'
 import { TaskLogsFilterBar } from './task-logs-filter-bar'
 import { UsageLogsMobileList } from './usage-logs-mobile-card'
-import { useLogsViewScope, type LogsViewAccess } from './usage-logs-provider'
+import {
+  useLogsViewScope,
+  useUsageLogsContext,
+  type LogsViewAccess,
+} from './usage-logs-provider'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
 
@@ -86,6 +91,7 @@ interface UsageLogsTableProps {
 
 export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
   const { t } = useTranslation()
+  const { workspaceKey, scopeKey } = useUsageLogsContext()
   const getColumnClassName = useCallback(
     () => (logCategory === 'common' ? 'py-2' : 'py-3.5'),
     [logCategory]
@@ -99,8 +105,8 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
   const searchParams = route.useSearch()
   const userId = useAuthStore((state) => state.auth.user?.id)
   const { data: showBillingSource = false } = useQuery({
-    queryKey: ['usage-log-billing-source', isAdmin, userId],
-    enabled: logCategory === 'common' && userId != null,
+    queryKey: ['usage-log-billing-source', scopeKey, isAdmin, userId],
+    enabled: !workspaceKey && logCategory === 'common' && userId != null,
     queryFn: async () => {
       if (isAdmin) {
         const plansResult = await getAdminPlans()
@@ -160,11 +166,12 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
     ],
   })
 
-  const { data, isLoading, isFetching } = useQuery({
+  const { data, isLoading, isFetching, isError, refetch } = useQuery({
     queryKey: [
       'logs',
       logCategory,
       viewAccess,
+      scopeKey,
       pagination.pageIndex + 1,
       pagination.pageSize,
       columnFilters,
@@ -190,7 +197,8 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
     placeholderData: (previousData, previousQuery) => {
       if (
         previousQuery?.queryKey[1] === logCategory &&
-        previousQuery.queryKey[2] === viewAccess
+        previousQuery.queryKey[2] === viewAccess &&
+        previousQuery.queryKey[3] === scopeKey
       ) {
         return previousData
       }
@@ -227,7 +235,9 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
 
   const isCommon = logCategory === 'common'
 
-  return (
+  return isError ? (
+    <ErrorState onRetry={() => void refetch()} />
+  ) : (
     <DataTablePage
       table={table}
       compactPagination={isMobile && isCommon}

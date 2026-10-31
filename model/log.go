@@ -494,6 +494,7 @@ type LogFilter struct {
 	UpstreamRequestId string
 	UserID            *int
 	TokenID           *int
+	ExternalTokenIDs  *[]int
 	BillingContextRef *string
 	BillingProduct    string
 	IncludeMetering   bool
@@ -510,6 +511,13 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	}
 	if f.TokenID != nil {
 		tx = tx.Where("logs.token_id = ?", *f.TokenID)
+	}
+	if f.ExternalTokenIDs != nil {
+		if len(*f.ExternalTokenIDs) == 0 {
+			tx = tx.Where("1 = 0")
+		} else {
+			tx = tx.Where("logs.token_id IN ?", *f.ExternalTokenIDs)
+		}
 	}
 	if f.BillingContextRef != nil {
 		tx = tx.Where("logs.billing_context_ref = ?", *f.BillingContextRef)

@@ -21,8 +21,10 @@ import z from 'zod'
 
 import { ApiKeys } from '@/features/keys'
 import { API_KEY_STATUS_OPTIONS } from '@/features/keys/constants'
+import { managedWorkspaceKeySchema } from '@/features/keys/types'
 
 const apiKeySearchSchema = z.object({
+  workspace_key: managedWorkspaceKeySchema,
   page: z.number().optional().catch(1),
   pageSize: z.number().optional().catch(undefined),
   status: z

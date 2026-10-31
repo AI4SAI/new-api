@@ -12,26 +12,29 @@ import (
 )
 
 type Token struct {
-	Id                 int            `json:"id"`
-	UserId             int            `json:"user_id" gorm:"index"`
-	Key                string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status             int            `json:"status" gorm:"default:1"`
-	Name               string         `json:"name" gorm:"index" `
-	CreatedTime        int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime       int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime        int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota        int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota     bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled bool           `json:"model_limits_enabled"`
-	ModelLimits        string         `json:"model_limits" gorm:"type:text"`
-	AllowIps           *string        `json:"allow_ips" gorm:"default:''"`
-	UsedQuota          int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group              string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry    bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups         string         `json:"-" gorm:"type:text"`
-	DeletedAt          gorm.DeletedAt `gorm:"index"`
-	ManagedBindingRef  string         `json:"managed_binding_ref,omitempty" gorm:"type:varchar(36)"`
-	CacheSchemaVersion int            `json:"-" gorm:"-"`
+	Id                  int            `json:"id"`
+	UserId              int            `json:"user_id" gorm:"index"`
+	Key                 string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status              int            `json:"status" gorm:"default:1"`
+	Name                string         `json:"name" gorm:"index" `
+	CreatedTime         int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime        int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime         int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota         int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota      bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled  bool           `json:"model_limits_enabled"`
+	ModelLimits         string         `json:"model_limits" gorm:"type:text"`
+	AllowIps            *string        `json:"allow_ips" gorm:"default:''"`
+	UsedQuota           int            `json:"used_quota" gorm:"default:0"` // used quota
+	Group               string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry     bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups          string         `json:"-" gorm:"type:text"`
+	DeletedAt           gorm.DeletedAt `gorm:"index"`
+	QuotaRevision       int64          `json:"quota_revision" gorm:"not null;default:0"`
+	QuotaMutationRef    string         `json:"-" gorm:"type:varchar(32)"`
+	ManagementCreatorID int            `json:"management_creator_id,omitempty" gorm:"not null;default:0"`
+	ManagedBindingRef   string         `json:"managed_binding_ref,omitempty" gorm:"type:varchar(36)"`
+	CacheSchemaVersion  int            `json:"-" gorm:"-"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool `json:"allow_user_quota_query"`
 }
@@ -107,10 +110,10 @@ func (token *Token) GetIpLimits() []string {
 	return ipLimits
 }
 
-func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {
+func GetAllUserTokens(userId int, startIdx int, num int, externalOnly ...bool) ([]*Token, error) {
 	var tokens []*Token
 	var err error
-	err = DB.Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
+	err = visibleTokenQuery(DB, externalOnly).Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
 	return tokens, err
 }
 
@@ -160,7 +163,7 @@ func validateLikePattern(input string) error {
 
 const searchHardLimit = 100
 
-func SearchUserTokens(userId int, keyword string, token string, offset int, limit int) (tokens []*Token, total int64, err error) {
+func SearchUserTokens(userId int, keyword string, token string, offset int, limit int, externalOnly ...bool) (tokens []*Token, total int64, err error) {
 	// model 层强制截断
 	if limit <= 0 || limit > searchHardLimit {
 		limit = searchHardLimit
@@ -187,7 +190,7 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		}
 	}
 
-	baseQuery := DB.Model(&Token{}).Where("user_id = ?", userId)
+	baseQuery := visibleTokenQuery(DB.Model(&Token{}), externalOnly).Where("user_id = ?", userId)
 
 	// 非空才加 LIKE 条件，空则跳过（不过滤该字段）
 	if keyword != "" {
@@ -261,13 +264,13 @@ func ValidateUserToken(key string) (token *Token, err error) {
 	return nil, fmt.Errorf("%w: %v", ErrDatabase, err)
 }
 
-func GetTokenByIds(id int, userId int) (*Token, error) {
+func GetTokenByIds(id int, userId int, externalOnly ...bool) (*Token, error) {
 	if id == 0 || userId == 0 {
 		return nil, common.NewMessage("Token ID or user ID is empty")
 	}
 	token := Token{Id: id, UserId: userId}
 	var err error = nil
-	err = DB.First(&token, "id = ? and user_id = ?", id, userId).Error
+	err = visibleTokenQuery(DB, externalOnly).First(&token, "id = ? and user_id = ?", id, userId).Error
 	return &token, err
 }
 
@@ -298,6 +301,9 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
 		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
+			if errors.Is(cacheErr, ErrTokenQuotaUpdateUnknown) {
+				return nil, cacheErr
+			}
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
 		}
 	}
@@ -310,28 +316,151 @@ func (token *Token) Insert() error {
 	return err
 }
 
-// Update Make sure your token's fields is completed, because this will update non-zero values
-func (token *Token) Update() (err error) {
-	// 写库前失效缓存并设置 fence，防止并发读者把过期快照重新写回缓存。
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before update: %s", cacheErr.Error()))
+var ErrTokenQuotaRevisionConflict = errors.New("token quota revision conflict")
+var ErrTokenQuotaUpdateUnknown = errors.New("token quota update outcome is unknown")
+
+type TokenQuotaAdjustment struct {
+	Delta            int
+	ExpectedRevision int64
+}
+
+// Update never writes a loaded balance. Explicit quota increments are bound to
+// a management revision, so a lost response cannot turn a retry into more quota.
+func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
+	if len(adjustments) > 1 {
+		return errors.New("invalid quota adjustment")
 	}
-	return DB.Model(token).Select("name", "status", "expired_time", "remain_quota", "unlimited_quota",
-		"model_limits_enabled", "model_limits", "allow_ips", "group", "cross_group_retry", "auto_groups",
-		"allow_user_quota_query").Updates(token).Error
+	adjustment := TokenQuotaAdjustment{}
+	if len(adjustments) == 1 {
+		adjustment = adjustments[0]
+	}
+	delta := adjustment.Delta
+	if delta > common.MaxWalletQuota || delta < -common.MaxWalletQuota || adjustment.ExpectedRevision < 0 {
+		return errors.New("invalid quota adjustment")
+	}
+	cacheAdjusted := false
+	mutationRef := common.GetUUID()
+	bodyCompleted := false
+	compensate := func() {
+		if !cacheAdjusted {
+			return
+		}
+		result, compensateErr := cacheReverseTokenBudget(token.Id, token.Key, -delta, adjustment.ExpectedRevision)
+		if compensateErr != nil || result != cacheQuotaOK {
+			common.SysError("failed to compensate token quota adjustment")
+			err = errors.Join(ErrTokenQuotaUpdateUnknown, err, errors.New("token quota adjustment compensation failed"), compensateErr)
+		}
+		cacheAdjusted = false
+	}
+	err = DB.Transaction(func(tx *gorm.DB) (writeErr error) {
+		if delta != 0 {
+			var current Token
+			if writeErr = lockForUpdate(tx).First(&current, token.Id).Error; writeErr != nil {
+				return writeErr
+			}
+			if current.QuotaRevision != adjustment.ExpectedRevision {
+				return ErrTokenQuotaRevisionConflict
+			}
+			if common.RedisEnabled {
+				result, cacheErr := cacheAdjustTokenBudget(token.Id, token.Key, delta, adjustment.ExpectedRevision)
+				if cacheErr == nil && result == cacheQuotaMiss {
+					// Hydrate from the transaction's locked snapshot without a second DB connection.
+					if _, cacheErr = cacheInitToken(current); cacheErr == nil {
+						result, cacheErr = cacheAdjustTokenBudget(token.Id, token.Key, delta, adjustment.ExpectedRevision)
+					}
+				}
+				if cacheErr != nil {
+					return errors.Join(ErrTokenQuotaUpdateUnknown, cacheErr)
+				}
+				if result == cacheQuotaConflict {
+					return ErrTokenQuotaRevisionConflict
+				}
+				if result == cacheQuotaUnknown {
+					return ErrTokenQuotaUpdateUnknown
+				}
+				if result != cacheQuotaOK {
+					return errors.New("token quota adjustment unavailable or insufficient")
+				}
+				cacheAdjusted = true
+			}
+		}
+		// Run failed-write compensation while the DB row lock is still held.
+		defer func() {
+			if writeErr != nil && cacheAdjusted {
+				err = writeErr
+				compensate()
+				writeErr = err
+			}
+		}()
+		if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
+			return cacheErr
+		}
+		changes := map[string]any{"name": token.Name, "expired_time": token.ExpiredTime,
+			"unlimited_quota": token.UnlimitedQuota, "model_limits_enabled": token.ModelLimitsEnabled,
+			"model_limits": token.ModelLimits, "allow_ips": token.AllowIps, "group": token.Group,
+			"cross_group_retry": token.CrossGroupRetry, "auto_groups": token.AutoGroups,
+			"allow_user_quota_query": token.AllowUserQuotaQuery}
+		query := tx.Model(token)
+		if delta != 0 {
+			changes["remain_quota"] = gorm.Expr("remain_quota + ?", delta)
+			changes["quota_revision"] = gorm.Expr("quota_revision + 1")
+			changes["quota_mutation_ref"] = mutationRef
+			query = query.Where("quota_revision = ? AND remain_quota + ? >= 0 AND remain_quota + ? <= ?", adjustment.ExpectedRevision, delta, delta, common.MaxWalletQuota)
+		}
+		result := query.Updates(changes)
+		if result.Error != nil {
+			return result.Error
+		}
+		if delta != 0 && result.RowsAffected != 1 {
+			return errors.New("token quota adjustment unavailable or insufficient")
+		}
+		bodyCompleted = true
+		return nil
+	})
+	if err != nil && delta != 0 && bodyCompleted {
+		commitErr := err
+		// COMMIT can succeed even when its acknowledgement is lost. Read the
+		// exact mutation marker under the same row lock before any compensation.
+		resolutionErr := DB.Transaction(func(tx *gorm.DB) error {
+			var current Token
+			if readErr := lockForUpdate(tx).First(&current, token.Id).Error; readErr != nil {
+				return readErr
+			}
+			if current.QuotaMutationRef == mutationRef {
+				err = nil
+				return nil
+			}
+			if current.QuotaRevision != adjustment.ExpectedRevision {
+				return ErrTokenQuotaUpdateUnknown
+			}
+			err = commitErr
+			compensate()
+			return nil
+		})
+		if resolutionErr != nil {
+			return errors.Join(ErrTokenQuotaUpdateUnknown, commitErr, resolutionErr)
+		}
+	}
+	if err == nil && cacheAdjusted {
+		result, cacheErr := cacheConfirmTokenBudget(token.Id, token.Key, adjustment.ExpectedRevision+1)
+		if cacheErr != nil || (result != cacheQuotaOK && result != cacheQuotaMiss) {
+			return errors.Join(ErrTokenQuotaUpdateUnknown, cacheErr)
+		}
+	}
+	return err
 }
 
 func (token *Token) SelectUpdate() (err error) {
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before status update: %s", cacheErr.Error()))
+		return cacheErr
 	}
 	// This can update zero values
-	return DB.Model(token).Select("accessed_time", "status").Updates(token).Error
+	return DB.Model(token).Select("status").Updates(token).Error
 }
 
 func (token *Token) Delete() (err error) {
 	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before delete: %s", cacheErr.Error()))
+		return cacheErr
 	}
 	return DB.Delete(token).Error
 }
@@ -440,14 +569,14 @@ func decreaseTokenQuota(id int, quota int) (err error) {
 }
 
 // CountUserTokens returns total number of tokens for the given user, used for pagination
-func CountUserTokens(userId int) (int64, error) {
+func CountUserTokens(userId int, externalOnly ...bool) (int64, error) {
 	var total int64
-	err := DB.Model(&Token{}).Where("user_id = ?", userId).Count(&total).Error
+	err := visibleTokenQuery(DB.Model(&Token{}), externalOnly).Where("user_id = ?", userId).Count(&total).Error
 	return total, err
 }
 
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
-func BatchDeleteTokens(ids []int, userId int) (int, error) {
+func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (int, error) {
 	if len(ids) == 0 {
 		return 0, common.NewMessage("Token IDs cannot be empty")
 	}
@@ -455,15 +584,16 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	tx := DB.Begin()
 
 	var tokens []Token
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
+	if err := visibleTokenQuery(tx, externalOnly).Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
 	if err := invalidateTokensCache(tokens); err != nil {
-		common.SysLog(common.LogText("failed to invalidate token cache before batch delete: %s", err.Error()))
+		tx.Rollback()
+		return 0, err
 	}
 
-	if err := tx.Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
+	if err := visibleTokenQuery(tx, externalOnly).Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
@@ -475,9 +605,9 @@ func BatchDeleteTokens(ids []int, userId int) (int, error) {
 	return len(tokens), nil
 }
 
-func GetTokenKeysByIds(ids []int, userId int) ([]Token, error) {
+func GetTokenKeysByIds(ids []int, userId int, externalOnly ...bool) ([]Token, error) {
 	var tokens []Token
-	err := DB.Select("id", commonKeyCol).
+	err := visibleTokenQuery(DB, externalOnly).Select("id", commonKeyCol).
 		Where("user_id = ? AND id IN (?)", userId, ids).
 		Find(&tokens).Error
 	return tokens, err
@@ -517,4 +647,19 @@ func invalidateTokensCache(tokens []Token) error {
 		}
 	}
 	return firstErr
+}
+
+func visibleTokenQuery(query *gorm.DB, externalOnly []bool) *gorm.DB {
+	if len(externalOnly) > 0 && externalOnly[0] {
+		return query.Where("managed_binding_ref IS NULL OR managed_binding_ref = ?", "")
+	}
+	return query
+}
+
+// Log databases can be separate. Resolve visible historical token IDs from the
+// primary database without joining it to the log store or hiding deleted keys.
+func ExternalTokenIDs(userID int) ([]int, error) {
+	ids := []int{}
+	err := visibleTokenQuery(DB.Unscoped().Model(&Token{}), []bool{true}).Where("user_id = ?", userID).Pluck("id", &ids).Error
+	return ids, err
 }

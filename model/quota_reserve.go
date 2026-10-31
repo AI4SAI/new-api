@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/go-redis/redis/v8"
 	"gorm.io/gorm"
 )
 
@@ -14,6 +15,8 @@ const (
 	cacheQuotaInsufficient cacheQuotaResult = iota
 	cacheQuotaOK
 	cacheQuotaMiss
+	cacheQuotaConflict
+	cacheQuotaUnknown
 )
 
 const userQuotaReserveScript = `
@@ -39,6 +42,7 @@ redis.call('HINCRBY', KEYS[1], 'Quota', ARGV[1])
 return 1`
 
 const tokenQuotaReserveScript = `
+if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') == -1 then return -3 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0
   or redis.call('HEXISTS', KEYS[1], 'UsedQuota') == 0 then
@@ -73,6 +77,10 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 		return cacheQuotaOK, nil
 	case 0:
 		return cacheQuotaInsufficient, nil
+	case -2:
+		return cacheQuotaConflict, nil
+	case -3:
+		return cacheQuotaUnknown, nil
 	default:
 		return cacheQuotaMiss, nil
 	}
@@ -99,6 +107,52 @@ func cacheTryReserveTokenQuota(id int, key string, amount int64) (cacheQuotaResu
 func cacheApplyTokenQuotaDelta(id int, key string, delta int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), tokenQuotaDeltaScript,
 		[]string{getTokenCacheKey(key)}, delta, id, common.GetTimestamp()).Int()
+	return quotaResultFromLua(result, err)
+}
+
+// Configuration adjustments change available quota without rewriting usage or
+// pending batch deductions. Redis and database each apply the same increment.
+func cacheAdjustTokenBudget(id int, key string, delta int, revision int64) (cacheQuotaResult, error) {
+	const script = `
+if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') == -1 then return -3 end
+if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
+  or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0 then return -1 end
+if tonumber(redis.call('HGET', KEYS[1], 'QuotaRevision') or '0') ~= tonumber(ARGV[4]) then return -2 end
+local remaining = tonumber(redis.call('HGET', KEYS[1], 'RemainQuota')) + tonumber(ARGV[1])
+if remaining < 0 or remaining > tonumber(ARGV[3]) then return 0 end
+redis.call('HINCRBY', KEYS[1], 'RemainQuota', ARGV[1])
+redis.call('HSET', KEYS[1], 'QuotaRevision', tonumber(ARGV[4]) + 1, 'CacheSchemaVersion', -1)
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script,
+		[]string{getTokenCacheKey(key)}, delta, id, common.MaxWalletQuota, revision).Int()
+	return quotaResultFromLua(result, err)
+}
+
+// A reversal restores the original authorization even when concurrent real
+// consumption has exhausted it. A negative remainder blocks future reservations.
+func cacheReverseTokenBudget(id int, key string, delta int, revision int64) (cacheQuotaResult, error) {
+	const script = `
+if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
+  or redis.call('HEXISTS', KEYS[1], 'RemainQuota') == 0 then return -1 end
+if tonumber(redis.call('HGET', KEYS[1], 'QuotaRevision') or '0') ~= tonumber(ARGV[3]) + 1 then return -2 end
+redis.call('HINCRBY', KEYS[1], 'RemainQuota', ARGV[1])
+redis.call('HSET', KEYS[1], 'QuotaRevision', ARGV[3])
+redis.call('HDEL', KEYS[1], 'CacheSchemaVersion')
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script,
+		[]string{getTokenCacheKey(key)}, delta, id, revision).Int()
+	return quotaResultFromLua(result, err)
+}
+
+// Confirm only the exact revision whose DB transaction was proven committed.
+// Outstanding actual consumption remains untouched.
+func cacheConfirmTokenBudget(id int, key string, revision int64) (cacheQuotaResult, error) {
+	const script = `
+if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[1]) then return -1 end
+if tonumber(redis.call('HGET', KEYS[1], 'QuotaRevision') or '0') ~= tonumber(ARGV[2]) then return -2 end
+if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') == -1 then redis.call('HDEL', KEYS[1], 'CacheSchemaVersion') end
+return 1`
+	result, err := common.RDB.Eval(context.Background(), script, []string{getTokenCacheKey(key)}, id, revision).Int()
 	return quotaResultFromLua(result, err)
 }
 
@@ -207,6 +261,15 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 		return true, nil
 	}
 	if unlimited {
+		if common.RedisEnabled {
+			state, err := common.RDB.HGet(context.Background(), getTokenCacheKey(key), "CacheSchemaVersion").Int()
+			if err == nil && state == -1 {
+				return false, ErrTokenQuotaUpdateUnknown
+			}
+			if err != nil && err != redis.Nil {
+				return false, err
+			}
+		}
 		return true, DecreaseTokenQuota(id, key, quota)
 	}
 	if !common.RedisEnabled {
@@ -214,10 +277,16 @@ func TryReserveTokenQuota(id int, key string, quota int, unlimited bool) (bool, 
 	}
 
 	result, err := cacheTryReserveTokenQuota(id, key, int64(quota))
+	if result == cacheQuotaUnknown {
+		return false, ErrTokenQuotaUpdateUnknown
+	}
 	if err == nil && result == cacheQuotaMiss {
 		if _, hydrateErr := GetTokenByKey(key, true); hydrateErr == nil {
 			result, err = cacheTryReserveTokenQuota(id, key, int64(quota))
 		}
+	}
+	if result == cacheQuotaUnknown {
+		return false, ErrTokenQuotaUpdateUnknown
 	}
 	if err != nil || result == cacheQuotaMiss {
 		if err != nil {

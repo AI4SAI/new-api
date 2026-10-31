@@ -11,13 +11,15 @@ import (
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	token := Token{
-		Id:                42,
-		UserId:            7,
-		Key:               "token-auto-groups-cache-key",
-		Name:              "auto-cache",
-		Group:             "auto",
-		AutoGroups:        `["vip","default"]`,
-		ManagedBindingRef: "11111111-1111-4111-8111-111111111111",
+		Id:                  42,
+		UserId:              7,
+		Key:                 "token-auto-groups-cache-key",
+		Name:                "auto-cache",
+		Group:               "auto",
+		AutoGroups:          `["vip","default"]`,
+		ManagedBindingRef:   "11111111-1111-4111-8111-111111111111",
+		ManagementCreatorID: 7,
+		QuotaRevision:       2,
 	}
 
 	require.NoError(t, cacheSetTokenForTest(token))
@@ -25,6 +27,8 @@ func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, token.AutoGroups, cached.AutoGroups)
 	assert.Equal(t, token.ManagedBindingRef, cached.ManagedBindingRef)
+	assert.Equal(t, token.ManagementCreatorID, cached.ManagementCreatorID)
+	assert.Equal(t, token.QuotaRevision, cached.QuotaRevision)
 	groups, err := cached.GetAutoGroups()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"vip", "default"}, groups)
@@ -66,8 +70,8 @@ func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 
 	require.NoError(t, token.SetAutoGroups([]string{"vip"}))
 	require.NoError(t, token.Update())
-	// Update 是限制性变更：写库前删除缓存并设置 fence。缓存不再提供旧的
-	// 宽分组值，下一次读取必须看到收紧后的分组。
+	// Metadata is invalidated without dropping outstanding quota reservations;
+	// the next authenticated read must observe the narrowed groups.
 	_, cacheErr := cacheGetTokenByKey(token.Key)
 	require.Error(t, cacheErr, "the pre-update cache entry must be invalidated")
 	reloaded, err := GetTokenByKey(token.Key, false)

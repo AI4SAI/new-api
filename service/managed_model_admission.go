@@ -79,7 +79,7 @@ func AdmitManagedModel(c *gin.Context, modelName, kind string) *types.NewAPIErro
 		c.Set(common.RequestIdKey, requestID)
 	}
 	body, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": instance,
-		"native_owner_id": owner, "native_token_id": token, "managed_binding_ref": c.GetString("managed_binding_ref"),
+		"native_owner_id": owner, "native_token_id": token, "management_creator_id": c.GetInt("management_creator_id"), "managed_binding_ref": c.GetString("managed_binding_ref"),
 		"model": modelName, "native_group": common.GetContextKeyString(c, constant.ContextKeyUsingGroup),
 		"pricing_model": c.GetString("model_billing_alias"),
 		"request_id":    requestID, "kind": kind, "request_path": c.Request.URL.Path})

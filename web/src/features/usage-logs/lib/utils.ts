@@ -185,7 +185,12 @@ export function buildApiParams(config: {
     page_size: pageSize,
     ...(searchParams.type ? { type: processType(searchParams.type) } : {}),
     ...(searchParams.model ? { model_name: String(searchParams.model) } : {}),
-    ...(searchParams.token ? { token_name: String(searchParams.token) } : {}),
+    ...(searchParams.token_id
+      ? { token_id: Number(searchParams.token_id) }
+      : {}),
+    ...(!searchParams.token_id && searchParams.token
+      ? { token_name: String(searchParams.token) }
+      : {}),
     ...(searchParams.group ? { group: String(searchParams.group) } : {}),
     ...(isAdmin && searchParams.channel
       ? { channel: Number(searchParams.channel) || 0 }
@@ -215,7 +220,7 @@ export function buildApiParams(config: {
           params.model_name = String(value)
           break
         case 'token_name':
-          params.token_name = String(value)
+          if (!params.token_id) params.token_name = String(value)
           break
         case 'group':
           params.group = String(value)
@@ -254,7 +259,14 @@ export async function fetchLogsByCategory(
       columnFilters,
       isAdmin,
     })
-    return isAdmin ? await getAllLogs(params) : await getUserLogs(params)
+    return isAdmin
+      ? await getAllLogs(params)
+      : await getUserLogs(
+          params,
+          typeof searchParams.workspace_key === 'string'
+            ? searchParams.workspace_key
+            : undefined
+        )
   }
 
   // For drawing and task logs

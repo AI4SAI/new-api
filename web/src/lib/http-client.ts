@@ -79,7 +79,11 @@ function redirectToSignIn(): void {
     typeof window !== 'undefined' &&
     window.location.pathname !== '/sign-in'
   ) {
-    window.location.replace('/sign-in')
+    const destination =
+      window.location.pathname + window.location.search + window.location.hash
+    window.location.replace(
+      `/sign-in?${new URLSearchParams({ redirect: destination })}`
+    )
   }
 }
 

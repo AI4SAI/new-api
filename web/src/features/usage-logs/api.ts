@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { modelAccountRequest } from '@/features/keys/api'
 import { api, getFreshAuthHeaders, type ApiRequestConfig } from '@/lib/api'
 import { createServerError } from '@/lib/server-error-message'
 
@@ -44,7 +45,8 @@ function buildApiPath(endpoint: string, isAdmin: boolean): string {
 async function fetchLogs<T>(
   endpoint: string,
   params: T,
-  isAdmin: boolean
+  isAdmin: boolean,
+  workspaceKey?: string
 ): Promise<GetLogsResponse> {
   const paramRecord = params as unknown as Record<string, unknown>
   const queryParams = buildQueryParams({
@@ -53,20 +55,27 @@ async function fetchLogs<T>(
     ...params,
   })
   const path = buildApiPath(endpoint, isAdmin)
-  const res = await api.get(`${path}?${queryParams}`)
+  const res = await api.get(
+    `${path}?${queryParams}`,
+    modelAccountRequest(workspaceKey)
+  )
   return res.data
 }
 
 async function fetchLogStats<T>(
   endpoint: string,
   params: T,
-  isAdmin: boolean
+  isAdmin: boolean,
+  workspaceKey?: string
 ): Promise<GetLogStatsResponse> {
   const queryParams = buildQueryParams(
     params as unknown as Record<string, unknown>
   )
   const path = buildApiPath(endpoint, isAdmin)
-  const res = await api.get(`${path}/stat?${queryParams}`)
+  const res = await api.get(
+    `${path}/stat?${queryParams}`,
+    modelAccountRequest(workspaceKey)
+  )
   return res.data
 }
 
@@ -78,15 +87,17 @@ export const getAllLogs = (params: GetLogsParams = {}) =>
   fetchLogs('/api/log', params, true)
 
 export const getUserLogs = (
-  params: Omit<GetLogsParams, 'username' | 'channel'> = {}
-) => fetchLogs('/api/log', params, false)
+  params: Omit<GetLogsParams, 'username' | 'channel'> = {},
+  workspaceKey?: string
+) => fetchLogs('/api/log', params, false, workspaceKey)
 
 export const getLogStats = (params: GetLogStatsParams = {}) =>
   fetchLogStats('/api/log', params, true)
 
 export const getUserLogStats = (
-  params: Omit<GetLogStatsParams, 'username' | 'channel'> = {}
-) => fetchLogStats('/api/log', params, false)
+  params: Omit<GetLogStatsParams, 'username' | 'channel'> = {},
+  workspaceKey?: string
+) => fetchLogStats('/api/log', params, false, workspaceKey)
 
 /**
  * Stream the logs matching params, newest first. The server sends one JSON
@@ -96,7 +107,11 @@ export const getUserLogStats = (
 export async function exportLogs(
   params: GetLogsParams,
   isAdmin: boolean,
-  options: { signal: AbortSignal; onLog: (log: UsageLog) => void }
+  options: {
+    signal: AbortSignal
+    onLog: (log: UsageLog) => void
+    workspaceKey?: string
+  }
 ): Promise<number> {
   const queryParams = buildQueryParams(
     params as unknown as Record<string, unknown>
@@ -105,7 +120,10 @@ export async function exportLogs(
     `${buildApiPath('/api/log', isAdmin)}/export?${queryParams}`,
     {
       credentials: 'include',
-      headers: await getFreshAuthHeaders(),
+      headers: {
+        ...(await getFreshAuthHeaders()),
+        ...modelAccountRequest(options.workspaceKey).headers,
+      },
       signal: options.signal,
     }
   )

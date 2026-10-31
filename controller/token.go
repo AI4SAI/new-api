@@ -34,8 +34,11 @@ func (input *tokenAutoGroupsInput) UnmarshalJSON(data []byte) error {
 }
 
 type tokenRequest struct {
+	ExpectedQuotaRevision *int64 `json:"expected_quota_revision"`
 	model.Token
-	AutoGroups tokenAutoGroupsInput `json:"auto_groups"`
+	RemainQuota *int                 `json:"remain_quota"`
+	QuotaDelta  *int                 `json:"quota_delta"`
+	AutoGroups  tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
 	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
 }
@@ -81,13 +84,16 @@ func buildMaskedTokenResponses(tokens []*model.Token) []*tokenResponse {
 }
 
 func getTokenRequestUserGroup(c *gin.Context) (string, error) {
+	if service.ManagementAccount(c) != nil {
+		return model.GetUserGroup(service.ManagementOwnerID(c), false)
+	}
 	if userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup); userGroup != "" {
 		return userGroup, nil
 	}
 	if userGroup := c.GetString("group"); userGroup != "" {
 		return userGroup, nil
 	}
-	return model.GetUserGroup(c.GetInt("id"), false)
+	return model.GetUserGroup(service.ManagementOwnerID(c), false)
 }
 
 func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) bool {
@@ -131,27 +137,27 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 }
 
 func GetAllTokens(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	pageInfo := common.GetPageQuery(c)
-	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	total, _ := model.CountUserTokens(userId)
+	total, _ := model.CountUserTokens(userId, !c.GetBool("access_token_managed"))
 	pageInfo.SetTotal(int(total))
 	pageInfo.SetItems(buildMaskedTokenResponses(tokens))
 	common.ApiSuccess(c, pageInfo)
 }
 
 func SearchTokens(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	keyword := c.Query("keyword")
 	token := c.Query("token")
 
 	pageInfo := common.GetPageQuery(c)
 
-	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -163,12 +169,12 @@ func SearchTokens(c *gin.Context) {
 
 func GetToken(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := model.GetTokenByIds(id, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -190,12 +196,12 @@ func GetTokenAutoGroups(c *gin.Context) {
 
 func GetTokenKey(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := model.GetTokenByIds(id, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -273,7 +279,7 @@ func GetTokenUsage(c *gin.Context) {
 		"expires_at":           expiredAt,
 	}
 	// 用户额度只在令牌允许时返回；IP 白名单已由 TokenAuthReadOnly 检查。
-	if token.AllowUserQuotaQuery {
+	if token.AllowUserQuotaQuery && token.ManagementCreatorID == 0 {
 		userQuota, err := model.GetUserQuota(token.UserId, false)
 		var userUsedQuota int
 		if err == nil {
@@ -305,6 +311,21 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if request.RemainQuota != nil {
+		token.RemainQuota = *request.RemainQuota
+	}
+	if request.QuotaDelta != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	if token.ManagementCreatorID != 0 {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	if service.ManagementAccount(c) != nil && token.ManagedBindingRef != "" {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
 	if token.ManagedBindingRef != "" {
 		if len(token.ManagedBindingRef) != 36 || (!c.GetBool("access_token_managed") && !requireManagedProvisioner(c)) {
 			if !c.IsAborted() {
@@ -336,7 +357,7 @@ func AddToken(c *gin.Context) {
 	}
 	// 检查用户令牌数量是否已达上限
 	maxTokens := operation_setting.GetMaxUserTokens()
-	count, err := model.CountUserTokens(c.GetInt("id"))
+	count, err := model.CountUserTokens(service.ManagementOwnerID(c), !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -360,7 +381,7 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:             c.GetInt("id"),
+		UserId:             service.ManagementOwnerID(c),
 		Name:               token.Name,
 		Key:                key,
 		CreatedTime:        common.GetTimestamp(),
@@ -377,6 +398,14 @@ func AddToken(c *gin.Context) {
 	}
 	cleanToken.AllowUserQuotaQuery = request.AllowUserQuotaQuery == nil || *request.AllowUserQuotaQuery
 	cleanToken.ManagedBindingRef = token.ManagedBindingRef
+	if service.ManagementAccount(c) != nil {
+		if request.AllowUserQuotaQuery != nil && *request.AllowUserQuotaQuery {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		cleanToken.ManagementCreatorID = c.GetInt("id")
+		cleanToken.AllowUserQuotaQuery = false
+	}
 	err = cleanToken.Insert()
 	if err != nil {
 		common.ApiError(c, err)
@@ -392,8 +421,8 @@ func AddToken(c *gin.Context) {
 
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	userId := c.GetInt("id")
-	token, err := model.GetTokenByIds(id, userId)
+	userId := service.ManagementOwnerID(c)
+	token, err := model.GetTokenByIds(id, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -413,7 +442,7 @@ func DeleteToken(c *gin.Context) {
 }
 
 func UpdateToken(c *gin.Context) {
-	userId := c.GetInt("id")
+	userId := service.ManagementOwnerID(c)
 	statusOnly := c.Query("status_only")
 	request := tokenRequest{}
 	err := c.ShouldBindJSON(&request)
@@ -422,6 +451,30 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	if token.ManagementCreatorID != 0 || token.ManagedBindingRef != "" {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	if statusOnly == "" && request.RemainQuota != nil {
+		common.ApiErrorT(c, "Use quota_delta to adjust token quota")
+		return
+	}
+	if statusOnly != "" && request.QuotaDelta != nil {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	delta := 0
+	if request.QuotaDelta != nil {
+		delta = *request.QuotaDelta
+	}
+	if delta != 0 && (request.ExpectedQuotaRevision == nil || *request.ExpectedQuotaRevision < 0) {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
+	if delta > maxTokenQuota() || delta < -maxTokenQuota() {
+		common.ApiErrorT(c, "Invalid parameters")
+		return
+	}
 	params := tokenAuditParams(c)
 	if token.Id > 0 {
 		params["id"] = token.Id
@@ -430,20 +483,13 @@ func UpdateToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
-	if !token.UnlimitedQuota {
-		if token.RemainQuota < 0 {
-			common.ApiErrorT(c, "Quota value cannot be negative")
-			return
-		}
-		maxQuotaValue := maxTokenQuota()
-		if token.RemainQuota > maxQuotaValue {
-			common.ApiErrorT(c, "Quota value exceeds valid range, maximum is {{max}}", map[string]any{"max": logger.FormatQuota(maxQuotaValue)})
-			return
-		}
-	}
-	cleanToken, err := model.GetTokenByIds(token.Id, userId)
+	cleanToken, err := model.GetTokenByIds(token.Id, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
+		return
+	}
+	if cleanToken.ManagementCreatorID > 0 && request.AllowUserQuotaQuery != nil && *request.AllowUserQuotaQuery {
+		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 	params["name"] = cleanToken.Name
@@ -464,7 +510,6 @@ func UpdateToken(c *gin.Context) {
 		// If you add more fields, please also update token.Update()
 		cleanToken.Name = token.Name
 		cleanToken.ExpiredTime = token.ExpiredTime
-		cleanToken.RemainQuota = token.RemainQuota
 		cleanToken.UnlimitedQuota = token.UnlimitedQuota
 		cleanToken.ModelLimitsEnabled = token.ModelLimitsEnabled
 		cleanToken.ModelLimits = token.ModelLimits
@@ -483,12 +528,34 @@ func UpdateToken(c *gin.Context) {
 			}
 		}
 	}
-	err = cleanToken.Update()
+	if statusOnly != "" {
+		err = cleanToken.SelectUpdate()
+	} else {
+		if delta == 0 {
+			err = cleanToken.Update()
+		} else {
+			err = cleanToken.Update(model.TokenQuotaAdjustment{Delta: delta, ExpectedRevision: *request.ExpectedQuotaRevision})
+		}
+	}
+	if errors.Is(err, model.ErrTokenQuotaRevisionConflict) {
+		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Token quota changed; reload before adjusting it"), gin.H{"code": "QUOTA_REVISION_CONFLICT"})
+		return
+	}
+	if errors.Is(err, model.ErrTokenQuotaUpdateUnknown) {
+		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Token quota update outcome is unknown; reload before adjusting it"), gin.H{"code": "QUOTA_UPDATE_UNKNOWN"})
+		return
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
 	params["name"] = cleanToken.Name
+	if delta != 0 {
+		params["quota_delta"] = delta
+	}
+	if updated, loadErr := model.GetTokenByIds(cleanToken.Id, userId); loadErr == nil {
+		cleanToken = updated
+	}
 	if statusOnly != "" {
 		params["from"], params["to"] = previous.Status, cleanToken.Status
 	} else {
@@ -499,7 +566,7 @@ func UpdateToken(c *gin.Context) {
 		}{
 			{"name", previous.Name != cleanToken.Name},
 			{"expired_time", previous.ExpiredTime != cleanToken.ExpiredTime},
-			{"remain_quota", previous.RemainQuota != cleanToken.RemainQuota},
+			{"remain_quota", delta != 0},
 			{"unlimited_quota", previous.UnlimitedQuota != cleanToken.UnlimitedQuota},
 			{"model_limits_enabled", previous.ModelLimitsEnabled != cleanToken.ModelLimitsEnabled},
 			{"model_limits", previous.ModelLimits != cleanToken.ModelLimits},
@@ -539,8 +606,8 @@ func DeleteTokenBatch(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	userId := c.GetInt("id")
-	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId)
+	userId := service.ManagementOwnerID(c)
+	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -569,8 +636,8 @@ func GetTokenKeysBatch(c *gin.Context) {
 		common.ApiErrorT(c, "Too many items in batch request, maximum is {{max}}", map[string]any{"max": 100})
 		return
 	}
-	userId := c.GetInt("id")
-	tokens, err := model.GetTokenKeysByIds(tokenBatch.Ids, userId)
+	userId := service.ManagementOwnerID(c)
+	tokens, err := model.GetTokenKeysByIds(tokenBatch.Ids, userId, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -585,4 +652,13 @@ func GetTokenKeysBatch(c *gin.Context) {
 	params["returned_ids"] = returnedIDs
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
 	common.ApiSuccess(c, gin.H{"keys": keysMap})
+}
+
+func GetManagedAccountContext(c *gin.Context) {
+	account := service.ManagementAccount(c)
+	if account == nil {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
+	common.ApiSuccess(c, gin.H{"workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID, "account_label": account.Label, "account_kind": account.Kind})
 }
