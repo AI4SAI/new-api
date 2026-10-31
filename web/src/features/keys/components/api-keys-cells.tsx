@@ -84,6 +84,16 @@ export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
     copyTooltip = t('Copied!')
   }
 
+  if (apiKey.managed) {
+    return (
+      <StatusBadge
+        label={t('Managed automatically')}
+        variant='neutral'
+        copyable={false}
+      />
+    )
+  }
+
   return (
     <div className='flex max-w-full min-w-0 items-center'>
       <Popover open={popoverOpen} onOpenChange={handlePopoverOpen}>
@@ -166,10 +176,12 @@ export function IpRestrictionsCell(props: ApiKeyRestrictionProps) {
 
   return (
     <ApiKeyRestrictionCell
-      items={ips}
+      items={props.apiKey.managed ? [] : ips}
       label={t('{{count}} IP(s)', { count: ips.length })}
       title={t('IP Restriction')}
-      emptyLabel={t('No restriction')}
+      emptyLabel={
+        props.apiKey.managed ? t('Managed automatically') : t('No restriction')
+      }
       detailsTrigger={props.detailsTrigger}
     />
   )

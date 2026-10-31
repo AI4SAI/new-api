@@ -52,9 +52,12 @@ func logFilterFromQuery(c *gin.Context, admin bool) model.LogFilter {
 		filter.BillingContextRef = &value
 	}
 	if service.ManagementAccount(c) != nil {
-		value, _ := c.Get("management_token_ids")
-		ids, _ := value.([]int)
-		filter.ExternalTokenIDs = &ids
+		value, _ := c.Get("management_token_visibility")
+		visibility, _ := value.(map[int]model.TokenLogVisibility)
+		if visibility == nil {
+			visibility = map[int]model.TokenLogVisibility{}
+		}
+		filter.TokenVisibility = visibility
 		owner := service.ManagementOwnerID(c)
 		filter.UserID = &owner
 	}

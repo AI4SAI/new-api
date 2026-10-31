@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -115,15 +116,37 @@ func assignDisplayLogIds(logs []*Log, startIdx int) {
 	}
 }
 
-func formatUserLogs(logs []*Log, startIdx int) {
+func formatUserLogs(logs []*Log, startIdx int, tokenVisibility ...map[int]TokenLogVisibility) {
 	for i := range logs {
-		if logs[i].Type == LogTypeConsume {
-			logs[i].Metering = logs[i].TokenMetering()
-		}
-		logs[i].ChannelName = ""
-		logs[i].Other = formatLogOtherJSON(logs[i].Other, logOtherVisibilityUser)
+		formatUserLog(logs[i], tokenVisibility...)
 	}
 	assignDisplayLogIds(logs, startIdx)
+}
+
+func formatUserLog(log *Log, tokenVisibility ...map[int]TokenLogVisibility) {
+	if log.Type == LogTypeConsume {
+		log.Metering = log.TokenMetering()
+	}
+	if len(tokenVisibility) != 0 && tokenVisibility[0] != nil {
+		visibility := tokenVisibility[0][log.TokenId]
+		if !visibility.FullDetails {
+			name := log.TokenName
+			if name == "" && log.TokenId > 0 {
+				name = fmt.Sprintf("Key #%d", log.TokenId)
+			}
+			if visibility.Managed {
+				name = ManagedTokenDisplayName
+			}
+			*log = Log{Id: log.Id, UserId: log.UserId, CreatedAt: log.CreatedAt, Type: log.Type,
+				ModelName: log.ModelName, BillingProduct: log.BillingProduct, Group: log.Group, Quota: log.Quota, PromptTokens: log.PromptTokens,
+				CompletionTokens: log.CompletionTokens, UseTime: log.UseTime, IsStream: log.IsStream,
+				TokenId: log.TokenId, TokenName: name, Metering: log.Metering,
+				Other: formatLogOtherJSON(log.Other, logOtherVisibilityBillingFacts)}
+			return
+		}
+	}
+	log.ChannelName = ""
+	log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
 }
 
 // FormatAdminLogs removes root-only diagnostics while retaining operational
@@ -494,7 +517,7 @@ type LogFilter struct {
 	UpstreamRequestId string
 	UserID            *int
 	TokenID           *int
-	ExternalTokenIDs  *[]int
+	TokenVisibility   map[int]TokenLogVisibility
 	BillingContextRef *string
 	BillingProduct    string
 	IncludeMetering   bool
@@ -512,12 +535,9 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	if f.TokenID != nil {
 		tx = tx.Where("logs.token_id = ?", *f.TokenID)
 	}
-	if f.ExternalTokenIDs != nil {
-		if len(*f.ExternalTokenIDs) == 0 {
-			tx = tx.Where("1 = 0")
-		} else {
-			tx = tx.Where("logs.token_id IN ?", *f.ExternalTokenIDs)
-		}
+	if f.TokenVisibility != nil {
+		// Management grants read model usage, not unrelated owner account events.
+		tx = tx.Where("logs.type IN ?", []int{LogTypeConsume, LogTypeError, LogTypeRefund})
 	}
 	if f.BillingContextRef != nil {
 		tx = tx.Where("logs.billing_context_ref = ?", *f.BillingContextRef)
@@ -535,7 +555,19 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 		return nil, err
 	}
 	if f.TokenName != "" {
-		tx = tx.Where("logs.token_name = ?", f.TokenName)
+		managedIDs := []int{}
+		for id, visibility := range f.TokenVisibility {
+			if visibility.Managed {
+				managedIDs = append(managedIDs, id)
+			}
+		}
+		if len(managedIDs) == 0 {
+			tx = tx.Where("logs.token_name = ?", f.TokenName)
+		} else if f.TokenName == ManagedTokenDisplayName {
+			tx = tx.Where("(logs.token_id IN ? OR logs.token_name = ?)", managedIDs, f.TokenName)
+		} else {
+			tx = tx.Where("logs.token_id NOT IN ? AND logs.token_name = ?", managedIDs, f.TokenName)
+		}
 	}
 	if f.RequestId != "" {
 		tx = tx.Where("logs.request_id = ?", f.RequestId)
@@ -644,7 +676,7 @@ func GetUserLogs(userId int, filter LogFilter, startIdx int, num int) (logs []*L
 		return nil, 0, common.NewMessage("Failed to query logs")
 	}
 
-	formatUserLogs(logs, startIdx)
+	formatUserLogs(logs, startIdx, filter.TokenVisibility)
 	return logs, total, err
 }
 
@@ -688,8 +720,7 @@ func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*
 	return streamLogs(tx, "logs.id desc", func(log *Log) error {
 		count++
 		log.Id = count
-		log.ChannelName = ""
-		log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+		formatUserLog(log, filter.TokenVisibility)
 		return fn(log)
 	})
 }
@@ -780,6 +811,9 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		rpmTpmQuery, err = nativeIdentity[0].apply(rpmTpmQuery)
 		if err != nil {
 			return stat, err
+		}
+		if nativeIdentity[0].TokenVisibility != nil {
+			tokenName = ""
 		}
 	}
 

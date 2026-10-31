@@ -305,7 +305,11 @@ function KeysPage() {
   )
 }
 
-async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
+async function renderKeysPage(
+  status = 1,
+  overrides: Partial<ApiKey> = {},
+  additionalKeys: ApiKey[] = []
+) {
   let currentKey = { ...key, status, ...overrides }
   let deleted = false
   vi.mocked(api.get).mockImplementation(async (url) => {
@@ -313,7 +317,10 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
       return {
         data: {
           success: true,
-          data: { items: deleted ? [] : [currentKey], total: deleted ? 0 : 1 },
+          data: {
+            items: deleted ? additionalKeys : [currentKey, ...additionalKeys],
+            total: (deleted ? 0 : 1) + additionalKeys.length,
+          },
         },
       }
     }
@@ -363,6 +370,81 @@ async function renderKeysPage(status = 1, overrides: Partial<ApiKey> = {}) {
   await screen.findByText(currentKey.name)
   return { post, put, router }
 }
+
+it.each([false, true])(
+  'shows an automatically managed Pilot key without secret or mutation controls on mobile=%s',
+  async (mobile) => {
+    if (mobile) {
+      const matchMedia = window.matchMedia
+      vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query.includes('max-width'),
+      }))
+    }
+    const { post, put, router } = await renderKeysPage(1, {
+      managed: true,
+      name: 'Pilot',
+      key: '',
+      allow_ips: null,
+    })
+    expect(screen.getByText('Pilot')).toBeVisible()
+    expect(screen.getAllByText('Managed automatically')).toHaveLength(2)
+    expect(screen.queryByText('No restriction')).not.toBeInTheDocument()
+    expect(screen.queryByText('No API Keys Found')).not.toBeInTheDocument()
+    for (const name of ['Disable', 'Edit', 'Open menu', 'Copy API key']) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument()
+    }
+    expect(screen.queryByText(/^sk-/)).not.toBeInTheDocument()
+    if (!mobile) {
+      expect(
+        screen.getByRole('checkbox', { name: 'Select row' })
+      ).toHaveAttribute('aria-disabled', 'true')
+      expect(
+        screen.getByRole('checkbox', { name: 'Select all' })
+      ).toHaveAttribute('aria-disabled', 'true')
+    }
+    await userEvent.click(screen.getByRole('button', { name: 'Usage' }))
+    await waitFor(() =>
+      expect(router.state.location.search).toMatchObject({
+        token_id: 7,
+        token: 'Pilot',
+      })
+    )
+    expect(post).not.toHaveBeenCalled()
+    expect(put).not.toHaveBeenCalled()
+    expect(api.delete).not.toHaveBeenCalled()
+  }
+)
+
+it('excludes managed keys when selecting all rows for a batch copy', async () => {
+  const user = userEvent.setup()
+  const { post } = await renderKeysPage(1, {}, [
+    apiKeySchema.parse({
+      ...key,
+      id: 8,
+      managed: true,
+      name: 'Pilot',
+      key: '',
+    }),
+  ])
+  post.mockResolvedValue({
+    data: { success: true, data: { keys: { 7: 'external-fixture' } } },
+  })
+  await user.click(screen.getByRole('checkbox', { name: 'Select all' }))
+  expect(
+    screen
+      .getAllByRole('checkbox', { name: 'Select row' })
+      .filter((checkbox) => checkbox.getAttribute('aria-checked') === 'true')
+  ).toHaveLength(1)
+  await user.click(screen.getByRole('button', { name: 'Copy selected keys' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/token/batch/keys',
+      { ids: [7] },
+      expect.any(Object)
+    )
+  )
+})
 
 it('keeps updated rows after navigation and removes a deleted key without reviving cached state', async () => {
   const { router } = await renderKeysPage()

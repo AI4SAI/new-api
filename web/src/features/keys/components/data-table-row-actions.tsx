@@ -179,6 +179,25 @@ export function DataTableRowActions<TData>({
     statusIcon = <PowerOff className='size-4' />
   }
 
+  const handleViewUsage = () =>
+    void navigate({
+      to: '/usage-logs/$section',
+      params: { section: 'common' },
+      search: {
+        workspace_key: workspaceKey,
+        token: apiKey.name,
+        token_id: workspaceKey || apiKey.managed ? apiKey.id : undefined,
+      },
+    })
+
+  if (apiKey.managed) {
+    return (
+      <Button variant='ghost' size='sm' onClick={handleViewUsage}>
+        {t('Usage')}
+      </Button>
+    )
+  }
+
   return (
     <div className='-ml-1.5 flex items-center gap-1'>
       <Tooltip>
@@ -227,19 +246,7 @@ export function DataTableRowActions<TData>({
         contentClassName='w-[200px]'
         modal={false}
       >
-        <DropdownMenuItem
-          onClick={() =>
-            void navigate({
-              to: '/usage-logs/$section',
-              params: { section: 'common' },
-              search: {
-                workspace_key: workspaceKey,
-                token: apiKey.name,
-                token_id: workspaceKey ? apiKey.id : undefined,
-              },
-            })
-          }
-        >
+        <DropdownMenuItem onClick={handleViewUsage}>
           {t('Usage')}
         </DropdownMenuItem>
         <DropdownMenuItem
