@@ -15,6 +15,8 @@ and license terms remain in force. These modifications do not imply upstream
 endorsement. Authentication form ordering and responsive layout are also
 corrected in this modified version. Direct Search consumption logs also retain
 bounded query parameters and result counts through the existing log metadata.
+Direct Fetch logs retain a redacted target URL and content size. DeepSeek tool
+settlement validates successful results and preserves free failure responses.
 Managed-account authorization now preserves
 the signed-in operator while scoping key management and usage to an authorized
 account. Key quota updates preserve concurrent consumption and reject repeated

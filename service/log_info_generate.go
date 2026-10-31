@@ -114,6 +114,9 @@ func GenerateTextOtherInfo(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, m
 	if relayInfo.SearchRequest != nil {
 		other.SetPublic("search_request", *relayInfo.SearchRequest)
 	}
+	if relayInfo.FetchRequest != nil {
+		other.SetPublic("fetch_request", *relayInfo.FetchRequest)
+	}
 	if relayInfo.IsModelMapped {
 		other.SetPublic("is_model_mapped", true)
 		other.SetPublic("upstream_model_name", relayInfo.UpstreamModelName)
@@ -150,6 +153,11 @@ func AppendResponseModelLogInfo(relayInfo *relaycommon.RelayInfo, other *model.L
 
 func appendParamOverrideInfo(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {
 	if relayInfo == nil || other == nil || len(relayInfo.ParamOverrideAudit) == 0 {
+		return
+	}
+	// Direct web tools record bounded effective parameters separately. Debug
+	// override strings can include signed URLs, credentials or original prompts.
+	if relayInfo.RelayFormat == types.RelayFormatDeepSeekTools {
 		return
 	}
 	other.SetPublic("po", relayInfo.ParamOverrideAudit)
