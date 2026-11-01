@@ -56,10 +56,15 @@ async function renderLogs(props: {
   role: number
   enabledPlans: boolean[]
   activeSubscription: boolean
+  modelServiceOnly?: boolean
+  workspaceKey?: string
 }) {
-  useAuthStore
-    .getState()
-    .auth.setUser({ id: 1, username: 'tester', role: props.role })
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'tester',
+    role: props.role,
+    permissions: { model_service_only: props.modelServiceOnly },
+  })
   const records = ['wallet', 'subscription'].map((source, index) =>
     usageLogSchema.parse({
       id: index + 1,
@@ -104,14 +109,20 @@ async function renderLogs(props: {
   })
   const router = createRouter({
     routeTree: root.addChildren([auth.addChildren([logs])]),
-    history: createMemoryHistory({ initialEntries: ['/usage-logs/common'] }),
+    history: createMemoryHistory({
+      initialEntries: [
+        props.workspaceKey
+          ? `/usage-logs/common?workspace_key=${encodeURIComponent(props.workspaceKey)}`
+          : '/usage-logs/common',
+      ],
+    }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   render(
     <QueryClientProvider client={client}>
-      <UsageLogsProvider>
+      <UsageLogsProvider workspaceKey={props.workspaceKey}>
         <RouterProvider router={router} />
       </UsageLogsProvider>
     </QueryClientProvider>
@@ -176,6 +187,33 @@ test('shows both source icons for a user with an active subscription', async () 
   expect(screen.getByRole('img', { name: 'Wallet' })).toBeVisible()
   expect(screen.getByRole('img', { name: 'Subscription' })).toBeVisible()
 })
+
+test.each([undefined, 'org:11111111-1111-4111-8111-111111111111'])(
+  'model service usage skips subscriptions and preserves workspace %s',
+  async (workspaceKey) => {
+    await renderLogs({
+      role: ROLE.USER,
+      enabledPlans: [],
+      activeSubscription: true,
+      modelServiceOnly: true,
+      workspaceKey,
+    })
+    expect(api.get).not.toHaveBeenCalledWith('/api/subscription/self')
+    expect(
+      screen.queryByRole('img', { name: 'Wallet' })
+    ).not.toBeInTheDocument()
+    // The historical log remains authoritative even without a subscription lookup.
+    expect(screen.getByRole('img', { name: 'Subscription' })).toBeVisible()
+    expect(api.get).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/api\/log\/self\?/),
+      expect.objectContaining({
+        headers: workspaceKey
+          ? { 'X-SAI-Workspace-Key': workspaceKey }
+          : undefined,
+      })
+    )
+  }
+)
 
 test('uses personal subscriptions when an admin switches to only-self view', async () => {
   const user = userEvent.setup()
