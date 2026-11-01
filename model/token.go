@@ -12,29 +12,33 @@ import (
 )
 
 type Token struct {
-	Id                  int            `json:"id"`
-	UserId              int            `json:"user_id" gorm:"index"`
-	Key                 string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
-	Status              int            `json:"status" gorm:"default:1"`
-	Name                string         `json:"name" gorm:"index" `
-	CreatedTime         int64          `json:"created_time" gorm:"bigint"`
-	AccessedTime        int64          `json:"accessed_time" gorm:"bigint"`
-	ExpiredTime         int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
-	RemainQuota         int            `json:"remain_quota" gorm:"default:0"`
-	UnlimitedQuota      bool           `json:"unlimited_quota"`
-	ModelLimitsEnabled  bool           `json:"model_limits_enabled"`
-	ModelLimits         string         `json:"model_limits" gorm:"type:text"`
-	AllowIps            *string        `json:"allow_ips" gorm:"default:''"`
-	UsedQuota           int            `json:"used_quota" gorm:"default:0"` // used quota
-	Group               string         `json:"group" gorm:"default:''"`
-	CrossGroupRetry     bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
-	AutoGroups          string         `json:"-" gorm:"type:text"`
-	DeletedAt           gorm.DeletedAt `gorm:"index"`
-	QuotaRevision       int64          `json:"quota_revision" gorm:"not null;default:0"`
-	QuotaMutationRef    string         `json:"-" gorm:"type:varchar(32)"`
-	ManagementCreatorID int            `json:"management_creator_id,omitempty" gorm:"not null;default:0"`
-	ManagedBindingRef   string         `json:"managed_binding_ref,omitempty" gorm:"type:varchar(36)"`
-	CacheSchemaVersion  int            `json:"-" gorm:"-"`
+	Id                      int            `json:"id"`
+	UserId                  int            `json:"user_id" gorm:"index"`
+	Key                     string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
+	Status                  int            `json:"status" gorm:"default:1"`
+	Name                    string         `json:"name" gorm:"index" `
+	CreatedTime             int64          `json:"created_time" gorm:"bigint"`
+	AccessedTime            int64          `json:"accessed_time" gorm:"bigint"`
+	ExpiredTime             int64          `json:"expired_time" gorm:"bigint;default:-1"` // -1 means never expired
+	RemainQuota             int            `json:"remain_quota" gorm:"default:0"`
+	UnlimitedQuota          bool           `json:"unlimited_quota"`
+	ModelLimitsEnabled      bool           `json:"model_limits_enabled"`
+	ModelLimits             string         `json:"model_limits" gorm:"type:text"`
+	AllowIps                *string        `json:"allow_ips" gorm:"default:''"`
+	UsedQuota               int            `json:"used_quota" gorm:"default:0"` // used quota
+	Group                   string         `json:"group" gorm:"default:''"`
+	CrossGroupRetry         bool           `json:"cross_group_retry"` // 跨分组重试，仅auto分组有效
+	AutoGroups              string         `json:"-" gorm:"type:text"`
+	DeletedAt               gorm.DeletedAt `gorm:"index"`
+	QuotaRevision           int64          `json:"quota_revision" gorm:"not null;default:0"`
+	MetadataRevision        int64          `json:"-" gorm:"not null;default:1"`
+	QuotaMutationRef        string         `json:"-" gorm:"type:varchar(32)"`
+	ManagementCreatorID     int            `json:"management_creator_id,omitempty" gorm:"not null;default:0"`
+	ManagedBindingRef       string         `json:"managed_binding_ref,omitempty" gorm:"type:varchar(36)"`
+	BillingContextRef       *string        `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);uniqueIndex"`
+	CreationRequestSHA      string         `json:"-" gorm:"type:varchar(64)"`
+	BillingContextConfirmed bool           `json:"-" gorm:"not null;default:false"`
+	CacheSchemaVersion      int            `json:"-" gorm:"-"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool `json:"allow_user_quota_query"`
 }
@@ -307,7 +311,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 		// 冷缓存时用数据库快照初始化；已存在的哈希只刷新 TTL，
 		// 避免快照覆盖 Redis 中已被原子预扣的余额。初始化失败不影响本次读取。
 		if _, cacheErr := cacheInitToken(*token); cacheErr != nil {
-			if errors.Is(cacheErr, ErrTokenQuotaUpdateUnknown) {
+			if errors.Is(cacheErr, ErrTokenQuotaUpdateUnknown) || errors.Is(cacheErr, ErrTokenMetadataStale) {
 				return nil, cacheErr
 			}
 			common.SysLog(common.LogText("failed to init token cache: %s", cacheErr.Error()))
@@ -322,6 +326,115 @@ func (token *Token) Insert() error {
 	return err
 }
 
+var ErrBillingContextConflict = errors.New("key billing context conflicts with its original creation")
+var ErrBillingContextRetired = errors.New("the original key creation was retired")
+
+// BindPlaygroundBillingContext applies a confirmed control-plane receipt once.
+func BindPlaygroundBillingContext(userID int, reference string) error {
+	if userID <= 0 || len(reference) != 36 {
+		return ErrBillingContextConflict
+	}
+	err := DB.Transaction(func(tx *gorm.DB) error {
+		var user User
+		if err := lockForUpdate(tx).Select("id", "playground_billing_context_ref").First(&user, userID).Error; err != nil {
+			return err
+		}
+		if user.PlaygroundBillingContextRef != nil {
+			if *user.PlaygroundBillingContextRef != reference {
+				return ErrBillingContextConflict
+			}
+			return nil
+		}
+		return tx.Model(&user).Update("playground_billing_context_ref", reference).Error
+	})
+	if err != nil {
+		return err
+	}
+	user, err := GetUserById(userID, false)
+	if err != nil {
+		return err
+	}
+	return updateUserCache(*user)
+}
+
+func GetPlaygroundBillingContext(userID int) (*string, error) {
+	var user User
+	err := DB.Select("id", "playground_billing_context_ref").First(&user, userID).Error
+	return user.PlaygroundBillingContextRef, err
+}
+
+func GetTokenByBillingContext(userID int, reference string) (*Token, error) {
+	var token Token
+	err := DB.Where("user_id = ? AND billing_context_ref = ?", userID, reference).First(&token).Error
+	return &token, err
+}
+
+// InsertPendingBillingToken creates one disabled key per immutable context.
+// A retry never changes the original key, parameters, or later user status.
+func (token *Token) InsertPendingBillingToken() error {
+	if token.BillingContextRef == nil || *token.BillingContextRef == "" || len(token.CreationRequestSHA) != 64 {
+		return ErrBillingContextConflict
+	}
+	var previous Token
+	read := func() error {
+		err := DB.Unscoped().Where("billing_context_ref = ?", *token.BillingContextRef).First(&previous).Error
+		if err == nil {
+			if previous.UserId != token.UserId || previous.CreationRequestSHA != token.CreationRequestSHA || previous.ManagedBindingRef != token.ManagedBindingRef {
+				return ErrBillingContextConflict
+			}
+			if previous.DeletedAt.Valid {
+				return ErrBillingContextRetired
+			}
+			*token = previous
+		}
+		return err
+	}
+	err := read()
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	token.Status, token.BillingContextConfirmed = common.TokenStatusDisabled, false
+	if err = DB.Create(token).Error; err != nil {
+		if recovered := read(); !errors.Is(recovered, gorm.ErrRecordNotFound) {
+			return recovered
+		}
+	}
+	return err
+}
+
+func (token *Token) ConfirmBillingContext() (err error) {
+	var attempted int64
+	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx).Where("id = ? AND user_id = ?", token.Id, token.UserId).First(&current).Error; err != nil {
+			return err
+		}
+		if current.BillingContextRef == nil || token.BillingContextRef == nil || *current.BillingContextRef != *token.BillingContextRef || current.CreationRequestSHA != token.CreationRequestSHA {
+			return ErrBillingContextConflict
+		}
+		if !current.BillingContextConfirmed {
+			next := max(current.MetadataRevision, 1) + 1
+			attempted, token.Key = next, current.Key
+			if err := setTokenMetadataFence(current.Key, next); err != nil {
+				return err
+			}
+			if err := tx.Model(&current).Updates(map[string]any{"billing_context_confirmed": true, "status": common.TokenStatusEnabled,
+				"metadata_revision": next}).Error; err != nil {
+				return err
+			}
+			current.BillingContextConfirmed, current.Status = true, common.TokenStatusEnabled
+			current.MetadataRevision = next
+		}
+		*token = current
+		return nil
+	})
+	if err == nil {
+		err = publishCommittedTokenMetadata(token.Key, token.MetadataRevision)
+	}
+	return err
+}
+
 var ErrTokenQuotaRevisionConflict = errors.New("token quota revision conflict")
 var ErrTokenQuotaUpdateUnknown = errors.New("token quota update outcome is unknown")
 
@@ -333,6 +446,8 @@ type TokenQuotaAdjustment struct {
 // Update never writes a loaded balance. Explicit quota increments are bound to
 // a management revision, so a lost response cannot turn a retry into more quota.
 func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
+	var attempted int64
+	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
 	if len(adjustments) > 1 {
 		return errors.New("invalid quota adjustment")
 	}
@@ -359,11 +474,11 @@ func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
 		cacheAdjusted = false
 	}
 	err = DB.Transaction(func(tx *gorm.DB) (writeErr error) {
+		var current Token
+		if writeErr = lockForUpdate(tx).First(&current, token.Id).Error; writeErr != nil {
+			return writeErr
+		}
 		if delta != 0 {
-			var current Token
-			if writeErr = lockForUpdate(tx).First(&current, token.Id).Error; writeErr != nil {
-				return writeErr
-			}
 			if current.QuotaRevision != adjustment.ExpectedRevision {
 				return ErrTokenQuotaRevisionConflict
 			}
@@ -398,14 +513,16 @@ func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
 				writeErr = err
 			}
 		}()
-		if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
+		next := max(current.MetadataRevision, 1) + 1
+		attempted, token.Key = next, current.Key
+		if cacheErr := setTokenMetadataFence(current.Key, next); cacheErr != nil {
 			return cacheErr
 		}
 		changes := map[string]any{"name": token.Name, "expired_time": token.ExpiredTime,
 			"unlimited_quota": token.UnlimitedQuota, "model_limits_enabled": token.ModelLimitsEnabled,
 			"model_limits": token.ModelLimits, "allow_ips": token.AllowIps, "group": token.Group,
 			"cross_group_retry": token.CrossGroupRetry, "auto_groups": token.AutoGroups,
-			"allow_user_quota_query": token.AllowUserQuotaQuery}
+			"allow_user_quota_query": token.AllowUserQuotaQuery, "metadata_revision": next}
 		query := tx.Model(token)
 		if delta != 0 {
 			changes["remain_quota"] = gorm.Expr("remain_quota + ?", delta)
@@ -421,6 +538,7 @@ func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
 			return errors.New("token quota adjustment unavailable or insufficient")
 		}
 		bodyCompleted = true
+		token.MetadataRevision = next
 		return nil
 	})
 	if err != nil && delta != 0 && bodyCompleted {
@@ -453,22 +571,76 @@ func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
 			return errors.Join(ErrTokenQuotaUpdateUnknown, cacheErr)
 		}
 	}
+	if err == nil {
+		err = publishCommittedTokenMetadata(token.Key, token.MetadataRevision)
+	}
 	return err
 }
 
 func (token *Token) SelectUpdate() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		return cacheErr
+	if token.Status == common.TokenStatusEnabled && token.BillingContextRef != nil && !token.BillingContextConfirmed {
+		return ErrBillingContextConflict
 	}
-	// This can update zero values
-	return DB.Model(token).Select("status").Updates(token).Error
+	return token.mutateMetadata(map[string]any{"status": token.Status}, false)
 }
 
 func (token *Token) Delete() (err error) {
-	if cacheErr := invalidateTokenCacheForMutation(token.Key); cacheErr != nil {
-		return cacheErr
+	return token.mutateMetadata(nil, true)
+}
+
+// mutateMetadata serializes control-plane mutations, not inference requests.
+func (token *Token) mutateMetadata(fields map[string]any, deleting bool) (err error) {
+	var attempted int64
+	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
+	err = DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx).First(&current, token.Id).Error; err != nil {
+			return err
+		}
+		next := max(current.MetadataRevision, 1) + 1
+		attempted, token.Key = next, current.Key
+		if err := setTokenMetadataFence(current.Key, next); err != nil {
+			return err
+		}
+		if fields == nil {
+			fields = map[string]any{}
+		}
+		fields["metadata_revision"] = next
+		if err := tx.Model(&current).Updates(fields).Error; err != nil {
+			return err
+		}
+		if deleting {
+			if err := tx.Delete(&current).Error; err != nil {
+				return err
+			}
+		}
+		token.Key, token.MetadataRevision = current.Key, next
+		return nil
+	})
+	if err == nil {
+		err = publishCommittedTokenMetadata(token.Key, token.MetadataRevision)
 	}
-	return DB.Delete(token).Error
+	return err
+}
+
+// A locked control-plane read distinguishes rollback from committed state.
+// It never clears a concurrently newer mutation's fence or changes Key status.
+func (token *Token) resolveMetadataOutcome(operationErr *error, attempted int64) {
+	if *operationErr == nil || attempted <= 0 || !common.RedisEnabled {
+		return
+	}
+	if err := DB.Transaction(func(tx *gorm.DB) error {
+		var current Token
+		if err := lockForUpdate(tx.Unscoped()).First(&current, token.Id).Error; err != nil {
+			return err
+		}
+		if current.Key != token.Key {
+			return ErrBillingContextConflict
+		}
+		return resolveTokenMetadataFence(current.Key, max(current.MetadataRevision, 1), attempted)
+	}); err != nil {
+		*operationErr = errors.Join(*operationErr, ErrTokenMetadataStale)
+	}
 }
 
 func (token *Token) IsModelLimitsEnabled() bool {
@@ -582,7 +754,7 @@ func CountUserTokens(userId int, externalOnly ...bool) (int64, error) {
 }
 
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
-func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (int, error) {
+func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, operationErr error) {
 	if len(ids) == 0 {
 		return 0, common.NewMessage("Token IDs cannot be empty")
 	}
@@ -590,13 +762,25 @@ func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (int, error)
 	tx := DB.Begin()
 
 	var tokens []Token
-	if err := visibleTokenQuery(tx, externalOnly).Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
+	defer func() {
+		for i := range tokens {
+			tokens[i].resolveMetadataOutcome(&operationErr, tokens[i].MetadataRevision)
+		}
+	}()
+	if err := lockForUpdate(visibleTokenQuery(tx, externalOnly)).Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
-	if err := invalidateTokensCache(tokens); err != nil {
-		tx.Rollback()
-		return 0, err
+	for i := range tokens {
+		tokens[i].MetadataRevision = max(tokens[i].MetadataRevision, 1) + 1
+		if err := setTokenMetadataFence(tokens[i].Key, tokens[i].MetadataRevision); err != nil {
+			tx.Rollback()
+			return 0, err
+		}
+		if err := tx.Model(&tokens[i]).Update("metadata_revision", tokens[i].MetadataRevision).Error; err != nil {
+			tx.Rollback()
+			return 0, err
+		}
 	}
 
 	if err := visibleTokenQuery(tx, externalOnly).Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
@@ -607,13 +791,18 @@ func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (int, error)
 	if err := tx.Commit().Error; err != nil {
 		return 0, err
 	}
+	for _, token := range tokens {
+		if err := publishCommittedTokenMetadata(token.Key, token.MetadataRevision); err != nil {
+			return len(tokens), err
+		}
+	}
 
 	return len(tokens), nil
 }
 
 func GetTokenKeysByIds(ids []int, userId int, externalOnly ...bool) ([]Token, error) {
 	var tokens []Token
-	err := visibleTokenQuery(DB, externalOnly).Select("id", commonKeyCol).
+	err := visibleTokenQuery(DB, externalOnly).Where("billing_context_ref IS NULL OR billing_context_confirmed = ?", true).Select("id", commonKeyCol).
 		Where("user_id = ? AND id IN (?)", userId, ids).
 		Find(&tokens).Error
 	return tokens, err

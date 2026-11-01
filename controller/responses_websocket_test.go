@@ -187,6 +187,7 @@ func TestResponsesWSRequestRunnerRefreshesBillingContextAndCleansBody(t *testing
 }
 
 func TestResponsesWSRequestRunnerRejectsRevokedCredentials(t *testing.T) {
+	require.NoError(t, i18n.Init())
 	for _, tc := range []struct {
 		name   string
 		status int
@@ -648,7 +649,7 @@ func TestResponsesWebSocketReusesConnectionAndSettlesEachRequest(t *testing.T) {
 	assert.Equal(t, 3000, user.UsedQuota)
 }
 
-func TestManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
+func TestLocalManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
 	require.NoError(t, i18n.Init())
 	var calls atomic.Int32
 	fixture := newResponsesWSBillingTest(t, `tier("input", p * 2)`, func(ws *websocket.Conn, _ *http.Request) {
@@ -667,35 +668,32 @@ func TestManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":10,"total_tokens":1010}}`)
 	}
-	var deny atomic.Bool
+	var portalCalls atomic.Int32
 	ref, playgroundRef := "11111111-1111-4111-8111-111111111111", "22222222-2222-4222-8222-222222222222"
-	keyFile := filepath.Join(t.TempDir(), "admission")
-	key := strings.Repeat("a", 48)
-	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
-	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if deny.Load() {
-			w.WriteHeader(http.StatusForbidden)
-			return
-		}
-		assert.Equal(t, "Bearer "+key, r.Header.Get("Authorization"))
-		var body map[string]any
-		require.NoError(t, common.DecodeJson(r.Body, &body))
-		body["billing_context_ref"], body["product_model"] = ref, body["model"]
-		if body["kind"] == "playground" {
-			assert.Equal(t, float64(0), body["native_token_id"])
-			body["billing_context_ref"] = playgroundRef
-		}
-		data, err := common.Marshal(body)
-		require.NoError(t, err)
-		_, _ = w.Write(data)
+	admission := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		portalCalls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	defer admission.Close()
-	t.Setenv("MODEL_BILLING_ADMISSION_URL", admission.URL)
-	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", keyFile)
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", admission.URL)
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", "/no-request-credential-required")
 	t.Setenv("MODEL_BILLING_INSTANCE_REF", "native-fixture")
+	accountRef := "personal:33333333-3333-4333-8333-333333333333"
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}))
+	require.NoError(t, model.ClaimExternalIdentityWithTx(model.DB, "managed-account", accountRef, fixture.user.Id))
+	require.NoError(t, model.DB.Model(fixture.token).Updates(map[string]any{"billing_context_ref": ref, "billing_context_confirmed": true}).Error)
+	require.NoError(t, model.InvalidateUserTokensCache(fixture.user.Id))
+	require.NoError(t, model.BindPlaygroundBillingContext(fixture.user.Id, playgroundRef))
+	projection := model.ManagedExecutionUpdate{UserID: fixture.user.Id, AccountRef: accountRef,
+		ExpectedRevision: 0, Revision: 1, ValidUntil: time.Now().Add(time.Hour).Unix(), PolicyEpoch: "7"}
+	_, err := model.UpdateManagedExecution(projection)
+	require.NoError(t, err)
+	started := time.Now().Unix()
 	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"first"}`)))
 	assert.Equal(t, "response.completed", readResponsesWSTestEvent(t, fixture.client)["type"])
-	deny.Store(true)
+	projection.ExpectedRevision, projection.Revision, projection.ValidUntil = 1, 2, 0
+	_, err = model.UpdateManagedExecution(projection)
+	require.NoError(t, err)
 	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"revoked"}`)))
 	rejected := readResponsesWSTestEvent(t, fixture.client)
 	assert.Equal(t, "error", rejected["type"])
@@ -722,7 +720,9 @@ func TestManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
 		return response.StatusCode
 	}
 	assert.Equal(t, 403, post("/v1/responses", `{"model":"ws-billing","input":"blocked"}`, "sk-"+fixture.token.Key))
-	deny.Store(false)
+	projection.ExpectedRevision, projection.Revision, projection.ValidUntil, projection.PolicyEpoch = 2, 3, time.Now().Add(time.Hour).Unix(), "8"
+	_, err = model.UpdateManagedExecution(projection)
+	require.NoError(t, err)
 	fixture.channel.SetSetting(dto.ChannelSettings{PassThroughBodyEnabled: true, ResponsesWebSocketEnabled: true})
 	require.NoError(t, model.DB.Model(fixture.channel).Update("setting", fixture.channel.Setting).Error)
 	assert.Equal(t, 400, post("/v1/responses", `{"model":"ws-billing","input":"async","background":true}`, "sk-"+fixture.token.Key))
@@ -748,6 +748,27 @@ func TestManagedAdmissionProtectsRealRelayWebSocketAndPlayground(t *testing.T) {
 	assert.Equal(t, "ws-billing", logs[0].BillingProduct)
 	assert.Equal(t, 0, logs[1].TokenId)
 	assert.Equal(t, int32(2), calls.Load())
+	for index, entry := range logs {
+		assert.Equal(t, []string{"7", "8"}[index], entry.BillingPolicyEpoch)
+		assert.GreaterOrEqual(t, entry.RequestStartedAt, started)
+		assert.LessOrEqual(t, entry.RequestStartedAt, entry.CreatedAt)
+		stat, err := model.SumUsedQuota(model.LogTypeConsume, started, entry.CreatedAt, "ws-billing", "", "", 0, "",
+			model.LogFilter{UserID: &entry.UserId, TokenID: &entry.TokenId, BillingContextRef: &entry.BillingContextRef,
+				BillingPolicyEpoch: &entry.BillingPolicyEpoch, IncludeMetering: true})
+		require.NoError(t, err)
+		assert.EqualValues(t, 1, stat.RequestCount)
+		assert.Equal(t, entry.Quota, stat.Quota)
+		measured := entry.TokenMetering()
+		assert.Equal(t, measured.InputTokens, stat.InputTokens)
+		assert.Equal(t, measured.CacheReadTokens, stat.CacheReadTokens)
+		assert.Equal(t, measured.OutputTokens, stat.OutputTokens)
+	}
+	remaining, err := model.GetUserQuota(fixture.user.Id, false)
+	require.NoError(t, err)
+	require.NoError(t, model.DecreaseUserQuota(fixture.user.Id, remaining, true))
+	assert.Equal(t, http.StatusForbidden, post("/pg/chat/completions", `{"model":"ws-billing","messages":[{"role":"user","content":"unfunded"}]}`, bundle.AccessToken))
+	assert.Equal(t, int32(2), calls.Load(), "native quota still denies unfunded execution before the supplier")
+	assert.Zero(t, portalCalls.Load(), "the original Portal transport is unavailable throughout this request chain")
 }
 
 // Both transports must reach the same upstream target with the same

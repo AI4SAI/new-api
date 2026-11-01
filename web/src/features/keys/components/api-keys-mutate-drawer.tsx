@@ -104,6 +104,12 @@ type ApiKeyMutateDrawerProps = {
   currentRow?: ApiKey
 }
 
+type KeyCreation = {
+  values: ApiKeyFormValues
+  requests: Array<{ id: string; payload: Parameters<typeof createApiKey>[0] }>
+  next: number
+}
+
 export function ApiKeysMutateDrawer({
   open,
   onOpenChange,
@@ -113,6 +119,16 @@ export function ApiKeysMutateDrawer({
   const isUpdate = !!currentRow
   const currentRowId = currentRow?.id
   const { triggerRefresh, workspaceKey, scopeKey } = useApiKeys()
+  const creationStorageKey = `newapi:pending-key-creation:${scopeKey}`
+  const [creation, setCreation] = useState<KeyCreation | null>(() => {
+    const saved = sessionStorage.getItem(creationStorageKey)
+    return saved ? JSON.parse(saved) : null
+  })
+  const persistCreation = (value: KeyCreation | null) => {
+    if (value) sessionStorage.setItem(creationStorageKey, JSON.stringify(value))
+    else sessionStorage.removeItem(creationStorageKey)
+    setCreation(value)
+  }
   const { status, loading: statusLoading } = useStatus()
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [needsReview, setNeedsReview] = useState<'unknown' | 'changed' | null>(
@@ -256,6 +272,7 @@ export function ApiKeysMutateDrawer({
     if (initializedTarget === target) return
     if (isUpdate && currentRow) {
       if (apiKeyData?.success && apiKeyData.data) {
+        setNeedsReview(null)
         setQuotaRevision(apiKeyData.data.quota_revision)
         form.reset(
           transformApiKeyToFormDefaults(
@@ -266,6 +283,15 @@ export function ApiKeysMutateDrawer({
         )
         setInitializedTarget(target)
       }
+    } else if (creation) {
+      form.reset({
+        ...creation.values,
+        expired_time: creation.values.expired_time
+          ? new Date(String(creation.values.expired_time))
+          : undefined,
+      })
+      setNeedsReview('unknown')
+      setInitializedTarget(target)
     } else {
       form.reset(
         getApiKeyFormDefaultValues(defaultUseAutoGroup && backendHasAuto)
@@ -291,6 +317,7 @@ export function ApiKeysMutateDrawer({
     maxAutoGroups,
     initializedTarget,
     readFailed,
+    creation,
   ])
 
   const formTarget =
@@ -317,7 +344,13 @@ export function ApiKeysMutateDrawer({
   }, [groups, form, selectedGroup])
 
   const onSubmit = async (data: ApiKeyFormValues) => {
-    if (readFailed || needsReview || isSubmitting) return
+    if (
+      readFailed ||
+      (needsReview && (isUpdate || !creation)) ||
+      isSubmitting
+    ) {
+      return
+    }
     setIsSubmitting(true)
     try {
       const basePayload = transformFormDataToPayload(data, isUpdate)
@@ -346,33 +379,42 @@ export function ApiKeysMutateDrawer({
           handleServerError(result, t(ERROR_MESSAGES.UPDATE_FAILED))
         }
       } else {
-        // Create mode - handle batch creation
-        const count = data.tokenCount || 1
-        let successCount = 0
-
-        for (let i = 0; i < count; i++) {
-          const result = await createApiKey(
-            {
+        const operation = creation ?? {
+          values: data,
+          next: 0,
+          requests: Array.from({ length: data.tokenCount || 1 }, (_, i) => ({
+            id: crypto.randomUUID(),
+            payload: {
               ...basePayload,
               name:
                 i === 0 && data.name
                   ? data.name
                   : `${data.name || 'default'}-${Math.random().toString(36).slice(2, 8)}`,
             },
-            workspaceKey
+          })),
+        }
+        persistCreation(operation)
+        for (const request of operation.requests.slice(operation.next)) {
+          const result = await createApiKey(
+            request.payload,
+            workspaceKey,
+            request.id
           )
           if (result.success) {
-            successCount++
+            operation.next += 1
+            persistCreation({ ...operation })
           } else {
+            setNeedsReview('unknown')
             handleServerError(result, t(ERROR_MESSAGES.CREATE_FAILED))
-            break
+            return
           }
         }
-
-        if (successCount > 0) {
+        persistCreation(null)
+        setNeedsReview(null)
+        if (operation.requests.length > 0) {
           toast.success(
             t('Successfully created {{count}} API Key(s)', {
-              count: successCount,
+              count: operation.requests.length,
             })
           )
           onOpenChange(false)
@@ -380,6 +422,16 @@ export function ApiKeysMutateDrawer({
         }
       }
     } catch (error) {
+      if (
+        !isUpdate &&
+        axios.isAxiosError(error) &&
+        [400, 403, 410].includes(error.response?.status ?? 0)
+      ) {
+        persistCreation(null)
+        setNeedsReview(null)
+        handleServerError(error, t(ERROR_MESSAGES.CREATE_FAILED))
+        return
+      }
       if (
         axios.isAxiosError(error) &&
         (!error.response ||
@@ -452,7 +504,13 @@ export function ApiKeysMutateDrawer({
             id='api-key-form'
             onSubmit={form.handleSubmit(onSubmit, onInvalid)}
             aria-busy={!isFormInitialized}
-            inert={!isFormInitialized || isSubmitting ? true : undefined}
+            inert={
+              !isFormInitialized ||
+              isSubmitting ||
+              (!isUpdate && Boolean(creation))
+                ? true
+                : undefined
+            }
             className={sideDrawerFormClassName('gap-5')}
           >
             <SideDrawerSection>
@@ -869,11 +927,16 @@ export function ApiKeysMutateDrawer({
                 type='button'
                 variant='outline'
                 onClick={() => {
+                  if (!isUpdate && creation) {
+                    void onSubmit(creation.values)
+                    return
+                  }
                   triggerRefresh()
                   onOpenChange(false)
                 }}
+                disabled={isSubmitting}
               >
-                {t('Review keys')}
+                {t(!isUpdate && creation ? 'Retry' : 'Review keys')}
               </Button>
             </div>
           )}
@@ -889,6 +952,7 @@ export function ApiKeysMutateDrawer({
               !isFormInitialized ||
               isSubmitting ||
               Boolean(needsReview) ||
+              (!isUpdate && Boolean(creation)) ||
               readFailed
             }
             className='w-full sm:w-auto'

@@ -17,11 +17,18 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 )
 
 const ManagedWorkspaceHeader = "X-SAI-Workspace-Key"
+
+var managedAccountClient = &http.Client{
+	Timeout:       5 * time.Second,
+	Transport:     &http.Transport{Proxy: nil, MaxIdleConns: 8, MaxIdleConnsPerHost: 8, IdleConnTimeout: 90 * time.Second},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 type ManagementRequest struct {
 	SchemaVersion int    `json:"schema_version"`
@@ -128,7 +135,7 @@ func managedAccountRPC(c *gin.Context, request any, resource string, limit int64
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+secret)
-	response, err := managedAdmissionClient.Do(httpRequest)
+	response, err := managedAccountClient.Do(httpRequest)
 	if err != nil {
 		return nil, errors.New("managed account authorization unavailable")
 	}
@@ -144,6 +151,42 @@ func managedAccountRPC(c *gin.Context, request any, resource string, limit int64
 		return nil, errors.New("invalid managed account authorization")
 	}
 	return raw, nil
+}
+
+// RegisterModelKey is a control-plane confirmation, never called by inference.
+func RegisterModelKey(c *gin.Context, token *model.Token) error {
+	if token.BillingContextRef == nil {
+		return ErrManagedAccountDenied
+	}
+	workspace, actor, session := "", c.GetInt("id"), c.GetString("session_id")
+	if account := ManagementAccount(c); account != nil {
+		workspace, actor, session = account.WorkspaceKey, account.ActorID, account.SessionID
+	}
+	if token.ManagedBindingRef != "" {
+		actor, session = 0, ""
+	}
+	raw, err := managedAccountRPC(c, map[string]any{
+		"schema_version": 1, "gateway_instance_ref": os.Getenv("MODEL_BILLING_INSTANCE_REF"),
+		"native_actor_id": actor, "session_id": session, "workspace_key": workspace,
+		"native_owner_id": token.UserId, "native_token_id": token.Id, "billing_context_ref": *token.BillingContextRef,
+		"managed_binding_ref": token.ManagedBindingRef, "native_group": token.Group,
+	}, "register-key", 4096)
+	if err != nil {
+		return err
+	}
+	var receipt struct {
+		SchemaVersion int    `json:"schema_version"`
+		Instance      string `json:"gateway_instance_ref"`
+		OwnerID       int    `json:"native_owner_id"`
+		TokenID       int    `json:"native_token_id"`
+		BindingRef    string `json:"billing_context_ref"`
+	}
+	if common.Unmarshal(raw, &receipt) != nil || receipt.SchemaVersion != 1 ||
+		receipt.Instance != os.Getenv("MODEL_BILLING_INSTANCE_REF") || receipt.OwnerID != token.UserId ||
+		receipt.TokenID != token.Id || receipt.BindingRef != *token.BillingContextRef {
+		return errors.New("key billing confirmation unavailable")
+	}
+	return nil
 }
 
 type ManagedKeyReference struct {

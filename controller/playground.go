@@ -3,6 +3,10 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/i18n"
@@ -10,9 +14,46 @@ import (
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
+
+// PreparePlayground is an explicit control operation before entering the native
+// playground. Inference itself never creates a billing binding or calls Portal.
+func PreparePlayground(c *gin.Context) {
+	if c.GetBool("use_access_token") || c.GetHeader(service.ManagedWorkspaceHeader) != "" || c.GetInt("id") <= 0 {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+	if !service.ManagedModelMode(c) {
+		common.ApiSuccess(c, gin.H{"ready": true})
+		return
+	}
+	owner := c.GetInt("id")
+	ref, err := model.GetPlaygroundBillingContext(owner)
+	if err == nil && ref == nil {
+		value := uuid.NewSHA1(uuid.NameSpaceOID, []byte(os.Getenv("MODEL_BILLING_INSTANCE_REF")+":"+strconv.Itoa(owner)+":playground")).String()
+		ref = &value
+	}
+	if err == nil {
+		err = service.RegisterModelKey(c, &model.Token{UserId: owner, BillingContextRef: ref})
+	}
+	if err == nil {
+		err = model.BindPlaygroundBillingContext(owner, *ref)
+	}
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
+	current, err := model.GetUserCache(owner)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
+	common.ApiSuccess(c, gin.H{"ready": current.ModelExecutionRevision > 0 && current.ModelExecutionUntil > time.Now().Unix()})
+}
 
 func Playground(c *gin.Context) {
 	var newAPIError *types.NewAPIError
@@ -51,6 +92,15 @@ func Playground(c *gin.Context) {
 		UserId: userId,
 		Name:   fmt.Sprintf("playground-%s", relayInfo.UsingGroup),
 		Group:  relayInfo.UsingGroup,
+	}
+	if service.ManagedModelMode(c) {
+		ref := c.GetString("playground_billing_context_ref")
+		if ref == "" {
+			newAPIError = types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.admission_unavailable")),
+				types.ErrorCodeQueryDataError, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
+			return
+		}
+		tempToken.BillingContextRef, tempToken.BillingContextConfirmed = &ref, true
 	}
 	_ = middleware.SetupContextForToken(c, tempToken)
 

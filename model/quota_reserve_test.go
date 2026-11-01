@@ -23,9 +23,17 @@ import (
 type quotaReplyLossHook struct {
 	scriptMatch string
 	fired       bool
+	before      bool
 }
 
-func (hook *quotaReplyLossHook) BeforeProcess(ctx context.Context, _ redis.Cmder) (context.Context, error) {
+func (hook *quotaReplyLossHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
+	if hook.before && !hook.fired && cmd.Name() == "eval" {
+		script, _ := cmd.Args()[1].(string)
+		if strings.Contains(script, hook.scriptMatch) {
+			hook.fired = true
+			return ctx, errors.New("injected Redis publication failure")
+		}
+	}
 	return ctx, nil
 }
 func (hook *quotaReplyLossHook) AfterProcess(_ context.Context, cmd redis.Cmder) error {
@@ -304,6 +312,54 @@ func TestTokenDisableFailsWhenCacheCannotBeInvalidated(t *testing.T) {
 	require.Equal(t, common.TokenStatusDisabled, getTokenFromDB(t, token.Id).Status)
 	_, err := ValidateUserToken(token.Key)
 	require.Error(t, err)
+}
+
+func TestTokenMetadataUnknownResultCannotRestoreEnabledCache(t *testing.T) {
+	for _, stage := range []string{"commit_response", "commit_unknown", "rollback", "cache_publication"} {
+		t.Run(stage, func(t *testing.T) {
+			truncateTables(t)
+			resetBatchUpdateTestState(t)
+			useTokenAdjustmentRedis(t)
+			token := createReserveTestToken(t, 100)
+			old := token
+			require.NoError(t, cacheSetTokenForTest(token))
+			original := DB
+			if stage != "cache_publication" {
+				faulted := DB.Session(&gorm.Session{NewDB: true, Context: context.Background()})
+				faulted.Statement.ConnPool = &quotaCommitFaultPool{ConnPool: original.Statement.ConnPool,
+					commitApplied: stage != "rollback", readbackFails: stage == "commit_unknown"}
+				DB = faulted
+			} else {
+				common.RDB.AddHook(&quotaReplyLossHook{scriptMatch: "local revision = tonumber", before: true})
+			}
+			token.Status = common.TokenStatusDisabled
+			err := token.SelectUpdate()
+			DB = original
+			require.Error(t, err)
+			if stage == "rollback" {
+				_, err = ValidateUserToken(token.Key)
+				require.NoError(t, err, "a confirmed rollback must recover without manual cache repair")
+				return
+			}
+			require.Equal(t, common.TokenStatusDisabled, getTokenFromDB(t, token.Id).Status)
+			// Account invalidation must not replace an unresolved version fence.
+			if stage == "commit_unknown" {
+				require.NoError(t, invalidateTokenCacheForMutation(token.Key))
+				require.Equal(t, time.Duration(-1), common.RDB.TTL(context.Background(), getTokenCacheFenceKey(token.Key)).Val())
+			}
+			_, err = cacheInitToken(old)
+			require.ErrorIs(t, err, ErrTokenMetadataStale)
+			_, err = ValidateUserToken(token.Key)
+			require.ErrorIs(t, err, ErrTokenInvalid)
+			require.NoError(t, token.SelectUpdate(), "retry must recover the committed disable")
+			// A delayed resolver from the first mutation cannot remove a newer fence.
+			require.NoError(t, setTokenMetadataFence(token.Key, token.MetadataRevision+1))
+			operationErr := errors.New("old result")
+			token.resolveMetadataOutcome(&operationErr, old.MetadataRevision+1)
+			_, err = cacheInitToken(token)
+			require.ErrorIs(t, err, ErrTokenMetadataStale)
+		})
+	}
 }
 
 func createReserveTestUser(t *testing.T, quota int) User {

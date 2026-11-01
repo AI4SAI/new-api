@@ -56,7 +56,7 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		if err != nil {
 			return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())
 		}
-		if c.GetString("model_billing_context_ref") != "" {
+		if service.ManagedModelMode(c) {
 			reader, err := storage.NewReader()
 			if err != nil {
 				return nil, nil, nil, types.NewError(err, types.ErrorCodeReadRequestBodyFailed, types.ErrOptionWithSkipRetry())

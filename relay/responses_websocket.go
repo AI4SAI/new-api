@@ -273,7 +273,6 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		return apiErr
 	}
 	common.SetContextKey(c, appconstant.ContextKeyOriginalModel, modelName)
-	common.SetContextKey(c, appconstant.ContextKeyRequestStartTime, time.Now())
 	service.GetChannelConstraints(c).AddFilter(appdto.ChannelFilter{Kind: appdto.FilterRequestPath, RequestPath: c.Request.URL.Path})
 
 	if s.lockedChannelID != 0 {

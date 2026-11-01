@@ -2,6 +2,7 @@ package model
 
 import (
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
@@ -10,16 +11,19 @@ import (
 
 func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	useUserCacheMiniRedis(t)
+	ref := "22222222-2222-4222-8222-222222222222"
 	token := Token{
-		Id:                  42,
-		UserId:              7,
-		Key:                 "token-auto-groups-cache-key",
-		Name:                "auto-cache",
-		Group:               "auto",
-		AutoGroups:          `["vip","default"]`,
-		ManagedBindingRef:   "11111111-1111-4111-8111-111111111111",
-		ManagementCreatorID: 7,
-		QuotaRevision:       2,
+		Id:                      42,
+		UserId:                  7,
+		Key:                     "token-auto-groups-cache-key",
+		Name:                    "auto-cache",
+		Group:                   "auto",
+		AutoGroups:              `["vip","default"]`,
+		ManagedBindingRef:       "11111111-1111-4111-8111-111111111111",
+		ManagementCreatorID:     7,
+		QuotaRevision:           2,
+		BillingContextRef:       &ref,
+		BillingContextConfirmed: true,
 	}
 
 	require.NoError(t, cacheSetTokenForTest(token))
@@ -29,6 +33,8 @@ func TestTokenAutoGroupsRoundTripThroughRedisHashCache(t *testing.T) {
 	assert.Equal(t, token.ManagedBindingRef, cached.ManagedBindingRef)
 	assert.Equal(t, token.ManagementCreatorID, cached.ManagementCreatorID)
 	assert.Equal(t, token.QuotaRevision, cached.QuotaRevision)
+	require.Equal(t, token.BillingContextRef, cached.BillingContextRef)
+	assert.True(t, cached.BillingContextConfirmed)
 	groups, err := cached.GetAutoGroups()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"vip", "default"}, groups)
@@ -49,7 +55,7 @@ func TestTokenAllowUserQuotaQueryRoundTripsThroughRedisHashCache(t *testing.T) {
 
 func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	truncateTables(t)
-	useUserCacheMiniRedis(t)
+	server := useUserCacheMiniRedis(t)
 	token := Token{
 		UserId:          7,
 		Key:             "token-auto-groups-update-cache-key",
@@ -77,6 +83,16 @@ func TestTokenUpdateSynchronouslyNarrowsPreheatedAutoGroupsCache(t *testing.T) {
 	reloaded, err := GetTokenByKey(token.Key, false)
 	require.NoError(t, err)
 	assert.JSONEq(t, `["vip"]`, reloaded.AutoGroups)
+	require.NoError(t, cacheSetTokenForTest(*reloaded))
+	old := *reloaded
+	reloaded.Status = common.TokenStatusDisabled
+	require.NoError(t, reloaded.SelectUpdate())
+	server.FastForward(5 * time.Minute)
+	_, err = cacheInitToken(old)
+	require.ErrorIs(t, err, ErrTokenMetadataStale)
+	_, err = ValidateUserToken(token.Key)
+	require.ErrorIs(t, err, ErrTokenInvalid)
+
 }
 
 // cacheSetTokenForTest 以测试身份写入完整 token 缓存（含额度字段），

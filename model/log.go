@@ -1,8 +1,10 @@
 package model
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -57,30 +59,35 @@ func sanitizeClickHouseLikePattern(input string) (string, error) {
 }
 
 type Log struct {
-	Id                int               `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2"`
-	UserId            int               `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1"`
-	CreatedAt         int64             `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type"`
-	Type              int               `json:"type" gorm:"index:idx_created_at_type"`
-	Content           string            `json:"content"`
-	Username          string            `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
-	TokenName         string            `json:"token_name" gorm:"index;default:''"`
-	ModelName         string            `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
-	Quota             int               `json:"quota" gorm:"default:0"`
-	PromptTokens      int               `json:"prompt_tokens" gorm:"default:0"`
-	CompletionTokens  int               `json:"completion_tokens" gorm:"default:0"`
-	UseTime           int               `json:"use_time" gorm:"default:0"`
-	IsStream          bool              `json:"is_stream"`
-	ChannelId         int               `json:"channel" gorm:"index"`
-	ChannelName       string            `json:"channel_name" gorm:"->"`
-	TokenId           int               `json:"token_id" gorm:"default:0;index"`
-	BillingContextRef string            `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index"`
-	BillingProduct    string            `json:"billing_product,omitempty" gorm:"type:varchar(256)"`
-	Group             string            `json:"group" gorm:"index"`
-	Ip                string            `json:"ip" gorm:"index;default:''"`
-	RequestId         string            `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
-	UpstreamRequestId string            `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
-	Other             string            `json:"other"`
-	Metering          *LogTokenMetering `json:"metering,omitempty" gorm:"-"`
+	Id                     int               `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2;index:idx_model_usage_completion,priority:3"`
+	UserId                 int               `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1;index:idx_model_usage_period,priority:1;index:idx_model_usage_completion,priority:1;index:idx_model_usage_observed,priority:1"`
+	CreatedAt              int64             `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type;index:idx_model_usage_observed,priority:3"`
+	Type                   int               `json:"type" gorm:"index:idx_created_at_type"`
+	Content                string            `json:"content"`
+	Username               string            `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
+	TokenName              string            `json:"token_name" gorm:"index;default:''"`
+	ModelName              string            `json:"model_name" gorm:"index;index:index_username_model_name,priority:1;default:''"`
+	Quota                  int               `json:"quota" gorm:"default:0"`
+	PromptTokens           int               `json:"prompt_tokens" gorm:"default:0"`
+	CompletionTokens       int               `json:"completion_tokens" gorm:"default:0"`
+	UseTime                int               `json:"use_time" gorm:"default:0"`
+	IsStream               bool              `json:"is_stream"`
+	ChannelId              int               `json:"channel" gorm:"index"`
+	ChannelName            string            `json:"channel_name" gorm:"->"`
+	TokenId                int               `json:"token_id" gorm:"default:0;index"`
+	BillingContextRef      string            `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index;index:idx_model_usage_period,priority:2;index:idx_model_usage_completion,priority:2;index:idx_model_usage_observed,priority:2"`
+	BillingPolicyEpoch     string            `json:"policy_epoch,omitempty" gorm:"type:varchar(20);not null;default:'';index:idx_model_usage_period,priority:3"`
+	RequestStartedAt       int64             `json:"request_started_at,omitempty" gorm:"not null;default:0;index:idx_model_usage_period,priority:4"`
+	BillingProduct         string            `json:"billing_product,omitempty" gorm:"type:varchar(256)"`
+	Group                  string            `json:"group" gorm:"index"`
+	Ip                     string            `json:"ip" gorm:"index;default:''"`
+	RequestId              string            `json:"request_id,omitempty" gorm:"type:varchar(64);index:idx_logs_request_id;default:''"`
+	UpstreamRequestId      string            `json:"upstream_request_id,omitempty" gorm:"type:varchar(128);index:idx_logs_upstream_request_id;default:''"`
+	Other                  string            `json:"other"`
+	Metering               *LogTokenMetering `json:"metering,omitempty" gorm:"-"`
+	MeteredInputTokens     *int64            `json:"-"`
+	MeteredCacheReadTokens *int64            `json:"-"`
+	MeteredOutputTokens    *int64            `json:"-"`
 }
 
 // don't use iota, avoid change log type value
@@ -103,6 +110,11 @@ func ensureLogRequestId(log *Log) {
 
 func createLog(log *Log) error {
 	ensureLogRequestId(log)
+	if log.Type == LogTypeConsume {
+		metering := log.TokenMetering()
+		log.MeteredInputTokens, log.MeteredCacheReadTokens, log.MeteredOutputTokens =
+			metering.InputTokens, metering.CacheReadTokens, metering.OutputTokens
+	}
 	return LOG_DB.Create(log).Error
 }
 
@@ -392,23 +404,25 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		}
 	}
 	log := &Log{
-		UserId:            userId,
-		Username:          username,
-		CreatedAt:         createdAt,
-		Type:              LogTypeConsume,
-		Content:           content,
-		PromptTokens:      params.PromptTokens,
-		CompletionTokens:  params.CompletionTokens,
-		TokenName:         params.TokenName,
-		ModelName:         params.ModelName,
-		Quota:             params.Quota,
-		ChannelId:         params.ChannelId,
-		TokenId:           params.TokenId,
-		BillingContextRef: c.GetString("model_billing_context_ref"),
-		BillingProduct:    c.GetString("model_billing_product"),
-		UseTime:           params.UseTimeSeconds,
-		IsStream:          params.IsStream,
-		Group:             params.Group,
+		UserId:             userId,
+		Username:           username,
+		CreatedAt:          createdAt,
+		Type:               LogTypeConsume,
+		Content:            content,
+		PromptTokens:       params.PromptTokens,
+		CompletionTokens:   params.CompletionTokens,
+		TokenName:          params.TokenName,
+		ModelName:          params.ModelName,
+		Quota:              params.Quota,
+		ChannelId:          params.ChannelId,
+		TokenId:            params.TokenId,
+		BillingContextRef:  c.GetString("model_billing_context_ref"),
+		BillingPolicyEpoch: c.GetString("model_billing_policy_epoch"),
+		RequestStartedAt:   c.GetInt64("model_billing_request_started_at"),
+		BillingProduct:     c.GetString("model_billing_product"),
+		UseTime:            params.UseTimeSeconds,
+		IsStream:           params.IsStream,
+		Group:              params.Group,
 		Ip: func() string {
 			if needRecordIp {
 				return c.ClientIP()
@@ -505,23 +519,24 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 // LogFilter is the usage-log search shared by the log list and the log export.
 // Username and Channel are administrator filters.
 type LogFilter struct {
-	Type              int
-	StartTimestamp    int64
-	EndTimestamp      int64
-	ModelName         string
-	Username          string
-	TokenName         string
-	Channel           int
-	Group             string
-	RequestId         string
-	UpstreamRequestId string
-	UserID            *int
-	TokenID           *int
-	TokenVisibility   map[int]TokenLogVisibility
-	BillingContextRef *string
-	BillingProduct    string
-	IncludeMetering   bool
-	Context           context.Context
+	Type               int
+	StartTimestamp     int64
+	EndTimestamp       int64
+	ModelName          string
+	Username           string
+	TokenName          string
+	Channel            int
+	Group              string
+	RequestId          string
+	UpstreamRequestId  string
+	UserID             *int
+	TokenID            *int
+	TokenVisibility    map[int]TokenLogVisibility
+	BillingContextRef  *string
+	BillingPolicyEpoch *string
+	BillingProduct     string
+	IncludeMetering    bool
+	Context            context.Context
 }
 
 func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
@@ -541,6 +556,9 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	}
 	if f.BillingContextRef != nil {
 		tx = tx.Where("logs.billing_context_ref = ?", *f.BillingContextRef)
+	}
+	if f.BillingPolicyEpoch != nil {
+		tx = tx.Where("logs.billing_policy_epoch = ?", *f.BillingPolicyEpoch)
 	}
 	if f.BillingProduct != "" {
 		tx = tx.Where("(logs.billing_product = ? OR ((logs.billing_product IS NULL OR logs.billing_product = '') AND logs.model_name = ?))", f.BillingProduct, f.BillingProduct)
@@ -575,11 +593,15 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	if f.UpstreamRequestId != "" {
 		tx = tx.Where("logs.upstream_request_id = ?", f.UpstreamRequestId)
 	}
+	timeColumn := "logs.created_at"
+	if f.BillingPolicyEpoch != nil && *f.BillingPolicyEpoch != "" {
+		timeColumn = "logs.request_started_at"
+	}
 	if f.StartTimestamp != 0 {
-		tx = tx.Where("logs.created_at >= ?", f.StartTimestamp)
+		tx = tx.Where(timeColumn+" >= ?", f.StartTimestamp)
 	}
 	if f.EndTimestamp != 0 {
-		tx = tx.Where("logs.created_at <= ?", f.EndTimestamp)
+		tx = tx.Where(timeColumn+" <= ?", f.EndTimestamp)
 	}
 	if f.Channel != 0 {
 		tx = tx.Where("logs.channel_id = ?", f.Channel)
@@ -746,15 +768,87 @@ func streamLogs(tx *gorm.DB, order string, fn func(*Log) error) error {
 	return rows.Err()
 }
 
+type ModelUsageActivity struct {
+	PolicyEpoch   string `json:"policy_epoch"`
+	Model         string `json:"model"`
+	FromTimestamp int64  `json:"from_timestamp"`
+	ToTimestamp   int64  `json:"to_timestamp"`
+}
+
+// CompletedModelUsage discovers affected billing periods without copying raw
+// requests or their financial amounts to the control plane. Completion overlap
+// catches ordinary out-of-order commits; request start can be arbitrarily old.
+func CompletedModelUsage(ctx context.Context, userID, tokenID int, bindingRef string,
+	afterLogID, pageAfterLogID, completedSince int64, limit int) ([]ModelUsageActivity, int64, bool, error) {
+	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
+		return nil, 0, false, fmt.Errorf("model usage collection requires relational log identifiers")
+	}
+	query := LOG_DB.WithContext(ctx).Model(&Log{}).Where(
+		"user_id = ? AND token_id = ? AND billing_context_ref = ? AND type = ? AND billing_policy_epoch <> '' AND id > ?",
+		userID, tokenID, bindingRef, LogTypeConsume, pageAfterLogID)
+	if completedSince > 0 {
+		query = query.Where("(id > ? OR created_at >= ?)", afterLogID, completedSince)
+	} else {
+		query = query.Where("id > ?", afterLogID)
+	}
+	var logs []Log
+	if err := query.Select("id, billing_policy_epoch, billing_product, model_name, request_started_at").
+		Order("id").Limit(limit + 1).Find(&logs).Error; err != nil {
+		return nil, 0, false, err
+	}
+	more := len(logs) > limit
+	if more {
+		logs = logs[:limit]
+	}
+	type activityKey struct {
+		epoch, model string
+		hour         int64
+	}
+	groups := make(map[activityKey]ModelUsageActivity)
+	next := pageAfterLogID
+	for _, entry := range logs {
+		product := entry.BillingProduct
+		if product == "" {
+			product = entry.ModelName
+		}
+		key := activityKey{entry.BillingPolicyEpoch, product, entry.RequestStartedAt / 3600}
+		group, exists := groups[key]
+		if !exists {
+			group = ModelUsageActivity{entry.BillingPolicyEpoch, product, entry.RequestStartedAt, entry.RequestStartedAt}
+		} else {
+			group.FromTimestamp = min(group.FromTimestamp, entry.RequestStartedAt)
+			group.ToTimestamp = max(group.ToTimestamp, entry.RequestStartedAt)
+		}
+		groups[key] = group
+		next = int64(entry.Id)
+	}
+	result := make([]ModelUsageActivity, 0, len(groups))
+	for _, group := range groups {
+		result = append(result, group)
+	}
+	slices.SortFunc(result, func(a, b ModelUsageActivity) int {
+		if a.PolicyEpoch == b.PolicyEpoch {
+			if a.Model == b.Model {
+				return cmp.Compare(a.FromTimestamp, b.FromTimestamp)
+			}
+			return cmp.Compare(a.Model, b.Model)
+		}
+		return cmp.Compare(a.PolicyEpoch, b.PolicyEpoch)
+	})
+	return result, next, more, nil
+}
+
 type Stat struct {
-	Quota             int    `json:"quota"`
-	Rpm               int    `json:"rpm"`
-	Tpm               int    `json:"tpm"`
-	RequestCount      int64  `json:"request_count"`
-	InputTokens       *int64 `json:"input_tokens"`
-	CacheReadTokens   *int64 `json:"cache_read_tokens"`
-	OutputTokens      *int64 `json:"output_tokens"`
-	MeteringAvailable bool   `json:"metering_available" gorm:"-"`
+	Quota                int    `json:"quota"`
+	Rpm                  int    `json:"rpm"`
+	Tpm                  int    `json:"tpm"`
+	RequestCount         int64  `json:"request_count"`
+	RequestStartedAt     *int64 `json:"request_started_at"`
+	LastRequestStartedAt *int64 `json:"last_request_started_at"`
+	InputTokens          *int64 `json:"input_tokens"`
+	CacheReadTokens      *int64 `json:"cache_read_tokens"`
+	OutputTokens         *int64 `json:"output_tokens"`
+	MeteringAvailable    bool   `json:"metering_available" gorm:"-"`
 }
 
 // Metering uses the same source rows as the charge. Parse optional metadata in
@@ -798,6 +892,19 @@ func (stat *Stat) readMetering(query *gorm.DB) {
 
 func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, channel int, group string, nativeIdentity ...LogFilter) (stat Stat, err error) {
 	tx := LOG_DB.Table("logs").Select("COALESCE(sum(quota), 0) quota, COUNT(*) request_count")
+	timeColumn := "created_at"
+	if len(nativeIdentity) == 1 && nativeIdentity[0].BillingPolicyEpoch != nil && *nativeIdentity[0].BillingPolicyEpoch != "" {
+		timeColumn = "request_started_at"
+		fields := "COALESCE(sum(quota), 0) quota, COUNT(*) request_count, MIN(request_started_at) request_started_at, MAX(request_started_at) last_request_started_at"
+		if nativeIdentity[0].IncludeMetering {
+			for _, field := range []string{"input_tokens", "cache_read_tokens", "output_tokens"} {
+				column := "metered_" + field
+				fields += fmt.Sprintf(", CASE WHEN COUNT(%s) = COUNT(*) AND COALESCE(SUM(%s), 0) <= %d THEN COALESCE(SUM(%s), 0) ELSE NULL END %s",
+					column, column, common.MaxWalletQuota, column, field)
+			}
+		}
+		tx = tx.Select(fields)
+	}
 
 	// 为rpm和tpm创建单独的查询
 	rpmTpmQuery := LOG_DB.Table("logs").Select("count(*) rpm, COALESCE(sum(prompt_tokens), 0) + COALESCE(sum(completion_tokens), 0) tpm")
@@ -828,10 +935,10 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		rpmTpmQuery = rpmTpmQuery.Where("token_name = ?", tokenName)
 	}
 	if startTimestamp != 0 {
-		tx = tx.Where("created_at >= ?", startTimestamp)
+		tx = tx.Where(timeColumn+" >= ?", startTimestamp)
 	}
 	if endTimestamp != 0 {
-		tx = tx.Where("created_at <= ?", endTimestamp)
+		tx = tx.Where(timeColumn+" <= ?", endTimestamp)
 	}
 	if tx, err = applyExplicitLogTextFilter(tx, "model_name", modelName); err != nil {
 		return stat, err
@@ -860,7 +967,14 @@ func SumUsedQuota(logType int, startTimestamp int64, endTimestamp int64, modelNa
 		return stat, common.NewMessage("Failed to query statistics")
 	}
 	if len(nativeIdentity) == 1 && nativeIdentity[0].IncludeMetering {
-		stat.readMetering(tx)
+		if timeColumn == "request_started_at" {
+			stat.MeteringAvailable = true
+		} else {
+			stat.readMetering(tx)
+		}
+	}
+	if len(nativeIdentity) == 1 && nativeIdentity[0].BillingPolicyEpoch != nil {
+		return stat, nil // Financial collection does not need the console's last-minute rate.
 	}
 	var rateStat struct {
 		Rpm int

@@ -11,19 +11,23 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const userCacheSchemaVersion = 2
+const userCacheSchemaVersion = 3
 
 type UserBase struct {
-	Id          int    `json:"id"`
-	Group       string `json:"group"`
-	Email       string `json:"email"`
-	Quota       int    `json:"quota"`
-	Status      int    `json:"status"`
-	Role        int    `json:"role"`
-	Username    string `json:"username"`
-	Setting     string `json:"setting"`
-	AuthVersion int64  `json:"-"`
-	CacheSchema int    `json:"-"`
+	Id                          int    `json:"id"`
+	Group                       string `json:"group"`
+	Email                       string `json:"email"`
+	Quota                       int    `json:"quota"`
+	Status                      int    `json:"status"`
+	Role                        int    `json:"role"`
+	Username                    string `json:"username"`
+	Setting                     string `json:"setting"`
+	AuthVersion                 int64  `json:"-"`
+	CacheSchema                 int    `json:"-"`
+	ModelExecutionRevision      int64  `json:"model_execution_revision"`
+	ModelExecutionUntil         int64  `json:"model_execution_until"`
+	ModelPolicyEpoch            string `json:"model_policy_epoch"`
+	PlaygroundBillingContextRef string `json:"-"`
 }
 
 func (user *UserBase) WriteContext(c *gin.Context) {
@@ -33,6 +37,10 @@ func (user *UserBase) WriteContext(c *gin.Context) {
 	common.SetContextKey(c, constant.ContextKeyUserEmail, user.Email)
 	common.SetContextKey(c, constant.ContextKeyUserName, user.Username)
 	common.SetContextKey(c, constant.ContextKeyUserSetting, user.GetSetting())
+	c.Set("model_execution_revision", user.ModelExecutionRevision)
+	c.Set("model_execution_until", user.ModelExecutionUntil)
+	c.Set("model_policy_epoch", user.ModelPolicyEpoch)
+	c.Set("playground_billing_context_ref", user.PlaygroundBillingContextRef)
 }
 
 func (user *UserBase) GetSetting() dto.UserSetting {
@@ -100,13 +108,23 @@ func GetUserCache(userId int) (*UserBase, error) {
 		return nil, err
 	}
 	if common.RedisEnabled {
-		floor, floorErr := getUserAuthVersionFloor(userId)
+		floor, executionFloor, floorErr := getUserCacheVersionFloors(userId)
 		if floorErr == nil && floor > user.AuthVersion {
 			return nil, ErrUserAuthCachePending
+		}
+		if floorErr == nil && executionFloor > user.ModelExecutionRevision {
+			current := user.ToBaseUser()
+			current.ModelExecutionUntil = 0
+			return current, nil
 		}
 		if err := populateUserCache(*user); err != nil {
 			if errors.Is(err, ErrUserAuthCachePending) {
 				return nil, err
+			}
+			if errors.Is(err, ErrModelExecutionCachePending) {
+				current := user.ToBaseUser()
+				current.ModelExecutionUntil = 0
+				return current, nil
 			}
 			common.SysLog(common.LogText("failed to synchronously populate user cache: %s", err.Error()))
 		}
@@ -127,12 +145,17 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
-	floor, err := getUserAuthVersionFloor(userId)
+	floor, executionFloor, err := getUserCacheVersionFloors(userId)
 	if err != nil {
 		return nil, err
 	}
 	if floor > userCache.AuthVersion {
 		return nil, ErrUserAuthCachePending
+	}
+	if executionFloor > userCache.ModelExecutionRevision {
+		// Model authorization is independent from human login and management.
+		// Mask execution for this read without changing the cached facts/quota.
+		userCache.ModelExecutionUntil = 0
 	}
 	return &userCache, nil
 }

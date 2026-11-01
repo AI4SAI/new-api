@@ -598,6 +598,7 @@ func TestResponsesWSShutdownInterruptsBusyWriter(t *testing.T) {
 }
 
 func TestResponsesWSPassthroughPreservesRawPricingParameters(t *testing.T) {
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "configured-instance")
 	create, _, err := normalizeResponsesWSTestMessage([]byte(`{"type":"response.create","generate":false,"response":{"model":"gpt-5.1","input":"hi","vendor":{"tier":"premium"},"stream":true}}`))
 	require.NoError(t, err)
 	c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -613,6 +614,35 @@ func TestResponsesWSPassthroughPreservesRawPricingParameters(t *testing.T) {
 	storage, err := common.GetBodyStorage(c)
 	require.NoError(t, err)
 	require.NoError(t, storage.Close())
+}
+
+func TestManagedResponsesBodyBlocksBackgroundWithoutAdmissionReceipt(t *testing.T) {
+	require.NoError(t, i18n.Init())
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "configured-instance")
+	for _, passthrough := range []bool{false, true} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"gpt-5.1","input":"hi","background":true}`))
+		c.Request.Header.Set("Content-Type", "application/json")
+		common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-5.1")
+		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeOpenAI)
+		common.SetContextKey(c, constant.ContextKeyChannelSetting, dto.ChannelSettings{PassThroughBodyEnabled: passthrough})
+		if !passthrough {
+			common.SetContextKey(c, constant.ContextKeyChannelParamOverride, map[string]any{"background": true})
+		}
+		request := dto.OpenAIResponsesRequest{Model: "gpt-5.1", Input: common.RawMessage(`"hi"`)}
+		info := relaycommon.GenRelayInfoResponses(c, &request)
+		payload, denied := buildResponsesWSCreatePayload(c, info, request, nil, "")
+		require.NotNil(t, denied)
+		assert.Equal(t, http.StatusBadRequest, denied.StatusCode)
+		assert.True(t, types.IsSkipRetryError(denied))
+		assert.Nil(t, payload)
+		assert.Empty(t, c.GetString("model_billing_context_ref"))
+		if passthrough {
+			storage, err := common.GetBodyStorage(c)
+			require.NoError(t, err)
+			require.NoError(t, storage.Close())
+		}
+	}
 }
 
 func TestResponsesWSStreamIdentity(t *testing.T) {

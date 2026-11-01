@@ -9,8 +9,8 @@ See LICENSE for the full project license terms.
 ==== SAI modifications, 2026 ====
 
 This modified version adds longer managed account names, verified OpenID Connect
-login, idempotent account and budget provisioning, and external billing admission
-with immutable usage attribution. Upstream new-api and QuantumNous attribution
+login, idempotent account and quota provisioning, and local execution of managed
+account permissions with immutable usage attribution. Upstream new-api and QuantumNous attribution
 and license terms remain in force. These modifications do not imply upstream
 endorsement. Authentication form ordering and responsive layout are also
 corrected in this modified version. Direct Search consumption logs also retain
@@ -25,6 +25,10 @@ Application-managed key metadata and billing facts remain visible without
 revealing their credentials or private request content.
 Managed key lists also show current member names and authorized workspace
 attribution through bounded reads from the existing account authority.
+Managed model requests use local account and key state, with registration and
+funding updates performed through control APIs. Usage keeps the accepted policy
+and request start time for aggregate settlement. Key metadata changes reject
+stale cache fills, and interrupted key creation reuses its original request.
 
 ==== Additional Terms under AGPLv3 Section 7 ====
 

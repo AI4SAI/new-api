@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
@@ -31,9 +32,11 @@ import (
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/console_setting"
 	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/alicebob/miniredis/v2"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-redis/redis/v8"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
@@ -175,6 +178,19 @@ func TestManagedOIDCAccountPreservesIdentityAndFunds(t *testing.T) {
 	require.NoError(t, model.DB.Where("user_id = ?", user.Id).Find(&grants).Error)
 	require.Len(t, grants, 1)
 	assert.True(t, grants[0].Managed)
+	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var receipt map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &receipt))
+		require.Equal(t, "/v1/internal/models/register-key", r.URL.Path)
+		require.Equal(t, "33333333-3333-4333-8333-333333333333", receipt["billing_context_ref"])
+		data, err := common.Marshal(receipt)
+		require.NoError(t, err)
+		_, _ = w.Write(data)
+	}))
+	defer registration.Close()
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", registration.URL+"/v1/internal/models/authorize-management")
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", keyFile)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
 	modelKey := httptest.NewRequest("POST", "/api/token/", strings.NewReader(`{"name":"managed-model","unlimited_quota":true,"expired_time":-1,"managed_binding_ref":"33333333-3333-4333-8333-333333333333"}`))
 	modelKey.Header.Set("Authorization", "Bearer "+issued)
 	modelKey.Header.Set("New-Api-User", strconv.Itoa(user.Id))
@@ -268,6 +284,182 @@ func TestModelServiceConsolePreservesLoginAndLanguageButRejectsAccountChanges(t 
 	assert.Equal(t, false, calculateUserPermissions(common.RoleAdminUser)["model_service_only"])
 }
 
+func TestModelExecutionPendingKeepsHumanAuthenticationAndKeyReads(t *testing.T) {
+	user, identity := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Token{}))
+	require.NoError(t, model.DB.Model(user).Update("quota", 100).Error)
+	server := miniredis.RunT(t)
+	previousEnabled, previousRDB := common.RedisEnabled, common.RDB
+	common.RedisEnabled, common.RDB = true, redis.NewClient(&redis.Options{Addr: server.Addr()})
+	t.Cleanup(func() { _ = common.RDB.Close(); common.RedisEnabled, common.RDB = previousEnabled, previousRDB })
+	ref := "personal:11111111-1111-4111-8111-111111111111"
+	billing := "22222222-2222-4222-8222-222222222222"
+	require.NoError(t, model.ClaimExternalIdentityWithTx(model.DB, "managed-account", ref, user.Id))
+	token := model.Token{UserId: user.Id, Key: common.GetUUID(), Name: "pending-execution", Status: common.TokenStatusEnabled,
+		ExpiredTime: -1, RemainQuota: 100, BillingContextRef: &billing, BillingContextConfirmed: true}
+	require.NoError(t, model.DB.Create(&token).Error)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "pending-execution-fixture")
+	projection := model.ManagedExecutionUpdate{UserID: user.Id, AccountRef: ref, Revision: 1, ValidUntil: time.Now().Add(time.Hour).Unix(), PolicyEpoch: "7"}
+	_, err := model.UpdateManagedExecution(projection)
+	require.NoError(t, err)
+	require.NoError(t, model.DB.Callback().Update().Before("gorm:update").Register("test:projection_rollback", func(tx *gorm.DB) {
+		if fields, ok := tx.Statement.Dest.(map[string]any); ok && fields["model_execution_revision"] != nil {
+			tx.AddError(errors.New("injected projection rollback"))
+		}
+	}))
+	projection.ExpectedRevision, projection.Revision = 1, 2
+	_, err = model.UpdateManagedExecution(projection)
+	require.NoError(t, model.DB.Callback().Update().Remove("test:projection_rollback"))
+	require.ErrorContains(t, err, "injected projection rollback")
+	_, _, err = service.ValidateLoginSession(identity)
+	require.NoError(t, err)
+	bundle, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "pending-execution-test")
+	require.NoError(t, err, "new human login remains available during model projection recovery")
+	router := gin.New()
+	router.GET("/api/token/", middleware.UserAuth(), GetAllTokens)
+	router.POST("/v1/chat/completions", middleware.TokenAuth(), func(c *gin.Context) {
+		common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
+		if denied := service.AdmitManagedModel(c, "model", "request"); denied != nil {
+			c.Status(denied.StatusCode)
+			return
+		}
+		c.Status(http.StatusOK)
+	})
+	invoke := func(path, method, credential string) int {
+		request := httptest.NewRequest(method, path, nil)
+		request.Header.Set("Authorization", "Bearer "+credential)
+		request.Header.Set("New-Api-User", strconv.Itoa(user.Id))
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response.Code
+	}
+	assert.Equal(t, http.StatusOK, invoke("/api/token/", http.MethodGet, bundle.AccessToken))
+	assert.Equal(t, http.StatusForbidden, invoke("/v1/chat/completions", http.MethodPost, "sk-"+token.Key))
+	_, err = model.UpdateManagedExecution(projection)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, invoke("/v1/chat/completions", http.MethodPost, "sk-"+token.Key))
+	user.Status = common.UserStatusDisabled
+	require.NoError(t, user.Update(false))
+	assert.Equal(t, http.StatusUnauthorized, invoke("/api/token/", http.MethodGet, bundle.AccessToken))
+	assert.Equal(t, http.StatusForbidden, invoke("/v1/chat/completions", http.MethodPost, "sk-"+token.Key))
+}
+
+func TestManagedExecutionProjectionControlAndUpgrade(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}))
+	ref := "personal:11111111-1111-4111-8111-111111111111"
+	require.NoError(t, model.ClaimExternalIdentityWithTx(model.DB, "managed-account", ref, user.Id))
+	// Upgrade the previous schema twice while retaining balances and identity.
+	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 123, "used_quota": 7, "request_count": 2, "status": common.UserStatusDisabled}).Error)
+	for _, field := range []string{"ModelExecutionRevision", "ModelExecutionUntil", "ModelPolicyEpoch"} {
+		require.NoError(t, model.DB.Migrator().DropColumn(&model.User{}, field))
+	}
+	for range 2 {
+		require.NoError(t, model.DB.AutoMigrate(&model.User{}))
+	}
+	key := strings.Repeat("e", 48)
+	keyFile := t.TempDir() + "/provision-key"
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	t.Setenv("MANAGED_ACCOUNT_PROVISION_KEY_FILE", keyFile)
+	operator := model.User{Username: "execution-root", AffCode: "execution-root", Role: common.RoleRootUser,
+		Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, model.DB.Create(&operator).Error)
+	rootPAT, _ := createScopedAccessToken(t, operator.Id, 0, "user:write")
+	router := gin.New()
+	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
+	const endpoint = "/api/user/managed-execution"
+	router.GET(endpoint, middleware.AdminAuth(), middleware.DisableCache(), GetManagedExecution)
+	router.PUT(endpoint, middleware.AdminAuth(), middleware.DisableCache(), PutManagedExecution)
+	invoke := func(method, path string, body any, credential string, authorization ...string) *httptest.ResponseRecorder {
+		encoded, err := common.Marshal(body)
+		require.NoError(t, err)
+		request := httptest.NewRequest(method, path, bytes.NewReader(encoded))
+		request.Header.Set("X-Managed-Provisioning-Key", credential)
+		bearer := rootPAT
+		if len(authorization) > 0 {
+			bearer = authorization[0]
+		}
+		if bearer != "" {
+			request.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	query := fmt.Sprintf(endpoint+"?user_id=%d&account_ref=%s", user.Id, ref)
+	response := invoke(http.MethodGet, query, nil, key)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Contains(t, response.Body.String(), `"revision":0`)
+	assert.Contains(t, response.Body.String(), `"valid_until":0`)
+	req := model.ManagedExecutionUpdate{UserID: user.Id, AccountRef: ref, Revision: 1, ValidUntil: common.GetTimestamp() + 600, PolicyEpoch: "3"}
+	missingScope, _ := createScopedAccessToken(t, operator.Id, 0, "profile:read")
+	expired, _ := createScopedAccessToken(t, operator.Id, time.Now().Unix()-1, "user:write")
+	denied := []struct {
+		name, pat, provision string
+		status               int
+	}{
+		{"anonymous", "", key, http.StatusUnauthorized},
+		{"root missing scope", missingScope, key, http.StatusForbidden},
+		{"root expired PAT", expired, key, http.StatusUnauthorized},
+		{"root missing provisioning key", rootPAT, "", http.StatusForbidden},
+		{"root wrong provisioning key", rootPAT, "wrong", http.StatusForbidden},
+	}
+	for _, role := range []int{common.RoleCommonUser, common.RoleAdminUser} {
+		name := fmt.Sprintf("execution-role-%d", role)
+		actor := model.User{Username: name, AffCode: name, Role: role, Status: common.UserStatusEnabled, AuthVersion: 1}
+		require.NoError(t, model.DB.Create(&actor).Error)
+		pat, _ := createScopedAccessToken(t, actor.Id, 0, "user:write")
+		denied = append(denied, struct {
+			name, pat, provision string
+			status               int
+		}{name, pat, key, http.StatusForbidden})
+	}
+	for _, test := range denied {
+		assert.Equal(t, test.status, invoke(http.MethodGet, query, nil, test.provision, test.pat).Code, test.name+" GET")
+		assert.Equal(t, test.status, invoke(http.MethodPut, endpoint, req, test.provision, test.pat).Code, test.name+" PUT")
+	}
+	responses := make(chan *httptest.ResponseRecorder, 2)
+	for range 2 {
+		go func() { responses <- invoke(http.MethodPut, endpoint, req, key) }()
+	}
+	var exact string
+	for range 2 {
+		response = <-responses
+		require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+		if exact != "" {
+			assert.Equal(t, exact, response.Body.String())
+		}
+		exact = response.Body.String()
+	}
+	changed := req
+	changed.ValidUntil++
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPut, endpoint, changed, key).Code)
+	changed = req
+	changed.AccountRef = "personal:22222222-2222-4222-8222-222222222222"
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPut, endpoint, changed, key).Code)
+	changed = req
+	changed.PolicyEpoch = "03"
+	assert.Equal(t, http.StatusBadRequest, invoke(http.MethodPut, endpoint, changed, key).Code)
+	left, right := req, req
+	left.ExpectedRevision, left.Revision, left.ValidUntil = 1, 2, 0
+	right.ExpectedRevision, right.Revision, right.ValidUntil = 1, 3, 0
+	go func() { responses <- invoke(http.MethodPut, endpoint, left, key) }()
+	go func() { responses <- invoke(http.MethodPut, endpoint, right, key) }()
+	statuses := map[int]int{}
+	for range 2 {
+		statuses[(<-responses).Code]++
+	}
+	assert.Equal(t, map[int]int{http.StatusOK: 1, http.StatusConflict: 1}, statuses)
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPut, endpoint, req, key).Code)
+	require.NoError(t, model.DB.First(user, user.Id).Error)
+	assert.Equal(t, common.UserStatusDisabled, user.Status)
+	assert.Equal(t, 123, user.Quota)
+	assert.Equal(t, 7, user.UsedQuota)
+	assert.Equal(t, 2, user.RequestCount)
+	assert.EqualValues(t, 1, user.AuthVersion)
+	assert.Zero(t, user.ModelExecutionUntil)
+}
+
 func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {
 	user, _ := setupSecurityEnrollmentTest(t)
 	confirmPaymentComplianceForTest(t)
@@ -336,6 +528,109 @@ func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {
 	var current model.User
 	require.NoError(t, model.DB.First(&current, user.Id).Error)
 	assert.Equal(t, user.Quota+123, current.Quota)
+}
+
+func TestNativeBillingStatUsesRequestPolicyAndStartAfterLateCompletion(t *testing.T) {
+	setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	// An existing log database upgrades without rewriting historical events.
+	require.NoError(t, model.LOG_DB.Migrator().DropIndex(&model.Log{}, "idx_model_usage_period"))
+	require.NoError(t, model.LOG_DB.Migrator().DropIndex(&model.Log{}, "idx_model_usage_completion"))
+	require.NoError(t, model.LOG_DB.Migrator().DropIndex(&model.Log{}, "idx_model_usage_observed"))
+	require.NoError(t, model.LOG_DB.Migrator().DropColumn(&model.Log{}, "BillingPolicyEpoch"))
+	require.NoError(t, model.LOG_DB.Migrator().DropColumn(&model.Log{}, "RequestStartedAt"))
+	for _, field := range []string{"MeteredInputTokens", "MeteredCacheReadTokens", "MeteredOutputTokens"} {
+		require.NoError(t, model.LOG_DB.Migrator().DropColumn(&model.Log{}, field))
+	}
+	ref := "11111111-1111-4111-8111-111111111111"
+	legacy := model.Log{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 5, CreatedAt: 150, BillingContextRef: ref}
+	require.NoError(t, model.LOG_DB.Omit("BillingPolicyEpoch", "RequestStartedAt", "MeteredInputTokens", "MeteredCacheReadTokens", "MeteredOutputTokens").Create(&legacy).Error)
+	for range 2 {
+		require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	}
+	rows := []model.Log{
+		{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 17, CreatedAt: 5000, BillingContextRef: ref, BillingPolicyEpoch: "7", RequestStartedAt: 150,
+			MeteredInputTokens: new(int64(120)), MeteredCacheReadTokens: new(int64(20)), MeteredOutputTokens: new(int64(2))},
+		{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 23, CreatedAt: 5001, BillingContextRef: ref, BillingPolicyEpoch: "8", RequestStartedAt: 150},
+		{UserId: 7, TokenId: 13, Type: model.LogTypeConsume, ModelName: "model", Quota: 31, CreatedAt: 5002, BillingContextRef: ref, BillingPolicyEpoch: "7", RequestStartedAt: 201},
+	}
+	require.NoError(t, model.LOG_DB.Create(&rows).Error)
+	for _, tc := range []struct {
+		epoch   string
+		quota   int
+		started *int64
+	}{
+		{"7", 17, new(int64(150))}, {"8", 23, new(int64(150))}, {"", 5, nil},
+	} {
+		response := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(response)
+		c.Request = httptest.NewRequest("GET", "/api/log/stat?type=2&include_metering=true&user_id=7&token_id=13&model_name=model&start_timestamp=100&end_timestamp=200&billing_context_ref="+ref+"&policy_epoch="+tc.epoch, nil)
+		GetLogsStat(c)
+		require.Equal(t, http.StatusOK, response.Code)
+		var result struct {
+			Data struct {
+				Quota       int
+				PolicyEpoch string `json:"policy_epoch"`
+				Filtered    bool   `json:"policy_epoch_filtered"`
+				Started     *int64 `json:"request_started_at"`
+				Input       *int64 `json:"input_tokens"`
+				Cache       *int64 `json:"cache_read_tokens"`
+				Output      *int64 `json:"output_tokens"`
+			}
+		}
+		require.NoError(t, common.Unmarshal(response.Body.Bytes(), &result))
+		assert.Equal(t, tc.quota, result.Data.Quota)
+		assert.True(t, result.Data.Filtered)
+		assert.Equal(t, tc.epoch, result.Data.PolicyEpoch)
+		assert.Equal(t, tc.started, result.Data.Started)
+		if tc.epoch == "7" {
+			assert.Equal(t, new(int64(120)), result.Data.Input)
+			assert.Equal(t, new(int64(20)), result.Data.Cache)
+			assert.Equal(t, new(int64(2)), result.Data.Output)
+		} else if tc.epoch == "8" {
+			assert.Nil(t, result.Data.Input)
+			assert.Nil(t, result.Data.Cache)
+			assert.Nil(t, result.Data.Output)
+		}
+	}
+	// Newly completed work can belong to old request periods. Pages carry no
+	// prompt or financial rows, and acknowledge the exact scope and highwater.
+	page := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(page)
+	c.Request = httptest.NewRequest("GET", "/api/log/stat?activity=true&user_id=7&token_id=13&billing_context_ref="+ref+"&after_log_id=0&page_after_log_id=0&page_size=2", nil)
+	GetLogsStat(c)
+	require.Equal(t, http.StatusOK, page.Code)
+	var activity struct {
+		Data struct {
+			Next   int64                      `json:"next_log_id"`
+			More   bool                       `json:"has_more"`
+			Groups []model.ModelUsageActivity `json:"groups"`
+		}
+	}
+	require.NoError(t, common.Unmarshal(page.Body.Bytes(), &activity))
+	assert.True(t, activity.Data.More)
+	assert.EqualValues(t, rows[1].Id, activity.Data.Next)
+	assert.Equal(t, []model.ModelUsageActivity{{PolicyEpoch: "7", Model: "model", FromTimestamp: 150, ToTimestamp: 150},
+		{PolicyEpoch: "8", Model: "model", FromTimestamp: 150, ToTimestamp: 150}}, activity.Data.Groups)
+	groups, next, more, err := model.CompletedModelUsage(context.Background(), 7, 13, ref, 0, activity.Data.Next, 0, 2)
+	require.NoError(t, err)
+	assert.False(t, more)
+	assert.EqualValues(t, rows[2].Id, next)
+	assert.Equal(t, []model.ModelUsageActivity{{PolicyEpoch: "7", Model: "model", FromTimestamp: 201, ToTimestamp: 201}}, groups)
+	// A low ID committed after the prior read is recovered by completion time.
+	require.NoError(t, model.LOG_DB.Model(&model.Log{}).Where("id = ?", legacy.Id).Updates(map[string]any{
+		"billing_policy_epoch": "7", "request_started_at": 99, "created_at": 6000}).Error)
+	groups, _, _, err = model.CompletedModelUsage(context.Background(), 7, 13, ref, next, 0, 6000, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []model.ModelUsageActivity{{PolicyEpoch: "7", Model: "model", FromTimestamp: 99, ToTimestamp: 99}}, groups)
+	// The user's call details use the same start-time and policy selection.
+	c, _ = gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/api/log/?type=2&user_id=7&token_id=13&billing_context_ref="+ref+"&policy_epoch=7&start_timestamp=100&end_timestamp=200", nil)
+	entries, total, err := model.GetAllLogs(logFilterFromQuery(c, true), 0, 100)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.EqualValues(t, 1, total)
+	assert.Equal(t, rows[0].Id, entries[0].Id)
 }
 
 func TestNativeBillingStatSeparatesPolicyContextsAfterRename(t *testing.T) {

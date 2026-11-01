@@ -34,6 +34,52 @@ func requireManagedProvisioner(c *gin.Context) bool {
 	return true
 }
 
+func GetManagedExecution(c *gin.Context) {
+	if !requireManagedProvisioner(c) {
+		return
+	}
+	id, err := strconv.Atoi(c.Query("user_id"))
+	if err != nil {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	projection, err := model.ReadManagedExecution(id, c.Query("account_ref"))
+	writeManagedExecutionResult(c, projection, err)
+}
+
+func PutManagedExecution(c *gin.Context) {
+	if !requireManagedProvisioner(c) {
+		return
+	}
+	var req model.ManagedExecutionUpdate
+	if common.DecodeJson(c.Request.Body, &req) != nil {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	projection, err := model.UpdateManagedExecution(req)
+	if err == nil {
+		recordManageAuditFor(c, req.UserID, "user.update", map[string]any{"model_execution_revision": req.Revision, "model_execution_until": req.ValidUntil, "model_policy_epoch": req.PolicyEpoch})
+	}
+	writeManagedExecutionResult(c, projection, err)
+}
+
+func writeManagedExecutionResult(c *gin.Context, projection *model.ManagedExecutionProjection, err error) {
+	if err == nil {
+		common.ApiSuccess(c, projection)
+		return
+	}
+	status, code := http.StatusServiceUnavailable, "execution_projection_pending"
+	switch {
+	case errors.Is(err, model.ErrModelExecutionInvalid):
+		status, code = http.StatusBadRequest, "invalid_execution_projection"
+	case errors.Is(err, model.ErrModelExecutionConflict):
+		status, code = http.StatusConflict, "execution_projection_conflict"
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		status, code = http.StatusNotFound, "managed_account_not_found"
+	}
+	c.JSON(status, gin.H{"success": false, "code": code})
+}
+
 // EnsureManagedAccount commits identity and a zero-funded new account together.
 // The external claim makes a lost create response safe to retry. An existing
 // account is adopted only by an explicit native ID or its verified OIDC subject.

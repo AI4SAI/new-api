@@ -16,6 +16,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useQuery } from '@tanstack/react-query'
+import { useTranslation } from 'react-i18next'
+
+import { ErrorState } from '@/components/error-state'
+import { useAuthStore } from '@/stores/auth-store'
+
+import { preparePlayground } from './api'
 import { PlaygroundChat } from './components/chat/playground-chat'
 import { PlaygroundInput } from './components/input/playground-input'
 import {
@@ -26,6 +33,21 @@ import {
 } from './hooks'
 
 export function Playground() {
+  const { t } = useTranslation()
+  const actor = useAuthStore((state) => state.auth.user?.id)
+  const session = useAuthStore((state) => state.auth.session?.sid)
+  const preparation = useQuery({
+    queryKey: ['playground-preparation', actor, session],
+    queryFn: preparePlayground,
+    staleTime: Infinity,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+    retry: false,
+    meta: { errorToast: false },
+  })
+  const ready =
+    !preparation.isFetching && preparation.data === true && !preparation.isError
   const {
     config,
     parameterEnabled,
@@ -81,27 +103,42 @@ export function Playground() {
         <PlaygroundChat
           messages={messages}
           isLoadingMessages={isLoadingMessages}
-          onRegenerateMessage={handleRegenerateMessage}
+          onRegenerateMessage={(message) => {
+            if (ready) handleRegenerateMessage(message)
+          }}
           onEditMessage={handleEditMessage}
           onDeleteMessage={handleDeleteMessage}
-          onSelectPrompt={handleSendMessage}
+          onSelectPrompt={(text) => {
+            if (ready) handleSendMessage(text)
+          }}
           isGenerating={isGenerating}
           editingKey={editingMessageKey}
           onCancelEdit={handleEditOpenChange}
           onSaveEdit={(newContent) => applyEdit(newContent, false)}
-          onSaveEditAndSubmit={(newContent) => applyEdit(newContent, true)}
+          onSaveEditAndSubmit={(newContent) => {
+            if (ready) applyEdit(newContent, true)
+          }}
         />
       </div>
 
       {/* Input area: center content and constrain to the same container width */}
       <div className='mx-auto w-full max-w-4xl'>
+        {!preparation.isFetching && !ready && (
+          <ErrorState
+            className='min-h-0'
+            title={t('Managed account access is unavailable')}
+            onRetry={() => {
+              void preparation.refetch()
+            }}
+          />
+        )}
         <PlaygroundInput
           config={config}
-          disabled={isGenerating}
+          disabled={isGenerating || !ready}
           groups={groups}
           groupValue={config.group}
           isGenerating={isGenerating}
-          isModelLoading={isLoadingModels}
+          isModelLoading={isLoadingModels || preparation.isFetching}
           modelValue={config.model}
           models={models}
           onGroupChange={(value) => updateConfig('group', value)}
@@ -110,7 +147,9 @@ export function Playground() {
           onModelChange={(value) => updateConfig('model', value)}
           onParameterEnabledChange={updateParameterEnabled}
           onStop={stopGeneration}
-          onSubmit={handleSendMessage}
+          onSubmit={(text) => {
+            if (ready) handleSendMessage(text)
+          }}
           parameterEnabled={parameterEnabled}
           hasMessages={messages.length > 0}
         />

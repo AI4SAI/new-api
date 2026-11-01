@@ -27,6 +27,11 @@ import type {
   GroupOption,
 } from './types'
 
+export async function preparePlayground(): Promise<boolean> {
+  const response = await api.post('/api/user/self/playground', {})
+  return requireServerSuccess(response.data).data?.ready === true
+}
+
 /**
  * Send chat completion request (non-streaming)
  */

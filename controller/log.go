@@ -11,6 +11,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // logFilterFromQuery reads the log search shared by the log list and the log
@@ -50,6 +51,9 @@ func logFilterFromQuery(c *gin.Context, admin bool) model.LogFilter {
 	}
 	if value, exists := c.GetQuery("billing_context_ref"); exists {
 		filter.BillingContextRef = &value
+	}
+	if epochs, exists := c.Request.URL.Query()["policy_epoch"]; exists && len(epochs) == 1 {
+		filter.BillingPolicyEpoch = &epochs[0]
 	}
 	if service.ManagementAccount(c) != nil {
 		value, _ := c.Get("management_token_visibility")
@@ -229,6 +233,31 @@ func GetLogByKey(c *gin.Context) {
 }
 
 func GetLogsStat(c *gin.Context) {
+	if c.Query("activity") == "true" {
+		userID, userErr := strconv.Atoi(c.Query("user_id"))
+		tokenID, tokenErr := strconv.Atoi(c.Query("token_id"))
+		ref, refErr := uuid.Parse(c.Query("billing_context_ref"))
+		after, afterErr := strconv.ParseInt(c.Query("after_log_id"), 10, 64)
+		pageAfter, pageErr := strconv.ParseInt(c.Query("page_after_log_id"), 10, 64)
+		since, sinceErr := strconv.ParseInt(c.DefaultQuery("completed_since_timestamp", "0"), 10, 64)
+		limit, limitErr := strconv.Atoi(c.DefaultQuery("page_size", "4096"))
+		if userErr != nil || tokenErr != nil || refErr != nil || afterErr != nil || pageErr != nil || sinceErr != nil || limitErr != nil ||
+			userID <= 0 || tokenID < 0 || after < 0 || pageAfter < 0 || since < 0 || limit < 1 || limit > 4096 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		groups, next, more, err := model.CompletedModelUsage(c.Request.Context(), userID, tokenID, ref.String(), after, pageAfter, since, limit)
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": gin.H{
+			"user_id": userID, "token_id": tokenID, "billing_context_ref": ref.String(),
+			"after_log_id": after, "page_after_log_id": pageAfter, "completed_since_timestamp": since,
+			"next_log_id": next, "has_more": more, "groups": groups,
+		}})
+		return
+	}
 	logType, _ := strconv.Atoi(c.Query("type"))
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
@@ -238,6 +267,27 @@ func GetLogsStat(c *gin.Context) {
 	channel, _ := strconv.Atoi(c.Query("channel"))
 	group := c.Query("group")
 	var nativeIdentity []model.LogFilter
+	epochs, filterEpoch := c.Request.URL.Query()["policy_epoch"]
+	epoch := ""
+	if filterEpoch {
+		if len(epochs) != 1 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		epoch = epochs[0]
+	}
+	if filterEpoch && (c.Query("user_id") == "" || c.Query("token_id") == "") {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	if filterEpoch && epoch != "" {
+		revision, err := strconv.ParseInt(epoch, 10, 64)
+		if err != nil || revision <= 0 || strconv.FormatInt(revision, 10) != epoch ||
+			c.Query("billing_context_ref") == "" || startTimestamp <= 0 || endTimestamp < startTimestamp {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+	}
 	if c.Query("user_id") != "" || c.Query("token_id") != "" {
 		userID, userErr := strconv.Atoi(c.Query("user_id"))
 		tokenID, tokenErr := strconv.Atoi(c.Query("token_id"))
@@ -254,6 +304,9 @@ func GetLogsStat(c *gin.Context) {
 		if value, exists := c.GetQuery("billing_context_ref"); exists {
 			filter.BillingContextRef = &value
 		}
+		if filterEpoch {
+			filter.BillingPolicyEpoch = &epoch
+		}
 		nativeIdentity = []model.LogFilter{filter}
 	}
 	stat, err := model.SumUsedQuota(logType, startTimestamp, endTimestamp, modelName, username, tokenName, channel, group, nativeIdentity...)
@@ -266,17 +319,21 @@ func GetLogsStat(c *gin.Context) {
 		"success": true,
 		"message": "",
 		"data": gin.H{
-			"quota":               stat.Quota,
-			"request_count":       stat.RequestCount,
-			"metering_available":  stat.MeteringAvailable,
-			"input_tokens":        stat.InputTokens,
-			"cache_read_tokens":   stat.CacheReadTokens,
-			"output_tokens":       stat.OutputTokens,
-			"user_id":             c.Query("user_id"),
-			"token_id":            c.Query("token_id"),
-			"billing_context_ref": c.Query("billing_context_ref"),
-			"rpm":                 stat.Rpm,
-			"tpm":                 stat.Tpm,
+			"quota":                   stat.Quota,
+			"request_count":           stat.RequestCount,
+			"metering_available":      stat.MeteringAvailable,
+			"input_tokens":            stat.InputTokens,
+			"cache_read_tokens":       stat.CacheReadTokens,
+			"output_tokens":           stat.OutputTokens,
+			"user_id":                 c.Query("user_id"),
+			"token_id":                c.Query("token_id"),
+			"billing_context_ref":     c.Query("billing_context_ref"),
+			"policy_epoch":            epoch,
+			"policy_epoch_filtered":   filterEpoch,
+			"request_started_at":      stat.RequestStartedAt,
+			"last_request_started_at": stat.LastRequestStartedAt,
+			"rpm":                     stat.Rpm,
+			"tpm":                     stat.Tpm,
 		},
 	})
 	return

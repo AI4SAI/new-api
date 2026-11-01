@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strconv"
@@ -16,6 +18,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/shopspring/decimal"
 )
 
@@ -66,6 +69,9 @@ func buildMaskedTokenResponse(token *model.Token, machine ...bool) *tokenRespons
 	}
 	maskedToken := *token
 	maskedToken.Key = token.GetMaskedKey()
+	if len(machine) == 0 || !machine[0] {
+		maskedToken.BillingContextRef = nil
+	}
 	managed := token.ManagedBindingRef != ""
 	if managed && (len(machine) == 0 || !machine[0]) {
 		maskedToken.Name = model.ManagedTokenDisplayName
@@ -258,6 +264,10 @@ func GetTokenKey(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	if token.BillingContextRef != nil && !token.BillingContextConfirmed {
+		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
@@ -370,7 +380,7 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if token.ManagementCreatorID != 0 {
+	if token.ManagementCreatorID != 0 || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -415,8 +425,14 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	if int(count) >= maxTokens {
-		common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
-		return
+		ref := c.GetHeader("Idempotency-Key")
+		if token.ManagedBindingRef != "" {
+			ref = token.ManagedBindingRef
+		}
+		if _, err := model.GetTokenByBillingContext(service.ManagementOwnerID(c), ref); err != nil {
+			common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
+			return
+		}
 	}
 	if token.Group == "auto" {
 		if !setTokenAutoGroups(c, &token, request.AutoGroups.Groups) {
@@ -458,9 +474,48 @@ func AddToken(c *gin.Context) {
 		cleanToken.ManagementCreatorID = c.GetInt("id")
 		cleanToken.AllowUserQuotaQuery = false
 	}
-	err = cleanToken.Insert()
+	if service.ManagedModelMode(c) {
+		ref := c.GetHeader("Idempotency-Key")
+		if cleanToken.ManagedBindingRef != "" {
+			ref = cleanToken.ManagedBindingRef
+		}
+		parsed, parseErr := uuid.Parse(ref)
+		if parseErr != nil || parsed.String() != ref {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		parameters, marshalErr := common.Marshal(map[string]any{"owner": cleanToken.UserId, "creator": c.GetInt("id"),
+			"workspace": c.GetHeader(service.ManagedWorkspaceHeader), "managed_ref": cleanToken.ManagedBindingRef,
+			"name": cleanToken.Name, "expiry": cleanToken.ExpiredTime, "quota": cleanToken.RemainQuota,
+			"unlimited": cleanToken.UnlimitedQuota, "models_enabled": cleanToken.ModelLimitsEnabled,
+			"models": cleanToken.ModelLimits, "ips": cleanToken.AllowIps, "group": cleanToken.Group,
+			"cross_group_retry": cleanToken.CrossGroupRetry, "auto_groups": cleanToken.AutoGroups,
+			"allow_quota_query": cleanToken.AllowUserQuotaQuery})
+		if marshalErr != nil {
+			common.ApiError(c, marshalErr)
+			return
+		}
+		digest := sha256.Sum256(parameters)
+		cleanToken.BillingContextRef, cleanToken.CreationRequestSHA = &ref, hex.EncodeToString(digest[:])
+		err = cleanToken.InsertPendingBillingToken()
+		if err == nil && !cleanToken.BillingContextConfirmed {
+			err = service.RegisterModelKey(c, &cleanToken)
+			if err == nil {
+				err = cleanToken.ConfirmBillingContext()
+			}
+		}
+	} else {
+		err = cleanToken.Insert()
+	}
 	if err != nil {
-		common.ApiError(c, err)
+		status := http.StatusServiceUnavailable
+		if errors.Is(err, model.ErrBillingContextConflict) {
+			status = http.StatusConflict
+		}
+		if errors.Is(err, model.ErrBillingContextRetired) {
+			status = http.StatusGone
+		}
+		common.ApiErrorStatus(c, status, common.NewMessage("Managed account access is unavailable"))
 		return
 	}
 	params["id"] = cleanToken.Id
@@ -468,6 +523,7 @@ func AddToken(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
+		"data":    gin.H{"id": cleanToken.Id, "status": cleanToken.Status},
 	})
 }
 
@@ -503,7 +559,7 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
-	if token.ManagementCreatorID != 0 || token.ManagedBindingRef != "" {
+	if token.ManagementCreatorID != 0 || token.ManagedBindingRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -546,6 +602,10 @@ func UpdateToken(c *gin.Context) {
 	}
 	params["name"] = cleanToken.Name
 	previous := *cleanToken
+	if cleanToken.BillingContextRef != nil && !cleanToken.BillingContextConfirmed {
+		common.ApiErrorStatus(c, http.StatusConflict, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
 	if token.Status == common.TokenStatusEnabled {
 		if cleanToken.Status == common.TokenStatusExpired && cleanToken.ExpiredTime <= common.GetTimestamp() && cleanToken.ExpiredTime != -1 {
 			common.ApiErrorT(c, "Token has expired and cannot be enabled. Please modify the expiration time or set it to never expire")

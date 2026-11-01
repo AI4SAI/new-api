@@ -73,6 +73,14 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 			w.WriteHeader(attributionStatus)
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/register-key") {
+			var receipt map[string]any
+			require.NoError(t, common.DecodeJson(r.Body, &receipt))
+			data, err := common.Marshal(receipt)
+			require.NoError(t, err)
+			_, _ = w.Write(data)
+			return
+		}
 		var body struct {
 			Tokens []service.ManagedKeyReference `json:"tokens"`
 		}
@@ -89,6 +97,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
 	request := func(method, path string, body any) (*gin.Context, *httptest.ResponseRecorder) {
 		c, w := newAuthenticatedContext(t, method, path, body, 7)
+		c.Request.Header.Set("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
 		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org",
 			ManagementRequest: service.ManagementRequest{Operation: "model.keys.read", Instance: "fixture-gateway", ActorID: 7, SessionID: "authenticated-session", WorkspaceKey: "org:fixture"}})
 		return c, w
@@ -230,6 +239,71 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	for _, row := range page.Items {
 		require.NotEqual(t, external.Id, row.ID)
 	}
+}
+
+func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	credential := t.TempDir() + "/credential"
+	require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+	deny, calls := true, 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, "/v1/internal/models/register-key", r.URL.Path)
+		var receipt map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &receipt))
+		require.Equal(t, "authenticated-fixture", receipt["session_id"])
+		var pending model.Token
+		require.NoError(t, db.First(&pending, int(receipt["native_token_id"].(float64))).Error)
+		require.False(t, pending.BillingContextConfirmed)
+		require.Equal(t, common.TokenStatusDisabled, pending.Status)
+		require.Empty(t, pending.ManagedBindingRef)
+		if deny {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		data, err := common.Marshal(receipt)
+		require.NoError(t, err)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
+	ref := "33333333-3333-4333-8333-333333333333"
+	create := func(name string) *httptest.ResponseRecorder {
+		c, w := newAuthenticatedContext(t, "POST", "/api/token/", map[string]any{"name": name, "remain_quota": 100, "expired_time": -1}, 7)
+		c.Set("session_id", "authenticated-fixture")
+		c.Request.Header.Set("Idempotency-Key", ref)
+		AddToken(c)
+		return w
+	}
+	require.Equal(t, http.StatusServiceUnavailable, create("original").Code)
+	var token model.Token
+	require.NoError(t, db.Where("billing_context_ref = ?", ref).First(&token).Error)
+	key, id := token.Key, token.Id
+	c, w := newAuthenticatedContext(t, "POST", "/api/token/key", nil, 7)
+	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
+	GetTokenKey(c)
+	require.Equal(t, http.StatusConflict, w.Code)
+	deny = false
+	require.True(t, decodeAPIResponse(t, create("original")).Success)
+	require.NoError(t, db.First(&token, id).Error)
+	require.True(t, token.BillingContextConfirmed)
+	require.Equal(t, key, token.Key)
+	require.Equal(t, common.TokenStatusEnabled, token.Status)
+	require.NoError(t, db.Model(&token).Update("status", common.TokenStatusDisabled).Error)
+	require.True(t, decodeAPIResponse(t, create("original")).Success)
+	require.NoError(t, db.First(&token, id).Error)
+	require.Equal(t, common.TokenStatusDisabled, token.Status)
+	require.Equal(t, 2, calls)
+	require.Equal(t, http.StatusConflict, create("changed").Code)
+	var count int64
+	require.NoError(t, db.Model(&model.Token{}).Where("billing_context_ref = ?", ref).Count(&count).Error)
+	require.EqualValues(t, 1, count)
+	c, w = newAuthenticatedContext(t, "POST", "/api/token/key", nil, 7)
+	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
+	GetTokenKey(c)
+	require.True(t, decodeAPIResponse(t, w).Success)
 }
 
 type tokenKeyResponse struct {
@@ -560,6 +634,12 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	require.True(t, db.Migrator().HasColumn(&model.Token{}, "management_creator_id"))
 	require.True(t, db.Migrator().HasColumn(&model.Token{}, "quota_revision"))
 	require.True(t, db.Migrator().HasColumn(&model.Token{}, "quota_mutation_ref"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "billing_context_ref"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "creation_request_sha"))
+	require.True(t, db.Migrator().HasColumn(&model.Token{}, "billing_context_confirmed"))
+	require.EqualValues(t, 1, migratedToken.MetadataRevision)
+	require.Nil(t, migratedToken.BillingContextRef)
+	require.False(t, migratedToken.BillingContextConfirmed)
 	require.Zero(t, migratedToken.ManagementCreatorID)
 	require.Zero(t, migratedToken.QuotaRevision)
 	require.NoError(t, model.DB.Model(&model.Token{}).Where("id = ?", migratedToken.Id).Update("remain_quota", 70).Error)
@@ -571,6 +651,7 @@ func runTokenMigrationCompatibilityTest(t *testing.T, db *gorm.DB, dialect strin
 	require.NoError(t, db.First(&adjusted, migratedToken.Id).Error)
 	require.Equal(t, 95, adjusted.RemainQuota)
 	require.EqualValues(t, 1, adjusted.QuotaRevision)
+	require.EqualValues(t, 3, adjusted.MetadataRevision)
 
 	for range 2 {
 		migrateTokenControllerTestDB(t, db)
@@ -974,6 +1055,8 @@ func verifyAPITokenAudit(t *testing.T) {
 	user := &model.User{Username: "token-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "token-owner"}
 	require.NoError(t, model.DB.Create(user).Error)
 	pat, _ := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "api_key:reveal")
+	managedPAT, managedAccess := createScopedAccessToken(t, user.Id, time.Now().Add(time.Hour).Unix(), "api_key:write")
+	require.NoError(t, model.DB.Model(managedAccess).Update("managed", true).Error)
 	other := &model.User{Username: "other-owner", Password: "placeholder", Role: common.RoleCommonUser, Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, AffCode: "other-owner"}
 	require.NoError(t, model.DB.Create(other).Error)
 	session := &model.UserSession{SID: "token-audit-session", UserID: user.Id, Version: 1, UserAuthVersion: 1, Status: model.UserSessionStatusActive, RefreshHash: "placeholder", LoginMethod: "password", LastActiveAt: time.Now().Unix(), ExpiresAt: time.Now().Add(time.Hour).Unix()}
@@ -1001,11 +1084,11 @@ func verifyAPITokenAudit(t *testing.T) {
 	router.GET("/api/audit/self", middleware.UserAuth(), GetAuditLogs)
 
 	for index, tc := range []struct {
-		name, method, path, body, action string
-		success                          bool
-		params                           string
-		initialStatus                    int
-		failWrite, rateLimit, usePAT     bool
+		name, method, path, body, action      string
+		success                               bool
+		params                                string
+		initialStatus                         int
+		failWrite, rateLimit, usePAT, managed bool
 	}{
 		{name: "create", method: "POST", path: "/", body: `{"name":"created","expired_time":-1,"unlimited_quota":true}`, action: "token.create", success: true},
 		{name: "invalid create", method: "POST", path: "/", body: `{"name":"attempt","remain_quota":-1}`, action: "token.create", params: `{"name":"attempt"}`},
@@ -1013,6 +1096,7 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "validation error exceeds audit buffer", method: "POST", path: "/", body: `{"remain_quota":` + strings.Repeat("9", 64*1024) + `}`, action: "token.create", params: `{}`},
 		{name: "create storage failure", method: "POST", path: "/", body: `{"name":"attempt","unlimited_quota":true}`, action: "token.create", params: `{"name":"attempt"}`, failWrite: true},
 		{name: "normalized update", method: "PUT", path: "/", body: `{"id":$id,"name":"renamed","expired_time":-1,"quota_delta":100,"expected_quota_revision":0,"unlimited_quota":true,"group":"default","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"renamed","quota_delta":100,"changed_fields":["name","remain_quota","group","cross_group_retry","auto_groups"]}`},
+		{name: "managed PAT releases only model limits", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"default","cross_group_retry":false,"allow_ips":"","model_limits_enabled":false,"model_limits":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["model_limits_enabled","model_limits"]}`, initialStatus: common.TokenStatusDisabled, usePAT: true, managed: true},
 		{name: "configuration values stay private", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":42,"unlimited_quota":false,"model_limits_enabled":true,"model_limits":"private-model-configuration","allow_ips":"203.0.113.57","group":"auto","cross_group_retry":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["expired_time","unlimited_quota","model_limits_enabled","model_limits","allow_ips"]}`},
 		{name: "unchanged update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":""}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":[]}`},
 		{name: "user quota query update", method: "PUT", path: "/", body: `{"id":$id,"name":"owned","expired_time":-1,"unlimited_quota":true,"group":"auto","cross_group_retry":true,"allow_ips":"","allow_user_quota_query":true}`, action: "token.update", success: true, params: `{"id":$id,"name":"owned","changed_fields":["allow_user_quota_query"]}`},
@@ -1041,6 +1125,12 @@ func verifyAPITokenAudit(t *testing.T) {
 			if tc.initialStatus != 0 {
 				owned.Status = tc.initialStatus
 			}
+			if tc.managed {
+				owned.ManagedBindingRef = "33333333-3333-4333-8333-333333333333"
+				owned.ModelLimitsEnabled, owned.ModelLimits = true, "original-model"
+				owned.Group, owned.CrossGroupRetry, owned.AutoGroups = "default", false, ""
+				owned.UsedQuota, owned.QuotaRevision = 12, 5
+			}
 			if owned.Status == common.TokenStatusExpired {
 				owned.ExpiredTime = 1
 			}
@@ -1067,6 +1157,9 @@ func verifyAPITokenAudit(t *testing.T) {
 			if tc.usePAT {
 				credential = pat
 			}
+			if tc.managed {
+				credential = managedPAT
+			}
 			request.Header.Set("Authorization", "Bearer "+credential)
 			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("User-Agent", "api-token-audit-client")
@@ -1076,6 +1169,18 @@ func verifyAPITokenAudit(t *testing.T) {
 			}
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
+			if tc.managed {
+				var after model.Token
+				require.NoError(t, model.DB.First(&after, owned.Id).Error)
+				assert.Equal(t, owned.Status, after.Status)
+				assert.Equal(t, owned.RemainQuota, after.RemainQuota)
+				assert.Equal(t, owned.UsedQuota, after.UsedQuota)
+				assert.Equal(t, owned.QuotaRevision, after.QuotaRevision)
+				assert.Equal(t, owned.Key, after.Key)
+				assert.Equal(t, owned.ManagedBindingRef, after.ManagedBindingRef)
+				assert.False(t, after.ModelLimitsEnabled)
+				assert.Empty(t, after.ModelLimits)
+			}
 			if strings.Contains(tc.name, "exceeds audit buffer") {
 				assert.Greater(t, response.Body.Len(), 64*1024)
 			}
@@ -1093,7 +1198,7 @@ func verifyAPITokenAudit(t *testing.T) {
 					operation = &events[i]
 				} else {
 					assert.Equal(t, model.AuditCategoryAccessToken, events[i].Category)
-					assert.Equal(t, model.AccessTokenFingerprint(pat), events[i].TokenRef)
+					assert.Equal(t, model.AccessTokenFingerprint(credential), events[i].TokenRef)
 				}
 			}
 			require.NotNil(t, operation)
@@ -1102,6 +1207,9 @@ func verifyAPITokenAudit(t *testing.T) {
 			assert.Equal(t, response.Code, operation.Status)
 			if tc.rateLimit {
 				assert.Equal(t, 429, response.Code)
+			} else if tc.name == "create storage failure" {
+				assert.Equal(t, http.StatusServiceUnavailable, response.Code)
+				assert.False(t, decodeAPIResponse(t, response).Success)
 			} else {
 				assert.Equal(t, 200, response.Code)
 				assert.Equal(t, tc.success, decodeAPIResponse(t, response).Success)

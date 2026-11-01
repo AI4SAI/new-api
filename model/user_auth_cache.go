@@ -11,15 +11,18 @@ import (
 	"gorm.io/gorm"
 )
 
-// User auth cache fencing uses three Redis keys per user: the cached user
+// User auth cache fencing uses a shared cached user
 // hash, a short-lived pending fence published before a restrictive database
 // transaction, and a monotonic committed version floor published after
 // commit. Cache writes below either floor are rejected, readers below the
 // effective floor fall back to the database, and the pending fence outlives
 // every user-hash TTL so a rolled-back transaction heals without allowing a
-// stale snapshot to re-authorize the user.
+// stale snapshot to re-authorize the user. Model execution has its own fence
+// and committed floor so policy changes do not revoke login sessions.
 
 var ErrUserAuthCachePending = errors.New("user authentication state update is pending")
+
+var ErrModelExecutionCachePending = errors.New("model execution state update is pending")
 
 var ErrUserAuthVersionConflict = errors.New("user authentication version update conflicted")
 
@@ -29,6 +32,11 @@ func getUserAuthFenceKey(userId int) string {
 
 func getUserAuthVersionKey(userId int) string {
 	return fmt.Sprintf("auth:user:version:%d", userId)
+}
+
+func getModelExecutionFenceKey(userId int) string { return fmt.Sprintf("model:user:fence:%d", userId) }
+func getModelExecutionVersionKey(userId int) string {
+	return fmt.Sprintf("model:user:version:%d", userId)
 }
 
 // A pending fence only covers the interval between publishing the next
@@ -63,6 +71,13 @@ local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
 if pending > incoming or committed > incoming or current > incoming then
   return 0
 end
+local execution = tonumber(ARGV[13])
+local executionPending = tonumber(redis.call('GET', KEYS[4]) or '0')
+local executionCommitted = tonumber(redis.call('GET', KEYS[5]) or '0')
+local executionCurrent = tonumber(redis.call('HGET', KEYS[1], 'ModelExecutionRevision') or '0')
+if executionPending > execution or executionCommitted > execution or executionCurrent > execution then return -2 end
+if executionCommitted < execution then redis.call('SET', KEYS[5], ARGV[13]) end
+if executionPending > 0 and executionPending <= execution then redis.call('DEL', KEYS[4]) end
 if committed < incoming then
   redis.call('SET', KEYS[3], ARGV[1])
 end
@@ -75,16 +90,19 @@ end
 redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
-  'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9])
+  'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
+  'ModelExecutionRevision', ARGV[13], 'ModelExecutionUntil', ARGV[14],
+  'ModelPolicyEpoch', ARGV[15], 'PlaygroundBillingContextRef', ARGV[16])
 if ARGV[10] == '1' and redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id)},
+		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getModelExecutionFenceKey(user.Id), getModelExecutionVersionKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
 		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
+		user.ModelExecutionRevision, user.ModelExecutionUntil, user.ModelPolicyEpoch, user.PlaygroundBillingContextRef,
 	).Int()
 	if err != nil {
 		return err
@@ -92,31 +110,34 @@ return 1`
 	if result == 0 {
 		return ErrUserAuthCachePending
 	}
+	if result == -2 {
+		return ErrModelExecutionCachePending
+	}
 	return nil
 }
 
-func getUserAuthVersionFloor(userId int) (int64, error) {
+// Both metadata generations use the existing single MGET round trip. Model
+// policy changes must not revoke a person's login/session AuthVersion.
+func getUserCacheVersionFloors(userId int) (int64, int64, error) {
 	if !common.RedisEnabled {
-		return 0, nil
+		return 0, 0, nil
 	}
-	values, err := common.RDB.MGet(context.Background(), getUserAuthFenceKey(userId), getUserAuthVersionKey(userId)).Result()
+	values, err := common.RDB.MGet(context.Background(), getUserAuthFenceKey(userId), getUserAuthVersionKey(userId), getModelExecutionFenceKey(userId), getModelExecutionVersionKey(userId)).Result()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	var floor int64
-	for _, value := range values {
+	var floors [2]int64
+	for i, value := range values {
 		if value == nil {
 			continue
 		}
 		parsed, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
 		if err != nil {
-			return 0, err
+			return 0, 0, err
 		}
-		if parsed > floor {
-			floor = parsed
-		}
+		floors[i/2] = max(floors[i/2], parsed)
 	}
-	return floor, nil
+	return floors[0], floors[1], nil
 }
 
 // SetUserAuthVersionFence publishes a fail-closed version before a restrictive
@@ -124,11 +145,15 @@ func getUserAuthVersionFloor(userId int) (int64, error) {
 // hash must have expired; a committed update is promoted separately to a
 // permanent monotonic version floor.
 func SetUserAuthVersionFence(userId int, authVersion int64) error {
-	if !common.RedisEnabled {
-		return nil
-	}
 	if userId <= 0 || authVersion <= 0 {
 		return fmt.Errorf("invalid user auth fence")
+	}
+	return setUserCacheVersionFence(getUserAuthFenceKey(userId), authVersion)
+}
+
+func setUserCacheVersionFence(key string, version int64) error {
+	if !common.RedisEnabled {
+		return nil
 	}
 	const script = `
 local current = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -141,7 +166,7 @@ elseif redis.call('TTL', KEYS[1]) < 0 then
   redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
 return 1`
-	return common.RDB.Eval(context.Background(), script, []string{getUserAuthFenceKey(userId)}, authVersion, userAuthFenceTTLSeconds()).Err()
+	return common.RDB.Eval(context.Background(), script, []string{key}, version, userAuthFenceTTLSeconds()).Err()
 }
 
 // publishCommittedUserAuthVersion records the durable lower bound used to

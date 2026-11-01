@@ -16,8 +16,16 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react'
 import { afterEach, describe, expect, test } from 'vitest'
+
+import type { ApiKey } from '../../types'
 
 const { createInstance } = await import('i18next')
 const { I18nextProvider, initReactI18next } = await import('react-i18next')
@@ -26,6 +34,7 @@ const { QueryClient, QueryClientProvider } =
 const { api } = await import('@/lib/api')
 const { ApiKeysProvider } = await import('../api-keys-provider')
 const { ApiKeysMutateDrawer } = await import('../api-keys-mutate-drawer')
+const { apiKeySchema } = await import('../../types')
 
 const i18n = createInstance()
 await i18n.use(initReactI18next).init({
@@ -33,13 +42,18 @@ await i18n.use(initReactI18next).init({
   resources: { en: { translation: {} } },
 })
 
-type ApiMethod = (url: string, data?: unknown) => Promise<{ data: unknown }>
+type ApiMethod = (
+  url: string,
+  data?: unknown,
+  options?: { headers?: Record<string, string> }
+) => Promise<{ data: unknown }>
 type MockableApi = {
   get: ApiMethod
   post: ApiMethod
 }
 type RenderedDrawer = {
   queryClient: InstanceType<typeof QueryClient>
+  view: ReturnType<typeof render>
 }
 
 const apiClient = api as unknown as MockableApi
@@ -84,7 +98,7 @@ function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
   }
 }
 
-async function renderCreateDrawer(): Promise<void> {
+async function renderCreateDrawer(recovery = false): Promise<void> {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
@@ -119,23 +133,33 @@ async function renderCreateDrawer(): Promise<void> {
     },
     { updatedAt: freshAt }
   )
-  renderedDrawer = { queryClient }
-
-  render(
-    <QueryClientProvider client={queryClient}>
-      <I18nextProvider i18n={i18n}>
-        <ApiKeysProvider>
-          <ApiKeysMutateDrawer open onOpenChange={() => undefined} />
-        </ApiKeysProvider>
-      </I18nextProvider>
-    </QueryClientProvider>
-  )
+  const view = render(drawerContent(queryClient))
+  renderedDrawer = { queryClient, view }
   await waitFor(
     () => {
-      const saveButton = findButton('Save changes', false)
+      const saveButton = findButton(recovery ? 'Retry' : 'Save changes', false)
       expect(saveButton).toBeEnabled()
     },
     { timeout: 1500 }
+  )
+}
+
+function drawerContent(
+  queryClient: InstanceType<typeof QueryClient>,
+  row?: ApiKey
+) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <I18nextProvider i18n={i18n}>
+        <ApiKeysProvider>
+          <ApiKeysMutateDrawer
+            open
+            onOpenChange={() => undefined}
+            currentRow={row}
+          />
+        </ApiKeysProvider>
+      </I18nextProvider>
+    </QueryClientProvider>
   )
 }
 
@@ -197,6 +221,7 @@ afterEach(() => {
   apiClient.get = originalGet
   apiClient.post = originalPost
   localStorage.clear()
+  sessionStorage.clear()
   if (renderedDrawer) {
     renderedDrawer.queryClient.clear()
     renderedDrawer = null
@@ -204,6 +229,118 @@ afterEach(() => {
 })
 
 describe('API keys mutate drawer Auto group integration', () => {
+  test('a pending create does not block editing another key and is restored on return', async () => {
+    installApiFixtures([])
+    const originalFixtureGet = apiClient.get
+    const row = apiKeySchema.parse({
+      id: 41,
+      name: 'existing-key',
+      key: '',
+      status: 1,
+      remain_quota: 0,
+      used_quota: 0,
+      unlimited_quota: true,
+      expired_time: -1,
+      created_time: 1,
+      accessed_time: 1,
+      model_limits_enabled: false,
+      group: 'default',
+    })
+    apiClient.get = async (url, ...args) =>
+      url === '/api/token/41'
+        ? { data: { success: true, data: row } }
+        : originalFixtureGet(url, ...args)
+    apiClient.post = async () => {
+      throw Object.assign(new Error('unknown'), {
+        isAxiosError: true,
+        response: { status: 503 },
+      })
+    }
+    await renderCreateDrawer()
+    changeInput(getControlByLabel('Name'), 'pending-create')
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^Retry$/ })).toBeEnabled()
+    )
+    const drawer = renderedDrawer
+    if (!drawer) throw new Error('Drawer did not mount')
+    drawer.view.rerender(drawerContent(drawer.queryClient, row))
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    expect(getControlByLabel('Name')).toHaveValue('existing-key')
+    drawer.view.rerender(drawerContent(drawer.queryClient))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^Retry$/ })).toBeEnabled()
+    )
+    expect(getControlByLabel('Name')).toHaveValue('pending-create')
+  })
+
+  test('a retired creation receipt allows a new operation instead of replaying it forever', async () => {
+    installApiFixtures([])
+    const requests: string[] = []
+    apiClient.post = async (_url, _payload, options) => {
+      const id = options?.headers?.['Idempotency-Key']
+      if (!id) throw new Error('Creation request lacks operation identity')
+      requests.push(id)
+      if (requests.length <= 2) {
+        throw Object.assign(new Error('retired or unknown'), {
+          isAxiosError: true,
+          response: { status: requests.length === 1 ? 503 : 410 },
+        })
+      }
+      return { data: { success: true, data: { id: 42 } } }
+    }
+    await renderCreateDrawer()
+    changeInput(getControlByLabel('Name'), 'original-request')
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^Retry$/ })).toBeEnabled()
+    )
+    fireEvent.click(findButton('Retry', true))
+    await waitFor(() => expect(findButton('Save changes', true)).toBeEnabled())
+    expect(
+      sessionStorage.getItem('newapi:pending-key-creation:personal')
+    ).toBeNull()
+    changeInput(getControlByLabel('Name'), 'new-request')
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() => expect(requests).toHaveLength(3))
+    expect(requests[1]).toBe(requests[0])
+    expect(requests[2]).not.toBe(requests[0])
+  })
+
+  test('restores the original create request after an unknown response and drawer remount', async () => {
+    installApiFixtures([])
+    const requests: Array<{ id: string; payload: unknown }> = []
+    apiClient.post = async (_url, payload, options) => {
+      const id = options?.headers?.['Idempotency-Key']
+      if (!id) throw new Error('Creation request lacks operation identity')
+      requests.push({ id, payload })
+      if (requests.length === 1) {
+        throw Object.assign(new Error('response lost'), {
+          isAxiosError: true,
+          response: { status: 503 },
+        })
+      }
+      return { data: { success: true, data: { id: 41 } } }
+    }
+    await renderCreateDrawer()
+    changeInput(getControlByLabel('Name'), 'retained-request')
+    fireEvent.click(findButton('Save changes', true))
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: /^Retry$/ })).toBeTruthy()
+    )
+    cleanup()
+    await renderCreateDrawer(true)
+    expect(getControlByLabel('Name').value).toBe('retained-request')
+    fireEvent.click(findButton('Retry', true))
+    await waitFor(() => expect(requests).toHaveLength(2))
+    expect(requests[1]).toEqual(requests[0])
+    await waitFor(() =>
+      expect(
+        sessionStorage.getItem('newapi:pending-key-creation:personal')
+      ).toBeNull()
+    )
+  })
+
   test('inherits the root Auto order and sends an empty override for every batch-created key', async () => {
     const createdPayloads: Array<Record<string, unknown>> = []
     installApiFixtures(createdPayloads)

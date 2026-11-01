@@ -416,6 +416,13 @@ func migrateClickHouseLogDB() error {
 	if err := LOG_DB.Exec(clickHouseLogCreateTableSQL(ttlDays)).Error; err != nil {
 		return err
 	}
+	for _, column := range []string{"billing_context_ref String DEFAULT ''", "billing_product String DEFAULT ''",
+		"billing_policy_epoch String DEFAULT ''", "request_started_at Int64 DEFAULT 0",
+		"metered_input_tokens Nullable(Int64)", "metered_cache_read_tokens Nullable(Int64)", "metered_output_tokens Nullable(Int64)"} {
+		if err := LOG_DB.Exec("ALTER TABLE logs ADD COLUMN IF NOT EXISTS " + column).Error; err != nil {
+			return err
+		}
+	}
 	return syncClickHouseLogTTL(ttlDays)
 }
 
@@ -460,6 +467,13 @@ CREATE TABLE IF NOT EXISTS logs (
 	is_stream UInt8 DEFAULT 0,
 	channel_id Int32 DEFAULT 0,
 	token_id Int32 DEFAULT 0,
+	billing_context_ref String DEFAULT '',
+	billing_product String DEFAULT '',
+	billing_policy_epoch String DEFAULT '',
+	request_started_at Int64 DEFAULT 0,
+	metered_input_tokens Nullable(Int64),
+	metered_cache_read_tokens Nullable(Int64),
+	metered_output_tokens Nullable(Int64),
 	`+"`group`"+` String DEFAULT '',
 	ip String DEFAULT '',
 	request_id String DEFAULT '',

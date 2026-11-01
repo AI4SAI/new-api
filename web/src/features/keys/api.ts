@@ -132,13 +132,16 @@ export async function getTokenAutoGroups(
 // Create a new API key
 export async function createApiKey(
   data: ApiKeyFormData,
-  workspaceKey?: string
+  workspaceKey: string | undefined,
+  requestId: string
 ): Promise<ApiResponse<ApiKey>> {
-  const res = await api.post(
-    '/api/token/',
-    data,
-    modelAccountRequest(workspaceKey)
-  )
+  const res = await api.post('/api/token/', data, {
+    ...modelAccountRequest(workspaceKey),
+    headers: {
+      ...modelAccountRequest(workspaceKey).headers,
+      'Idempotency-Key': requestId,
+    },
+  })
   return res.data
 }
 
