@@ -100,7 +100,9 @@ func ConfirmedOpenAIStreamUsage(data []byte, usage *dto.Usage, responses bool) b
 		if cache == 0 {
 			cache = usage.PromptCacheHitTokens
 		}
-		if input != *prompt || canonical.CompletionTokens != *completion || canonical.PromptTokensDetails.CachedTokens != cache {
+		cacheWrite := canonical.PromptTokensDetails.CacheCreationTokensTotal()
+		if input != *prompt || canonical.CompletionTokens != *completion || canonical.PromptTokensDetails.CachedTokens != cache ||
+			cacheWrite < 0 || cacheWrite > *prompt || cacheWrite != details.CacheCreationTokensTotal() {
 			return false
 		}
 	}

@@ -381,6 +381,7 @@ func TestConfirmedResponsesUsagePreservesZeroAndRejectsIncompleteSnapshots(t *te
 		{"inconsistent total", `{"input_tokens":7,"output_tokens":5,"total_tokens":11}`, false},
 		{"cache exceeds input", `{"input_tokens":7,"output_tokens":5,"input_tokens_details":{"cached_tokens":8}}`, false},
 		{"different billing snapshot", `{"input_tokens":7,"output_tokens":5,"billing_usage":{"source":"oai_responses","semantic":"openai","openai_usage":{"input_tokens":700,"output_tokens":5}}}`, false},
+		{"different billing cache write", `{"input_tokens":7,"output_tokens":5,"billing_usage":{"source":"oai_responses","semantic":"openai","openai_usage":{"input_tokens":7,"output_tokens":5,"input_tokens_details":{"cache_write_tokens":700}}}}`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			raw := []byte(`{"type":"response.completed","response":{"status":"completed","usage":` + tc.raw + `}}`)
