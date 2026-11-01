@@ -42,6 +42,10 @@ import {
 } from '@/lib/auth-session'
 import { subscribeAuthSessionEvents } from '@/lib/auth-session-sync'
 import { resolveLegacyRoute } from '@/lib/legacy-route'
+import {
+  modelWorkspaceSearch,
+  modelWorkspaceSearchSchema,
+} from '@/lib/model-workspace'
 import { useAuthStore } from '@/stores/auth-store'
 
 function RootComponent() {
@@ -113,6 +117,8 @@ let setupStatusChecked = false
 export const Route = createRootRouteWithContext<{
   queryClient: QueryClient
 }>()({
+  validateSearch: modelWorkspaceSearchSchema,
+  search: modelWorkspaceSearch,
   // 应用初始化与路由解析前统一校验会话
   beforeLoad: async ({ location }) => {
     const legacyTarget = resolveLegacyRoute(location.href)

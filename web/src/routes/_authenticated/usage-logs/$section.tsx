@@ -24,10 +24,6 @@ import {
   isUsageLogsSectionId,
   USAGE_LOGS_DEFAULT_SECTION,
 } from '@/features/usage-logs/section-registry'
-import {
-  managedWorkspaceKeySchema,
-  modelWorkspaceSearch,
-} from '@/lib/model-workspace'
 
 const logTypeValues = ['0', '1', '2', '3', '4', '5', '6', '7'] as const
 const logTypeSearchSchema = z
@@ -41,7 +37,6 @@ const logTypeSearchSchema = z
   .catch([])
 
 const usageLogsSearchSchema = z.object({
-  workspace_key: managedWorkspaceKeySchema,
   token_id: z.number().int().positive().optional(),
   page: z.number().optional().catch(1),
   pageSize: z.number().optional().catch(undefined),
@@ -88,6 +83,5 @@ export const Route = createFileRoute('/_authenticated/usage-logs/$section')({
     }
   },
   validateSearch: usageLogsSearchSchema,
-  search: modelWorkspaceSearch,
   component: UsageLogs,
 })

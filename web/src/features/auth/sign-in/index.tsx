@@ -19,6 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { Link, useSearch } from '@tanstack/react-router'
 import { useTranslation } from 'react-i18next'
 
+import { sanitizeAuthRedirect } from '@/features/auth/lib/auth-redirect'
 import { useStatus } from '@/hooks/use-status'
 
 import { AuthLayout } from '../auth-layout'
@@ -27,7 +28,12 @@ import { UserAuthForm } from './components/user-auth-form'
 
 export function SignIn() {
   const { t } = useTranslation()
-  const { redirect } = useSearch({ from: '/(auth)/sign-in' })
+  const { redirect, workspace_key } = useSearch({ from: '/(auth)/sign-in' })
+  const returnTo =
+    sanitizeAuthRedirect(redirect, window.location.origin) ??
+    (workspace_key
+      ? `/keys?workspace_key=${encodeURIComponent(workspace_key)}`
+      : undefined)
   const { status } = useStatus()
 
   return (
@@ -52,7 +58,7 @@ export function SignIn() {
             )}
         </div>
 
-        <UserAuthForm redirectTo={redirect} />
+        <UserAuthForm redirectTo={returnTo} />
 
         <TermsFooter
           variant='sign-in'

@@ -146,8 +146,15 @@ describe('managed model account requests', () => {
 
 test('organization context survives model navigation and can explicitly return to personal', async () => {
   const workspace = 'org:11111111-1111-4111-8111-111111111111'
-  const root = createRootRoute()
+  const root = createRootRoute({
+    validateSearch: modelWorkspaceSearchSchema,
+    search: modelWorkspaceSearch,
+  })
   const routes = [
+    '/',
+    '/docs',
+    '/sign-in',
+    '/oauth/oidc',
     '/keys',
     '/pricing',
     '/pricing/$modelId',
@@ -156,8 +163,6 @@ test('organization context survives model navigation and can explicitly return t
     createRoute({
       getParentRoute: () => root,
       path,
-      validateSearch: modelWorkspaceSearchSchema,
-      search: modelWorkspaceSearch,
     })
   )
   const router = createRouter({
@@ -168,6 +173,10 @@ test('organization context survives model navigation and can explicitly return t
   })
   await router.load()
   for (const path of [
+    '/',
+    '/docs',
+    '/sign-in',
+    '/oauth/oidc',
     '/pricing',
     '/pricing/synthetic-model',
     '/keys',
