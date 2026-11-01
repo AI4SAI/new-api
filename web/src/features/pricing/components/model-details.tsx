@@ -36,6 +36,7 @@ import { useTranslation } from 'react-i18next'
 import { CopyButton } from '@/components/copy-button'
 import { StaticDataTable } from '@/components/data-table'
 import { sideDrawerContentClassName } from '@/components/drawer-layout'
+import { ErrorState } from '@/components/error-state'
 import { GroupBadge } from '@/components/group-badge'
 import { PublicLayout } from '@/components/layout'
 import { Button } from '@/components/ui/button'
@@ -48,6 +49,7 @@ import {
 } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ManagedAccountBoundary } from '@/features/keys/components/managed-account-boundary'
 import { getPerfMetrics } from '@/features/performance-metrics/api'
 import {
   formatLatency,
@@ -1596,6 +1598,15 @@ export function ModelDetailsDrawer(props: ModelDetailsDrawerProps) {
 }
 
 export function ModelDetails() {
+  const { workspace_key } = useSearch({ from: '/pricing/$modelId/' })
+  return (
+    <ManagedAccountBoundary workspaceKey={workspace_key}>
+      {(_, scopeKey) => <ModelDetailsPage key={scopeKey} />}
+    </ManagedAccountBoundary>
+  )
+}
+
+function ModelDetailsPage() {
   const { t } = useTranslation()
   const { modelId } = useParams({ from: '/pricing/$modelId/' })
   const search = useSearch({ from: '/pricing/$modelId/' })
@@ -1608,6 +1619,8 @@ export function ModelDetails() {
     endpointMap,
     autoGroups,
     isLoading,
+    error,
+    refetch,
     priceRate,
     usdExchangeRate,
   } = usePricingData()
@@ -1622,6 +1635,17 @@ export function ModelDetails() {
 
   const handleBack = () => {
     navigate({ to: '/pricing', search })
+  }
+
+  if (error) {
+    return (
+      <PublicLayout>
+        <ErrorState
+          title={t('Model account unavailable')}
+          onRetry={() => void refetch()}
+        />
+      </PublicLayout>
+    )
   }
 
   if (isLoading) {

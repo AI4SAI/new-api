@@ -19,12 +19,19 @@ For commercial licensing, please contact support@quantumnous.com
 import { createFileRoute, redirect } from '@tanstack/react-router'
 
 import { USAGE_LOGS_DEFAULT_SECTION } from '@/features/usage-logs/section-registry'
+import {
+  modelWorkspaceSearch,
+  modelWorkspaceSearchSchema,
+} from '@/lib/model-workspace'
 
 export const Route = createFileRoute('/_authenticated/usage-logs/')({
-  beforeLoad: () => {
+  validateSearch: modelWorkspaceSearchSchema,
+  search: modelWorkspaceSearch,
+  beforeLoad: ({ search }) => {
     throw redirect({
       to: '/usage-logs/$section',
       params: { section: USAGE_LOGS_DEFAULT_SECTION },
+      search,
     })
   },
 })

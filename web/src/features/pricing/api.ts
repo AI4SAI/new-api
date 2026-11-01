@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { modelAccountRequest } from '@/features/keys/api'
 import { api } from '@/lib/api'
 
 import type { PricingData } from './types'
@@ -25,7 +26,13 @@ import type { PricingData } from './types'
 // ----------------------------------------------------------------------------
 
 // Get model pricing data
-export async function getPricing(): Promise<PricingData> {
-  const res = await api.get('/api/pricing')
+export async function getPricing(
+  workspaceKey?: string,
+  signal?: AbortSignal
+): Promise<PricingData> {
+  const res = await api.get(
+    '/api/pricing',
+    modelAccountRequest(workspaceKey, signal)
+  )
   return res.data
 }

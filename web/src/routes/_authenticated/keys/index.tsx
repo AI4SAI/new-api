@@ -21,7 +21,10 @@ import z from 'zod'
 
 import { ApiKeys } from '@/features/keys'
 import { API_KEY_STATUS_OPTIONS } from '@/features/keys/constants'
-import { managedWorkspaceKeySchema } from '@/features/keys/types'
+import {
+  managedWorkspaceKeySchema,
+  modelWorkspaceSearch,
+} from '@/lib/model-workspace'
 
 const apiKeySearchSchema = z.object({
   workspace_key: managedWorkspaceKeySchema,
@@ -37,5 +40,6 @@ const apiKeySearchSchema = z.object({
 
 export const Route = createFileRoute('/_authenticated/keys/')({
   validateSearch: apiKeySearchSchema,
+  search: modelWorkspaceSearch,
   component: ApiKeys,
 })

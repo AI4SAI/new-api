@@ -2,6 +2,7 @@ package controller
 
 import (
 	"maps"
+	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -37,20 +38,26 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 
 func GetPricing(c *gin.Context) {
 	pricing := model.GetPricing()
-	userId, exists := c.Get("id")
+	userId := service.ManagementOwnerID(c)
 	usableGroup := map[string]string{}
 	groupRatio := map[string]float64{}
 	maps.Copy(groupRatio, ratio_setting.GetGroupRatioCopy())
 	var group string
-	if exists {
-		user, err := model.GetUserCache(userId.(int))
-		if err == nil {
-			group = user.Group
-			for g := range groupRatio {
-				ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
-				if ok {
-					groupRatio[g] = ratio
-				}
+	if userId > 0 {
+		user, err := model.GetUserCache(userId)
+		if err != nil {
+			common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Model account unavailable"))
+			return
+		}
+		if user.Status != common.UserStatusEnabled {
+			common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Access denied"))
+			return
+		}
+		group = user.Group
+		for g := range groupRatio {
+			ratio, ok := ratio_setting.GetGroupGroupRatio(group, g)
+			if ok {
+				groupRatio[g] = ratio
 			}
 		}
 	}

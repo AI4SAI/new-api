@@ -10,8 +10,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/relaykit/dto"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting"
 	"github.com/QuantumNous/new-api/setting/config"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
@@ -528,4 +530,86 @@ func TestSetupLoginDoesNotTouchPasswordWhenPasswordFieldOmitted(t *testing.T) {
 	var stored model.User
 	require.NoError(t, db.First(&stored, user.Id).Error)
 	assert.Equal(t, hashedPassword, stored.Password)
+}
+
+func TestPricingUsesAuthorizedOrganizationOwner(t *testing.T) {
+	withSelfUseModeEnabled(t)
+	db := setupModelListControllerTestDB(t)
+	beforeGroups := setting.UserUsableGroups2JSONString()
+	beforeRatios := ratio_setting.GroupRatio2JSONString()
+	beforeSpecial := ratio_setting.GroupGroupRatio2JSONString()
+	specialGroups := ratio_setting.GetGroupRatioSetting().GroupSpecialUsableGroup
+	beforeUsable := specialGroups.ReadAll()
+	t.Cleanup(func() {
+		require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(beforeGroups))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(beforeRatios))
+		require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(beforeSpecial))
+		specialGroups.Clear()
+		specialGroups.AddAll(beforeUsable)
+		model.InvalidatePricingCache()
+	})
+	require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{"default":"Personal"}`))
+	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1,"org-only":1}`))
+	require.NoError(t, ratio_setting.UpdateGroupGroupRatioByJSONString(`{"org-only":{"org-only":0.2}}`))
+	specialGroups.Clear()
+	specialGroups.Set("org-only", map[string]string{"-:default": "", "+:org-only": "Organization"})
+	require.NoError(t, db.Create(&[]model.User{
+		{Id: 1, Username: "pricing-person", AffCode: "pricing-person", Password: "fixture", Group: "default", Status: common.UserStatusEnabled},
+		{Id: 2, Username: "pricing-organization", AffCode: "pricing-organization", Password: "fixture", Group: "org-only", Status: common.UserStatusEnabled},
+	}).Error)
+	for i, group := range []string{"default", "org-only"} {
+		name := "pricing-workspace-" + group
+		require.NoError(t, db.Create(&model.Channel{Id: i + 1, Type: constant.ChannelTypeOpenAI, Key: "fixture", Status: common.ChannelStatusEnabled, Name: name, Group: group, Models: name}).Error)
+		require.NoError(t, db.Create(&model.Ability{Group: group, Model: name, ChannelId: i + 1, Enabled: true}).Error)
+	}
+	model.InvalidatePricingCache()
+	for _, test := range []struct {
+		name   string
+		owner  int
+		status int
+		group  string
+		ratio  float64
+	}{
+		{"anonymous", 0, http.StatusOK, "default", 1},
+		{"organization", 2, http.StatusOK, "org-only", 0.2},
+		{"missing authorized owner", 999, http.StatusServiceUnavailable, "", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/pricing", nil)
+			if test.owner > 0 {
+				c.Set("id", 1)
+				c.Set("managed_account", &service.ManagedAccount{OwnerID: test.owner, Kind: "org"})
+			}
+			GetPricing(c)
+			require.Equal(t, test.status, recorder.Code)
+			if test.status != http.StatusOK {
+				return
+			}
+			var body struct {
+				Data   []model.Pricing    `json:"data"`
+				Ratios map[string]float64 `json:"group_ratio"`
+				Groups map[string]string  `json:"usable_group"`
+			}
+			require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &body))
+			require.Len(t, body.Groups, 1)
+			assert.Contains(t, body.Groups, test.group)
+			assert.Equal(t, test.ratio, body.Ratios[test.group])
+			require.Len(t, body.Data, 1)
+			assert.Equal(t, "pricing-workspace-"+test.group, body.Data[0].ModelName)
+		})
+	}
+}
+
+func TestPricingRejectsAnonymousWorkspaceInsteadOfUsingPublicPrice(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/pricing", nil)
+	request.Header.Set(service.ManagedWorkspaceHeader, "org:11111111-1111-4111-8111-111111111111")
+	router := gin.New()
+	router.GET("/api/pricing", middleware.ManagedAccountAuthorization("model.keys.read"), func(c *gin.Context) {
+		t.Fatal("unverified workspace reached pricing")
+	})
+	router.ServeHTTP(recorder, request)
+	assert.Equal(t, http.StatusForbidden, recorder.Code)
 }

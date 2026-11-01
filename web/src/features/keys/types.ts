@@ -18,11 +18,6 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
-export const managedWorkspaceKeySchema = z
-  .string()
-  .regex(/^(org|project):[0-9a-f-]{36}$/)
-  .optional()
-
 export interface ManagedAccountContext {
   workspace_key: string
   native_owner_id: number

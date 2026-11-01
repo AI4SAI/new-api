@@ -16,9 +16,20 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import {
+  createRootRoute,
+  createRoute,
+  createRouter,
+  createMemoryHistory,
+} from '@tanstack/react-router'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 
+import { getPricing } from '@/features/pricing/api'
 import { buildApiParams } from '@/features/usage-logs/lib/utils'
+import {
+  modelWorkspaceSearch,
+  modelWorkspaceSearchSchema,
+} from '@/lib/model-workspace'
 
 import {
   getApiKeys,
@@ -131,4 +142,56 @@ describe('managed model account requests', () => {
     expect(changed).not.toHaveProperty('remain_quota')
     expect(changed.quota_delta).toBeLessThan(0)
   })
+})
+
+test('organization context survives model navigation and can explicitly return to personal', async () => {
+  const workspace = 'org:11111111-1111-4111-8111-111111111111'
+  const root = createRootRoute()
+  const routes = [
+    '/keys',
+    '/pricing',
+    '/pricing/$modelId',
+    '/usage-logs/common',
+  ].map((path) =>
+    createRoute({
+      getParentRoute: () => root,
+      path,
+      validateSearch: modelWorkspaceSearchSchema,
+      search: modelWorkspaceSearch,
+    })
+  )
+  const router = createRouter({
+    routeTree: root.addChildren(routes),
+    history: createMemoryHistory({
+      initialEntries: [`/keys?workspace_key=${encodeURIComponent(workspace)}`],
+    }),
+  })
+  await router.load()
+  for (const path of [
+    '/pricing',
+    '/pricing/synthetic-model',
+    '/keys',
+    '/usage-logs/common',
+  ]) {
+    await router.navigate({ href: path })
+    expect(router.state.location.search).toEqual({ workspace_key: workspace })
+  }
+  await router.navigate({ to: '/keys', search: { workspace_key: undefined } })
+  expect(router.state.location.search.workspace_key).toBeUndefined()
+})
+
+test('pricing carries the same explicit organization context as key management', async () => {
+  const a = 'org:11111111-1111-4111-8111-111111111111'
+  const b = 'org:22222222-2222-4222-8222-222222222222'
+  await Promise.all([getPricing(a), getPricing(b), getPricing()])
+  expect(http.get.mock.calls.map((call) => call[1].headers)).toEqual([
+    { 'X-SAI-Workspace-Key': a },
+    { 'X-SAI-Workspace-Key': b },
+    undefined,
+  ])
+  expect(http.get.mock.calls.map((call) => call[1].disableDuplicate)).toEqual([
+    true,
+    true,
+    false,
+  ])
 })

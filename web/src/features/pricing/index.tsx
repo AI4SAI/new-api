@@ -16,11 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { useSearch } from '@tanstack/react-router'
 import { useCallback, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { ErrorState } from '@/components/error-state'
 import { PublicLayout } from '@/components/layout'
 import { PageTransition } from '@/components/page-transition'
+import { ManagedAccountBoundary } from '@/features/keys/components/managed-account-boundary'
 
 import {
   LoadingSkeleton,
@@ -37,6 +40,15 @@ import { useFilters } from './hooks/use-filters'
 import { usePricingData } from './hooks/use-pricing-data'
 
 export function Pricing() {
+  const { workspace_key } = useSearch({ from: '/pricing/' })
+  return (
+    <ManagedAccountBoundary workspaceKey={workspace_key}>
+      {(_, scopeKey) => <PricingContent key={scopeKey} />}
+    </ManagedAccountBoundary>
+  )
+}
+
+function PricingContent() {
   const { t } = useTranslation()
   const [selectedModelName, setSelectedModelName] = useState<string | null>(
     null
@@ -50,6 +62,8 @@ export function Pricing() {
     endpointMap,
     autoGroups,
     isLoading,
+    error,
+    refetch,
     priceRate,
     usdExchangeRate,
   } = usePricingData()
@@ -145,6 +159,17 @@ export function Pricing() {
         selectedGroup={groupFilter}
         onModelClick={handleModelClick}
       />
+    )
+  }
+
+  if (error) {
+    return (
+      <PublicLayout>
+        <ErrorState
+          title={t('Model account unavailable')}
+          onRetry={() => void refetch()}
+        />
+      </PublicLayout>
     )
   }
 

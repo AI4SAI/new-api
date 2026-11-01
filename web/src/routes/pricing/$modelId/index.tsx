@@ -20,10 +20,15 @@ import { createFileRoute, redirect } from '@tanstack/react-router'
 import z from 'zod'
 
 import { ModelDetails } from '@/features/pricing/components/model-details'
+import {
+  managedWorkspaceKeySchema,
+  modelWorkspaceSearch,
+} from '@/lib/model-workspace'
 import { getModuleAccessForGuard } from '@/lib/nav-modules'
 import { useAuthStore } from '@/stores/auth-store'
 
 const modelDetailsSearchSchema = z.object({
+  workspace_key: managedWorkspaceKeySchema,
   search: z.string().optional(),
   sort: z.string().optional(),
   vendor: z.string().optional(),
@@ -38,12 +43,13 @@ const modelDetailsSearchSchema = z.object({
 
 export const Route = createFileRoute('/pricing/$modelId/')({
   validateSearch: modelDetailsSearchSchema,
-  beforeLoad: async ({ context, location }) => {
+  search: modelWorkspaceSearch,
+  beforeLoad: async ({ context, location, search }) => {
     const access = await getModuleAccessForGuard(context.queryClient, 'pricing')
     if (!access.enabled) {
       throw redirect({ to: '/' })
     }
-    if (access.requireAuth) {
+    if (access.requireAuth || search.workspace_key) {
       const { auth } = useAuthStore.getState()
       if (!auth.user) {
         throw redirect({

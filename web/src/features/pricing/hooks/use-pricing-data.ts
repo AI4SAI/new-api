@@ -17,20 +17,28 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { useQuery } from '@tanstack/react-query'
+import { useSearch } from '@tanstack/react-router'
 import { useMemo } from 'react'
 
 import { useStatus } from '@/hooks/use-status'
 import { requireServerSuccess } from '@/lib/server-error-message'
+import { useAuthStore } from '@/stores/auth-store'
 
 import { getPricing } from '../api'
 
 export function usePricingData(enabled = true) {
   const { status } = useStatus()
+  const workspaceKey = useSearch({ strict: false }).workspace_key
+  const user = useAuthStore((state) => state.auth.user)
+  const session = useAuthStore((state) => state.auth.session)
 
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ['pricing'],
-    queryFn: async () => requireServerSuccess(await getPricing()),
-    staleTime: 5 * 60 * 1000,
+    queryKey: ['pricing', session?.sid, user?.id, workspaceKey ?? ''],
+    queryFn: async ({ signal }) =>
+      requireServerSuccess(await getPricing(workspaceKey, signal)),
+    staleTime: workspaceKey ? 0 : 5 * 60 * 1000,
+    gcTime: workspaceKey ? 0 : 5 * 60 * 1000,
+    retry: false,
     enabled,
   })
 
