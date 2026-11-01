@@ -17,6 +17,7 @@ import (
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 	hosttypes "github.com/QuantumNous/new-api/types"
 
@@ -97,6 +98,10 @@ func TestFixedPriceBillingDatabaseMatrix(t *testing.T) {
 
 func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 	t.Helper()
+	grok := model_setting.GetGrokSettings()
+	previousGrok := *grok
+	grok.ViolationDeductionEnabled, grok.ViolationDeductionAmount = true, 0.05
+	t.Cleanup(func() { *grok = previousGrok })
 	const mixed = `len <= 32000 ? tier("short", fixed(0.01)) : tier("long", p * 2)`
 	const flat = `tier("request", fixed(0.01))`
 	const tokenExpression = `tier("tokens", p * 2 + c * 8 + cr * 0.2)`
@@ -122,6 +127,8 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		unit                                            billingexpr.BillingUnit
 		requestedImages, actualImages                   int
 		searchLog                                       *relaycommon.DirectSearchLog
+		fetchLog                                        *relaycommon.DirectFetchLog
+		violation                                       string
 	}{
 		{name: "confirmed-only missing usage returns wallet reservation", expression: tokenExpression, estimate: 100,
 			stream: true, confirmedOnly: true, waived: true, unit: billingexpr.BillingUnitToken},
@@ -149,6 +156,12 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 		{name: "Search metadata keeps zero-token request charge", expression: `tier("request", fixed(0.00075))`,
 			usage: &dto.Usage{}, want: 375, unit: billingexpr.BillingUnitRequest,
 			searchLog: &relaycommon.DirectSearchLog{Query: "论文 site:example.com", Count: 8, ResultCount: 3, Outcome: "success"}},
+		{name: "Fetch metadata keeps zero-token request charge", expression: `tier("request", fixed(0.00075))`,
+			usage: &dto.Usage{}, want: 375, unit: billingexpr.BillingUnitRequest,
+			fetchLog: &relaycommon.DirectFetchLog{URL: "https://example.com/article", URLRedacted: true, ContentBytes: 6, Outcome: "success"}},
+		{name: "Search safety refusal remains free", expression: flat, refund: true, violation: constant.DeepSeekSearchModel},
+		{name: "Fetch safety refusal remains free", expression: flat, refund: true, violation: constant.DeepSeekFetchModel},
+		{name: "Grok violation fee retains its charge", expression: flat, refund: true, violation: "grok", want: 25000},
 		{name: "stream charges once", expression: flat, stream: true, usage: &dto.Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "audio zero usage charges once", expression: flat, audio: true, usage: &dto.Usage{}, want: 5000, unit: billingexpr.BillingUnitRequest},
 		{name: "audio missing usage charges once", expression: flat, audio: true, want: 5000, unit: billingexpr.BillingUnitRequest},
@@ -225,6 +238,7 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					model.InvalidateSubscriptionPlanCache(plan.Id)
 				})
 			}
+			info.ParamOverrideAudit = []string{"set reasoning.effort = high"}
 			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
 			ctx.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil)
 			if tc.localUsage {
@@ -233,6 +247,16 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 			if tc.searchLog != nil {
 				ctx.Request.URL.Path = "/v1/tools/search"
 				info.RelayMode, info.OriginModelName, info.SearchRequest = relayconstant.RelayModeToolsSearch, constant.DeepSeekSearchModel, tc.searchLog
+			}
+			if tc.fetchLog != nil {
+				ctx.Request.URL.Path = "/v1/tools/fetch"
+				info.RelayMode, info.OriginModelName, info.FetchRequest = relayconstant.RelayModeToolsFetch, constant.DeepSeekFetchModel, tc.fetchLog
+			}
+			if tc.violation != "" {
+				info.OriginModelName = tc.violation
+			}
+			if info.OriginModelName == constant.DeepSeekSearchModel || info.OriginModelName == constant.DeepSeekFetchModel {
+				info.RelayFormat = types.RelayFormatDeepSeekTools
 			}
 			if tc.expression == imageExpression {
 				ctx.Request.URL.Path = "/v1/images/generations"
@@ -281,6 +305,18 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					case <-time.After(5 * time.Second):
 						t.Fatal("refund did not finish")
 					}
+					if tc.violation != "" {
+						failure := types.WithOpenAIError(types.OpenAIError{Message: ContentViolatesUsageMarker, Type: "invalid_request_error"}, 403)
+						assert.Equal(t, tc.want > 0, ChargeViolationFeeIfNeeded(ctx, info, NormalizeViolationFeeError(failure)))
+						var logs []model.Log
+						require.NoError(t, logDB.Where("user_id = ?", user.Id).Find(&logs).Error)
+						if tc.want == 0 {
+							assert.Empty(t, logs, "a refunded tool refusal must not create a fee log")
+						} else {
+							require.Len(t, logs, 1)
+							assert.Equal(t, tc.want, logs[0].Quota)
+						}
+					}
 				} else {
 					info.UpdateImageCount(int64(tc.actualImages))
 					if tc.tool {
@@ -316,19 +352,33 @@ func runFixedPriceAccountingCases(t *testing.T, db, logDB *gorm.DB) {
 					if tc.usage != nil || !tc.waived {
 						assert.Equal(t, string(tc.unit), other["billing_unit"])
 					}
+					if info.RelayFormat == types.RelayFormatDeepSeekTools {
+						assert.NotContains(t, other, "po")
+					} else {
+						assert.Equal(t, []any{"set reasoning.effort = high"}, other["po"])
+					}
 					if tc.searchLog != nil {
 						assert.Equal(t, map[string]any{"query": tc.searchLog.Query, "count": float64(8),
 							"need_content": false, "result_count": float64(3), "outcome": "success"}, other["search_request"])
 						assert.NotContains(t, other, "web_search")
+					}
+					if tc.fetchLog != nil {
+						assert.Equal(t, map[string]any{"url": tc.fetchLog.URL, "url_redacted": true,
+							"content_bytes": float64(6), "outcome": "success"}, other["fetch_request"])
+						assert.NotContains(t, other, "search_request")
+						assert.NotContains(t, other, "web_search")
+					}
+					if tc.searchLog != nil || tc.fetchLog != nil {
 						assert.Zero(t, log.PromptTokens)
 						assert.Zero(t, log.CompletionTokens)
-						assert.Equal(t, constant.DeepSeekSearchModel, log.ModelName)
+						assert.Equal(t, info.OriginModelName, log.ModelName)
 						visible, total, err := model.GetUserLogs(user.Id, model.LogFilter{Type: model.LogTypeConsume}, 0, 10)
 						require.NoError(t, err)
 						require.Equal(t, int64(1), total)
 						var public map[string]any
 						require.NoError(t, common.UnmarshalJsonStr(visible[0].Other, &public))
 						assert.Equal(t, other["search_request"], public["search_request"])
+						assert.Equal(t, other["fetch_request"], public["fetch_request"])
 						assert.NotContains(t, public, "admin_info")
 					}
 					if tc.requestedImages > 0 {
