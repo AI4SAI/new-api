@@ -40,6 +40,27 @@ import { copyToClipboard } from '@/lib/copy-to-clipboard'
 import type { ApiKey } from '../types'
 import { useApiKeys } from './api-keys-provider'
 
+export function ApiKeyNameCell({ apiKey }: { apiKey: ApiKey }) {
+  const { t } = useTranslation()
+  if (!apiKey.managed) return <span className='font-medium'>{apiKey.name}</span>
+  const attribution = apiKey.attribution
+  return (
+    <div className='min-w-0 space-y-1 break-words'>
+      <span className='font-medium'>
+        {attribution?.state === 'ready'
+          ? attribution.actor.display_name
+          : t('Attribution unavailable')}
+      </span>
+      <div className='text-muted-foreground text-xs'>
+        <span>{apiKey.name}</span>
+        {attribution?.state === 'ready' && (
+          <> · {attribution.workspace.label}</>
+        )}
+      </div>
+    </div>
+  )
+}
+
 export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
   const { t } = useTranslation()
   const {

@@ -386,8 +386,23 @@ it.each([false, true])(
       name: 'Pilot',
       key: '',
       allow_ips: null,
+      attribution: {
+        state: 'ready',
+        actor: { display_name: 'Current member', username: 'member-user' },
+        workspace: {
+          kind: 'project',
+          code: 'proj-climate',
+          label: 'Climate study',
+        },
+      },
     })
     expect(screen.getByText('Pilot')).toBeVisible()
+    expect(screen.getByText('Current member')).toBeVisible()
+    expect(screen.getByText(/Climate study/)).toBeVisible()
+    expect(screen.queryByText('member-user')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText('Attribution unavailable')
+    ).not.toBeInTheDocument()
     expect(screen.getAllByText('Managed automatically')).toHaveLength(2)
     expect(screen.queryByText('No restriction')).not.toBeInTheDocument()
     expect(screen.queryByText('No API Keys Found')).not.toBeInTheDocument()
@@ -430,6 +445,7 @@ it('excludes managed keys when selecting all rows for a batch copy', async () =>
   post.mockResolvedValue({
     data: { success: true, data: { keys: { 7: 'external-fixture' } } },
   })
+  expect(screen.getByText('Attribution unavailable')).toBeVisible()
   await user.click(screen.getByRole('checkbox', { name: 'Select all' }))
   expect(
     screen

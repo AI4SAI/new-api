@@ -34,6 +34,20 @@ export const apiKeySchema = z.object({
   name: z.string(),
   key: z.string(),
   managed: z.boolean().optional(),
+  attribution: z
+    .discriminatedUnion('state', [
+      z.object({ state: z.literal('unavailable') }),
+      z.object({
+        state: z.literal('ready'),
+        actor: z.object({ display_name: z.string(), username: z.string() }),
+        workspace: z.object({
+          kind: z.enum(['org', 'project']),
+          code: z.string(),
+          label: z.string(),
+        }),
+      }),
+    ])
+    .optional(),
   status: z.number(), // 1: enabled, 2: disabled, 3: expired, 4: exhausted
   remain_quota: z.number(),
   used_quota: z.number(),

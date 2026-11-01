@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -68,12 +69,8 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 	if c.GetBool("use_access_token") || c.GetInt("id") <= 0 || c.GetString("session_id") == "" {
 		return ErrManagedAccountDenied
 	}
-	endpoint, err := url.Parse(os.Getenv("MODEL_MANAGEMENT_AUTHORIZATION_URL"))
-	if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
-		(endpoint.Scheme != "https" && !(endpoint.Scheme == "http" && (endpoint.Hostname() == "localhost" || net.ParseIP(endpoint.Hostname()).IsLoopback()))) {
-		return errors.New("managed account authorization unavailable")
-	}
 	var body []byte
+	var err error
 	if c.Request.Body != nil {
 		body, err = io.ReadAll(io.LimitReader(c.Request.Body, 1<<20+1))
 	}
@@ -86,35 +83,9 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 		ActorID: c.GetInt("id"), SessionID: c.GetString("session_id"), WorkspaceKey: workspace,
 		Operation: operation, RequestID: common.GetUUID(), Method: c.Request.Method,
 		Path: c.Request.URL.Path, SHA256: hex.EncodeToString(digest[:])}
-	key, err := os.ReadFile(os.Getenv("MODEL_BILLING_ADMISSION_KEY_FILE"))
-	secret := strings.TrimSpace(string(key))
-	if err != nil || len(secret) < 32 || len(secret) > 512 || request.Instance == "" {
-		return errors.New("managed account authorization unavailable")
-	}
-	payload, err := common.Marshal(request)
+	raw, err := managedAccountRPC(c, request, "", 65536)
 	if err != nil {
 		return err
-	}
-	httpRequest, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, endpoint.String(), bytes.NewReader(payload))
-	if err != nil {
-		return err
-	}
-	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest.Header.Set("Authorization", "Bearer "+secret)
-	response, err := managedAdmissionClient.Do(httpRequest)
-	if err != nil {
-		return errors.New("managed account authorization unavailable")
-	}
-	defer response.Body.Close()
-	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusUnauthorized {
-		return ErrManagedAccountDenied
-	}
-	if response.StatusCode != http.StatusOK {
-		return errors.New("managed account authorization unavailable")
-	}
-	raw, err := io.ReadAll(io.LimitReader(response.Body, 65537))
-	if err != nil || len(raw) > 65536 {
-		return errors.New("invalid managed account authorization")
 	}
 	var result struct {
 		SchemaVersion int    `json:"schema_version"`
@@ -131,6 +102,128 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 	c.Set("managed_account", account)
 	c.Header("Cache-Control", "no-store")
 	return nil
+}
+
+func managedAccountRPC(c *gin.Context, request any, resource string, limit int64) ([]byte, error) {
+	endpoint, err := url.Parse(os.Getenv("MODEL_MANAGEMENT_AUTHORIZATION_URL"))
+	if err != nil || endpoint.Host == "" || endpoint.User != nil || endpoint.RawQuery != "" || endpoint.Fragment != "" ||
+		(endpoint.Scheme != "https" && !(endpoint.Scheme == "http" && (endpoint.Hostname() == "localhost" || net.ParseIP(endpoint.Hostname()).IsLoopback()))) {
+		return nil, errors.New("managed account authorization unavailable")
+	}
+	if resource != "" {
+		endpoint.Path = path.Join(path.Dir(endpoint.Path), resource)
+	}
+	key, err := os.ReadFile(os.Getenv("MODEL_BILLING_ADMISSION_KEY_FILE"))
+	secret := strings.TrimSpace(string(key))
+	if err != nil || len(secret) < 32 || len(secret) > 512 || os.Getenv("MODEL_BILLING_INSTANCE_REF") == "" {
+		return nil, errors.New("managed account authorization unavailable")
+	}
+	payload, err := common.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+	httpRequest, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, endpoint.String(), bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Authorization", "Bearer "+secret)
+	response, err := managedAdmissionClient.Do(httpRequest)
+	if err != nil {
+		return nil, errors.New("managed account authorization unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusUnauthorized {
+		return nil, ErrManagedAccountDenied
+	}
+	if response.StatusCode != http.StatusOK {
+		return nil, errors.New("managed account authorization unavailable")
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	if err != nil || int64(len(raw)) > limit {
+		return nil, errors.New("invalid managed account authorization")
+	}
+	return raw, nil
+}
+
+type ManagedKeyReference struct {
+	TokenID    int    `json:"native_token_id"`
+	BindingRef string `json:"managed_binding_ref"`
+}
+
+type ManagedKeyActor struct {
+	DisplayName string `json:"display_name"`
+	Username    string `json:"username"`
+}
+
+type ManagedKeyWorkspace struct {
+	Kind  string `json:"kind"`
+	Code  string `json:"code"`
+	Label string `json:"label"`
+}
+
+type ManagedKeyAttribution struct {
+	State     string               `json:"state"`
+	Actor     *ManagedKeyActor     `json:"actor,omitempty"`
+	Workspace *ManagedKeyWorkspace `json:"workspace,omitempty"`
+}
+
+// ReadManagedKeyAttributions resolves only an already-authorized native page.
+// It does not persist profiles or turn display metadata into key authority.
+func ReadManagedKeyAttributions(c *gin.Context, references []ManagedKeyReference) (map[int]*ManagedKeyAttribution, error) {
+	account := ManagementAccount(c)
+	if account == nil || len(references) == 0 {
+		return nil, nil
+	}
+	if len(references) > 100 || account.Operation != "model.keys.read" {
+		return nil, ErrManagedAccountDenied
+	}
+	expected := make(map[int]string, len(references))
+	for _, item := range references {
+		if _, duplicate := expected[item.TokenID]; duplicate || item.TokenID <= 0 {
+			return nil, ErrManagedAccountDenied
+		}
+		expected[item.TokenID] = item.BindingRef
+	}
+	raw, err := managedAccountRPC(c, map[string]any{
+		"schema_version": 1, "gateway_instance_ref": account.Instance, "native_actor_id": account.ActorID,
+		"session_id": account.SessionID, "workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID,
+		"tokens": references,
+	}, "key-attributions", 262144)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		SchemaVersion int    `json:"schema_version"`
+		Instance      string `json:"gateway_instance_ref"`
+		OwnerID       int    `json:"native_owner_id"`
+		Items         []struct {
+			ManagedKeyReference
+			Attribution ManagedKeyAttribution `json:"attribution"`
+		} `json:"items"`
+	}
+	invalid := errors.New("managed key attribution unavailable")
+	if common.Unmarshal(raw, &result) != nil || result.SchemaVersion != 1 || result.Instance != account.Instance || result.OwnerID != account.OwnerID || len(result.Items) != len(references) {
+		return nil, invalid
+	}
+	resolved := make(map[int]*ManagedKeyAttribution, len(references))
+	for _, item := range result.Items {
+		ref, known := expected[item.TokenID]
+		if !known || ref != item.BindingRef || resolved[item.TokenID] != nil {
+			return nil, invalid
+		}
+		value := item.Attribution
+		if value.State == "ready" {
+			if value.Actor == nil || value.Actor.DisplayName == "" || value.Actor.Username == "" || value.Workspace == nil ||
+				(value.Workspace.Kind != "org" && value.Workspace.Kind != "project") || value.Workspace.Code == "" || value.Workspace.Label == "" {
+				return nil, invalid
+			}
+		} else if value.State != "unavailable" || value.Actor != nil || value.Workspace != nil {
+			return nil, invalid
+		}
+		resolved[item.TokenID] = &value
+	}
+	return resolved, nil
 }
 
 func verifyManagementCapability(raw string, request ManagementRequest) (*ManagedAccount, error) {
