@@ -41,6 +41,7 @@ import {
 } from './api-key-timestamp-cell'
 import {
   ApiKeyCell,
+  ApiKeyNameCell,
   IpRestrictionsCell,
   ModelLimitsCell,
 } from './api-keys-cells'
@@ -121,9 +122,7 @@ export function useApiKeysColumns(
       {
         accessorKey: 'name',
         header: t('Name'),
-        cell: ({ row }) => (
-          <span className='font-medium'>{row.getValue('name')}</span>
-        ),
+        cell: ({ row }) => <ApiKeyNameCell apiKey={row.original} />,
         size: 180,
         meta: { mobileTitle: true },
       },

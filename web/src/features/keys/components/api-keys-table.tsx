@@ -57,6 +57,7 @@ import { ApiKeyQuotaCell } from './api-key-quota-cell'
 import { ApiKeyActivityCell } from './api-key-timestamp-cell'
 import {
   ApiKeyCell,
+  ApiKeyNameCell,
   ModelLimitsCell,
   IpRestrictionsCell,
 } from './api-keys-cells'
@@ -156,7 +157,7 @@ function ApiKeysMobileList({
             <div className='flex items-start justify-between gap-3'>
               <div className='min-w-0'>
                 <div className='text-sm leading-5 font-semibold break-words'>
-                  {apiKey.name}
+                  <ApiKeyNameCell apiKey={apiKey} />
                 </div>
               </div>
               {statusConfig && (

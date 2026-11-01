@@ -117,3 +117,64 @@ func TestManagedAccountCapabilityBindsEveryRequest(t *testing.T) {
 	require.Error(t, AuthorizeManagedAccount(pat, "model.keys.update"))
 	require.Equal(t, before, calls)
 }
+
+func TestManagedKeyAttributionReadsOneExactPage(t *testing.T) {
+	credential := t.TempDir() + "/credential"
+	require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+	references := []ManagedKeyReference{{TokenID: 3, BindingRef: "binding-a"}, {TokenID: 8, BindingRef: "binding-b"}}
+	calls, mode := 0, "ready"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		require.Equal(t, "/v1/internal/models/key-attributions", r.URL.Path)
+		require.Equal(t, "Bearer "+strings.Repeat("x", 48), r.Header.Get("Authorization"))
+		var body map[string]any
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		require.Len(t, body, 7)
+		require.EqualValues(t, 7, body["native_actor_id"])
+		require.EqualValues(t, 41, body["native_owner_id"])
+		require.Len(t, body["tokens"], 2)
+		if mode == "denied" {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		items := []map[string]any{}
+		for _, ref := range references {
+			items = append(items, map[string]any{"native_token_id": ref.TokenID, "managed_binding_ref": ref.BindingRef,
+				"attribution": ManagedKeyAttribution{State: "ready", Actor: &ManagedKeyActor{DisplayName: "Current member", Username: "member"},
+					Workspace: &ManagedKeyWorkspace{Kind: "project", Code: "proj-climate", Label: "Climate study"}}})
+		}
+		if mode == "mismatch" {
+			items[0]["managed_binding_ref"] = "foreign-binding"
+		}
+		data, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41, "items": items})
+		require.NoError(t, err)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest("GET", "/api/token/", nil)
+	c.Set("managed_account", &ManagedAccount{OwnerID: 41, Kind: "org", ManagementRequest: ManagementRequest{
+		SchemaVersion: 1, Instance: "fixture-gateway", ActorID: 7, SessionID: "authenticated-session", WorkspaceKey: "org:fixture", Operation: "model.keys.read"}})
+	rows, err := ReadManagedKeyAttributions(c, references)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+	require.Len(t, rows, 2)
+	require.Equal(t, "Current member", rows[3].Actor.DisplayName)
+	require.Equal(t, "Climate study", rows[8].Workspace.Label)
+	mode = "mismatch"
+	rows, err = ReadManagedKeyAttributions(c, references)
+	require.Error(t, err)
+	require.Nil(t, rows)
+	mode = "denied"
+	_, err = ReadManagedKeyAttributions(c, references)
+	require.ErrorIs(t, err, ErrManagedAccountDenied)
+	before := calls
+	_, err = ReadManagedKeyAttributions(c, []ManagedKeyReference{references[0], references[0]})
+	require.ErrorIs(t, err, ErrManagedAccountDenied)
+	_, err = ReadManagedKeyAttributions(c, nil)
+	require.NoError(t, err)
+	require.Equal(t, before, calls)
+}

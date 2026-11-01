@@ -23,6 +23,8 @@ account. Key quota updates preserve concurrent consumption and reject repeated
 adjustments against an older revision.
 Application-managed key metadata and billing facts remain visible without
 revealing their credentials or private request content.
+Managed key lists also show current member names and authorized workspace
+attribution through bounded reads from the existing account authority.
 
 ==== Additional Terms under AGPLv3 Section 7 ====
 

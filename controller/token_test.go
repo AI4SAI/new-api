@@ -41,14 +41,15 @@ type tokenPageResponse struct {
 }
 
 type tokenResponseItem struct {
-	ID                int     `json:"id"`
-	Name              string  `json:"name"`
-	Key               string  `json:"key"`
-	Status            int     `json:"status"`
-	RemainQuota       *int    `json:"remain_quota"`
-	Managed           bool    `json:"managed"`
-	ManagedBindingRef string  `json:"managed_binding_ref"`
-	AllowIps          *string `json:"allow_ips"`
+	ID                int                            `json:"id"`
+	Name              string                         `json:"name"`
+	Key               string                         `json:"key"`
+	Status            int                            `json:"status"`
+	RemainQuota       *int                           `json:"remain_quota"`
+	Managed           bool                           `json:"managed"`
+	ManagedBindingRef string                         `json:"managed_binding_ref"`
+	AllowIps          *string                        `json:"allow_ips"`
+	Attribution       *service.ManagedKeyAttribution `json:"attribution"`
 }
 
 func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
@@ -62,9 +63,34 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.NoError(t, db.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
 	require.NoError(t, db.Model(internal).Update("allow_ips", "192.0.2.3").Error)
 	require.NoError(t, db.Model(external).Update("management_creator_id", 7).Error)
+	credential := t.TempDir() + "/credential"
+	require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+	attributionStatus := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if attributionStatus != http.StatusOK {
+			w.WriteHeader(attributionStatus)
+			return
+		}
+		var body struct {
+			Tokens []service.ManagedKeyReference `json:"tokens"`
+		}
+		require.NoError(t, common.DecodeJson(r.Body, &body))
+		require.Equal(t, []service.ManagedKeyReference{{TokenID: internal.Id, BindingRef: "11111111-1111-4111-8111-111111111111"}}, body.Tokens)
+		data, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41,
+			"items": []map[string]any{{"native_token_id": internal.Id, "managed_binding_ref": body.Tokens[0].BindingRef,
+				"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: "Current member", Username: "member"},
+					Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}}}})
+		require.NoError(t, err)
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
 	request := func(method, path string, body any) (*gin.Context, *httptest.ResponseRecorder) {
 		c, w := newAuthenticatedContext(t, method, path, body, 7)
-		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org"})
+		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org",
+			ManagementRequest: service.ManagementRequest{Operation: "model.keys.read", Instance: "fixture-gateway", ActorID: 7, SessionID: "authenticated-session", WorkspaceKey: "org:fixture"}})
 		return c, w
 	}
 	c, w := request("GET", "/api/token/", nil)
@@ -81,6 +107,8 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.Empty(t, page.Items[0].Key)
 	require.Empty(t, page.Items[0].ManagedBindingRef)
 	require.Nil(t, page.Items[0].AllowIps)
+	require.Equal(t, "Current member", page.Items[0].Attribution.Actor.DisplayName)
+	require.Equal(t, "Research lab", page.Items[0].Attribution.Workspace.Label)
 	require.Equal(t, external.Id, page.Items[1].ID)
 	require.False(t, page.Items[1].Managed)
 	require.NotEmpty(t, page.Items[1].Key)
@@ -106,12 +134,14 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &detail))
 		require.True(t, detail.Managed)
 		if machine {
+			require.Nil(t, detail.Attribution)
 			require.Equal(t, internal.Name, detail.Name)
 			require.Equal(t, internal.GetMaskedKey(), detail.Key)
 			require.NotEmpty(t, detail.ManagedBindingRef)
 			require.NotNil(t, detail.AllowIps)
 			require.Equal(t, "192.0.2.3", *detail.AllowIps)
 		} else {
+			require.Equal(t, "Current member", detail.Attribution.Actor.DisplayName)
 			require.Equal(t, "Pilot", detail.Name)
 			require.Empty(t, detail.Key)
 			require.Empty(t, detail.ManagedBindingRef)
@@ -128,6 +158,18 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 		operation.handler(c)
 		require.False(t, decodeAPIResponse(t, w).Success)
 	}
+	attributionStatus = http.StatusServiceUnavailable
+	c, w = request("GET", "/api/token/", nil)
+	GetAllTokens(c)
+	require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
+	require.Equal(t, "unavailable", page.Items[0].Attribution.State)
+	require.Equal(t, 100, *page.Items[0].RemainQuota)
+	require.Empty(t, page.Items[0].Key)
+	attributionStatus = http.StatusForbidden
+	c, w = request("GET", "/api/token/", nil)
+	GetAllTokens(c)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	attributionStatus = http.StatusOK
 	c, w = request("POST", "/api/token/", map[string]any{"name": "device", "remain_quota": 100, "expired_time": -1})
 	AddToken(c)
 	require.True(t, decodeAPIResponse(t, w).Success)

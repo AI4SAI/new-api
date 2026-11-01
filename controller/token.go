@@ -45,8 +45,9 @@ type tokenRequest struct {
 
 type tokenResponse struct {
 	*model.Token
-	AutoGroups []string `json:"auto_groups"`
-	Managed    bool     `json:"managed"`
+	AutoGroups  []string                       `json:"auto_groups"`
+	Managed     bool                           `json:"managed"`
+	Attribution *service.ManagedKeyAttribution `json:"attribution,omitempty"`
 }
 
 func maxTokenQuota() int {
@@ -80,7 +81,11 @@ func buildMaskedTokenResponse(token *model.Token, machine ...bool) *tokenRespons
 	if len(autoGroups) == 0 {
 		autoGroups = nil
 	}
-	return &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups, Managed: managed}
+	response := &tokenResponse{Token: &maskedToken, AutoGroups: autoGroups, Managed: managed}
+	if managed && (len(machine) == 0 || !machine[0]) {
+		response.Attribution = &service.ManagedKeyAttribution{State: "unavailable"}
+	}
+	return response
 }
 
 func buildMaskedTokenResponses(tokens []*model.Token, machine bool) []*tokenResponse {
@@ -89,6 +94,34 @@ func buildMaskedTokenResponses(tokens []*model.Token, machine bool) []*tokenResp
 		maskedTokens = append(maskedTokens, buildMaskedTokenResponse(token, machine))
 	}
 	return maskedTokens
+}
+
+func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, bool) {
+	machine := c.GetBool("access_token_managed")
+	responses := buildMaskedTokenResponses(tokens, machine)
+	if machine || service.ManagementAccount(c) == nil {
+		return responses, true
+	}
+	references := make([]service.ManagedKeyReference, 0, len(tokens))
+	for _, token := range tokens {
+		if token.ManagedBindingRef != "" {
+			references = append(references, service.ManagedKeyReference{TokenID: token.Id, BindingRef: token.ManagedBindingRef})
+		}
+	}
+	attributions, err := service.ReadManagedKeyAttributions(c, references)
+	if errors.Is(err, service.ErrManagedAccountDenied) {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
+		return nil, false
+	}
+	if err != nil {
+		common.SysError(common.LogText("managed key attribution unavailable"))
+	}
+	for _, response := range responses {
+		if attribution := attributions[response.Id]; attribution != nil {
+			response.Attribution = attribution
+		}
+	}
+	return responses, true
 }
 
 func getTokenRequestUserGroup(c *gin.Context) (string, error) {
@@ -154,7 +187,11 @@ func GetAllTokens(c *gin.Context) {
 	}
 	total, _ := model.CountUserTokens(userId)
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(buildMaskedTokenResponses(tokens, c.GetBool("access_token_managed")))
+	items, ok := presentTokenPage(c, tokens)
+	if !ok {
+		return
+	}
+	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
 }
 
@@ -171,7 +208,11 @@ func SearchTokens(c *gin.Context) {
 		return
 	}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(buildMaskedTokenResponses(tokens, c.GetBool("access_token_managed")))
+	items, ok := presentTokenPage(c, tokens)
+	if !ok {
+		return
+	}
+	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
 }
 
@@ -187,7 +228,10 @@ func GetToken(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	common.ApiSuccess(c, buildMaskedTokenResponse(token, c.GetBool("access_token_managed")))
+	items, ok := presentTokenPage(c, []*model.Token{token})
+	if ok {
+		common.ApiSuccess(c, items[0])
+	}
 }
 
 func GetTokenAutoGroups(c *gin.Context) {
