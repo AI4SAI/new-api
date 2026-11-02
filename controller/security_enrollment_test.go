@@ -469,7 +469,7 @@ func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {
 	keyFile, key := t.TempDir()+"/provision-key", strings.Repeat("g", 48)
 	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
 	t.Setenv("MANAGED_ACCOUNT_PROVISION_KEY_FILE", keyFile)
-	body := fmt.Sprintf(`{"grant_ref":"11111111-1111-4111-8111-111111111111","user_id":%d,"name":"grant-test","quota":123}`, user.Id)
+	body := fmt.Sprintf(`{"grant_ref":"11111111-1111-4111-8111-111111111111","user_id":%d,"name":"grant-test","quota":123,"expected_execution_revision":0}`, user.Id)
 	invoke := func(body string) *httptest.ResponseRecorder {
 		response := httptest.NewRecorder()
 		c, _ := gin.CreateTestContext(response)
@@ -528,6 +528,83 @@ func TestManagedGrantIsIdempotentAndRetainsItsReceipt(t *testing.T) {
 	var current model.User
 	require.NoError(t, model.DB.First(&current, user.Id).Error)
 	assert.Equal(t, user.Quota+123, current.Quota)
+}
+
+func TestManagedGrantReclaimUsesScopedControlAndClosesUnredeemedRequests(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	confirmPaymentComplianceForTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.ExternalIdentityClaim{}, &model.Redemption{}))
+	require.NoError(t, model.LOG_DB.AutoMigrate(&model.Log{}))
+	account := "personal:11111111-1111-4111-8111-111111111111"
+	require.NoError(t, model.ClaimExternalIdentityWithTx(model.DB, "managed-account", account, user.Id))
+	operator := model.User{Username: "reclaim-root", AffCode: "reclaim-root", Role: common.RoleRootUser, Status: common.UserStatusEnabled, AuthVersion: 1}
+	require.NoError(t, model.DB.Create(&operator).Error)
+	pat, _ := createScopedAccessToken(t, operator.Id, 0, "redemption:write")
+	limited, _ := createScopedAccessToken(t, operator.Id, 0, "redemption:read")
+	keyFile, key := t.TempDir()+"/provision-key", strings.Repeat("r", 48)
+	require.NoError(t, os.WriteFile(keyFile, []byte(key), 0600))
+	t.Setenv("MANAGED_ACCOUNT_PROVISION_KEY_FILE", keyFile)
+	router := gin.New()
+	router.Use(middleware.RequestId(), middleware.AccessTokenAudit())
+	router.POST("/api/redemption/managed", middleware.AdminAuth(), EnsureManagedRedemption)
+	router.POST("/api/redemption/managed/reclaim", middleware.AdminAuth(), ReclaimManagedRedemption)
+	router.GET("/api/redemption/managed/:grant_ref/reclaim", middleware.AdminAuth(), GetManagedRedemptionReclaim)
+	invoke := func(method, path string, body any, token string) *httptest.ResponseRecorder {
+		data, err := common.Marshal(body)
+		require.NoError(t, err)
+		request := httptest.NewRequest(method, path, bytes.NewReader(data))
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("X-Managed-Provisioning-Key", key)
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		return response
+	}
+	ref := "22222222-2222-4222-8222-222222222222"
+	query := fmt.Sprintf("/api/redemption/managed/%s/reclaim?user_id=%d", ref, user.Id)
+	assert.Equal(t, http.StatusForbidden, invoke(http.MethodGet, query, nil, limited).Code)
+	missing := invoke(http.MethodGet, query, nil, pat)
+	require.Equal(t, 200, missing.Code)
+	assert.Contains(t, missing.Body.String(), `"exists":false`)
+	create := map[string]any{"grant_ref": ref, "user_id": user.Id, "name": "control-grant", "quota": 100, "expected_execution_revision": 0}
+	for _, invalid := range []string{strings.Repeat("x", 36), "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"} {
+		create["grant_ref"] = invalid
+		assert.Equal(t, http.StatusBadRequest, invoke(http.MethodPost, "/api/redemption/managed", create, pat).Code)
+		assert.Equal(t, http.StatusBadRequest, invoke(http.MethodPost, "/api/redemption/managed/reclaim", create, pat).Code)
+	}
+	create["grant_ref"] = ref
+	created := invoke(http.MethodPost, "/api/redemption/managed", create, pat)
+	require.Equal(t, 200, created.Code, created.Body.String())
+	var original model.Redemption
+	require.NoError(t, model.DB.Where("managed_grant_ref = ?", ref).First(&original).Error)
+	_, err := model.UpdateManagedExecution(model.ManagedExecutionUpdate{UserID: user.Id, AccountRef: account, ExpectedRevision: 0, Revision: 1, ValidUntil: 0, PolicyEpoch: "1"})
+	require.NoError(t, err)
+	_, err = model.Redeem(original.Key, user.Id)
+	require.Error(t, err, "an old issued but not redeemed request cannot cross off")
+	request := map[string]any{"grant_ref": ref, "user_id": user.Id, "quota": 100, "expected_execution_revision": 1}
+	first := invoke(http.MethodPost, "/api/redemption/managed/reclaim", request, pat)
+	require.Equal(t, 200, first.Code, first.Body.String())
+	assert.Contains(t, first.Body.String(), `"outcome":"cancelled"`)
+	assert.Contains(t, first.Body.String(), `"completed":true`)
+	assert.NotContains(t, first.Body.String(), original.Key)
+	assert.JSONEq(t, first.Body.String(), invoke(http.MethodPost, "/api/redemption/managed/reclaim", request, pat).Body.String())
+	assert.JSONEq(t, first.Body.String(), invoke(http.MethodGet, query, nil, pat).Body.String())
+	assert.Contains(t, invoke(http.MethodPost, "/api/redemption/managed", create, pat).Body.String(), `"status":2`)
+	create["grant_ref"] = "33333333-3333-4333-8333-333333333333"
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPost, "/api/redemption/managed", create, pat).Code, "old not-yet-created request is fenced")
+	absentCancel := map[string]any{"grant_ref": create["grant_ref"], "user_id": user.Id, "quota": 100, "expected_execution_revision": 1}
+	cancelled := invoke(http.MethodPost, "/api/redemption/managed/reclaim", absentCancel, pat)
+	require.Equal(t, 200, cancelled.Code, cancelled.Body.String())
+	assert.Contains(t, cancelled.Body.String(), `"outcome":"cancelled"`)
+	assert.JSONEq(t, cancelled.Body.String(), invoke(http.MethodPost, "/api/redemption/managed/reclaim", absentCancel, pat).Body.String())
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPost, "/api/redemption/managed", create, pat).Code)
+	request["quota"] = 99
+	assert.Equal(t, http.StatusConflict, invoke(http.MethodPost, "/api/redemption/managed/reclaim", request, pat).Code)
+	var preserved model.User
+	require.NoError(t, model.DB.First(&preserved, user.Id).Error)
+	assert.Equal(t, user.Quota, preserved.Quota)
+	assert.Equal(t, user.Status, preserved.Status)
+	assert.Zero(t, preserved.QuotaReclaimedTotal)
 }
 
 func TestNativeBillingStatUsesRequestPolicyAndStartAfterLateCompletion(t *testing.T) {

@@ -18,6 +18,7 @@ type UserBase struct {
 	Group                       string `json:"group"`
 	Email                       string `json:"email"`
 	Quota                       int    `json:"quota"`
+	QuotaReclaimedTotal         int64  `json:"-"`
 	Status                      int    `json:"status"`
 	Role                        int    `json:"role"`
 	Username                    string `json:"username"`
@@ -108,11 +109,11 @@ func GetUserCache(userId int) (*UserBase, error) {
 		return nil, err
 	}
 	if common.RedisEnabled {
-		floor, executionFloor, floorErr := getUserCacheVersionFloors(userId)
+		floor, executionFloor, reclaimFloor, floorErr := getUserCacheVersionFloors(userId)
 		if floorErr == nil && floor > user.AuthVersion {
 			return nil, ErrUserAuthCachePending
 		}
-		if floorErr == nil && executionFloor > user.ModelExecutionRevision {
+		if floorErr == nil && (reclaimFloor > user.QuotaReclaimedTotal || executionFloor > user.ModelExecutionRevision) {
 			current := user.ToBaseUser()
 			current.ModelExecutionUntil = 0
 			return current, nil
@@ -121,7 +122,7 @@ func GetUserCache(userId int) (*UserBase, error) {
 			if errors.Is(err, ErrUserAuthCachePending) {
 				return nil, err
 			}
-			if errors.Is(err, ErrModelExecutionCachePending) {
+			if errors.Is(err, ErrModelExecutionCachePending) || errors.Is(err, ErrUserQuotaReclaimPending) {
 				current := user.ToBaseUser()
 				current.ModelExecutionUntil = 0
 				return current, nil
@@ -145,14 +146,14 @@ func cacheGetUserBase(userId int) (*UserBase, error) {
 	if userCache.Id != userId || userCache.CacheSchema != userCacheSchemaVersion || userCache.AuthVersion <= 0 {
 		return nil, fmt.Errorf("user cache schema is stale")
 	}
-	floor, executionFloor, err := getUserCacheVersionFloors(userId)
+	floor, executionFloor, reclaimFloor, err := getUserCacheVersionFloors(userId)
 	if err != nil {
 		return nil, err
 	}
 	if floor > userCache.AuthVersion {
 		return nil, ErrUserAuthCachePending
 	}
-	if executionFloor > userCache.ModelExecutionRevision {
+	if executionFloor > userCache.ModelExecutionRevision || reclaimFloor > userCache.QuotaReclaimedTotal {
 		// Model authorization is independent from human login and management.
 		// Mask execution for this read without changing the cached facts/quota.
 		userCache.ModelExecutionUntil = 0

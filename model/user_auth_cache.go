@@ -24,6 +24,8 @@ var ErrUserAuthCachePending = errors.New("user authentication state update is pe
 
 var ErrModelExecutionCachePending = errors.New("model execution state update is pending")
 
+var ErrUserQuotaReclaimPending = errors.New("user quota reclaim is pending")
+
 var ErrUserAuthVersionConflict = errors.New("user authentication version update conflicted")
 
 func getUserAuthFenceKey(userId int) string {
@@ -37,6 +39,37 @@ func getUserAuthVersionKey(userId int) string {
 func getModelExecutionFenceKey(userId int) string { return fmt.Sprintf("model:user:fence:%d", userId) }
 func getModelExecutionVersionKey(userId int) string {
 	return fmt.Sprintf("model:user:version:%d", userId)
+}
+
+func getUserQuotaReclaimFenceKey(userID int) string {
+	return fmt.Sprintf("quota:user:reclaim-pending:%d", userID)
+}
+func getUserQuotaReclaimVersionKey(userID int) string {
+	return fmt.Sprintf("quota:user:reclaimed:%d", userID)
+}
+
+// Reclaims use a permanent pending floor: a lost commit/cache acknowledgement
+// is resolved from the original receipt, never by expiring the denial.
+func setUserQuotaReclaimFence(userID int, total int64) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	return common.RDB.Eval(context.Background(), `
+if tonumber(redis.call('GET',KEYS[1]) or '0') < tonumber(ARGV[1]) then redis.call('SET',KEYS[1],ARGV[1]) end
+return 1`, []string{getUserQuotaReclaimFenceKey(userID)}, total).Err()
+}
+
+// Call under the current User row lock after an unknown DB result. A confirmed
+// rollback clears only its own pending floor; a later operation is preserved.
+func resolveUserQuotaReclaimFence(userID int, attempted, observed int64) error {
+	if !common.RedisEnabled {
+		return nil
+	}
+	return common.RDB.Eval(context.Background(), `
+local committed=tonumber(redis.call('GET',KEYS[2]) or '0')
+if committed > tonumber(ARGV[2]) then return 0 end
+if tonumber(redis.call('GET',KEYS[1]) or '0') == tonumber(ARGV[1]) then redis.call('DEL',KEYS[1]) end
+return 1`, []string{getUserQuotaReclaimFenceKey(userID), getUserQuotaReclaimVersionKey(userID)}, attempted, observed).Err()
 }
 
 // A pending fence only covers the interval between publishing the next
@@ -68,6 +101,11 @@ local incoming = tonumber(ARGV[1])
 local pending = tonumber(redis.call('GET', KEYS[2]) or '0')
 local committed = tonumber(redis.call('GET', KEYS[3]) or '0')
 local current = tonumber(redis.call('HGET', KEYS[1], 'AuthVersion') or '0')
+local reclaimed = tonumber(ARGV[17])
+local reclaimPending = tonumber(redis.call('GET', KEYS[6]) or '0')
+local reclaimCommitted = tonumber(redis.call('GET', KEYS[7]) or '0')
+local reclaimCached = tonumber(redis.call('HGET', KEYS[1], 'QuotaReclaimedTotal') or '0')
+if reclaimed < math.max(reclaimPending, reclaimCommitted, reclaimCached) then return -3 end
 if pending > incoming or committed > incoming or current > incoming then
   return 0
 end
@@ -87,22 +125,27 @@ end
 if ARGV[10] == '0' and redis.call('EXISTS', KEYS[1]) == 0 then
   return 1
 end
+if reclaimCommitted < reclaimed then redis.call('SET', KEYS[7], ARGV[17]) end
+if reclaimPending > 0 and reclaimPending <= reclaimed then redis.call('DEL', KEYS[6]) end
+if redis.call('HEXISTS', KEYS[1], 'Quota') == 1 and reclaimed > reclaimCached then
+  redis.call('HINCRBY', KEYS[1], 'Quota', reclaimCached - reclaimed)
+end
 redis.call('HSET', KEYS[1],
   'Id', ARGV[2], 'Group', ARGV[3], 'Email', ARGV[4],
   'Status', ARGV[5], 'Role', ARGV[6], 'Username', ARGV[7],
   'Setting', ARGV[8], 'AuthVersion', ARGV[1], 'CacheSchema', ARGV[9],
   'ModelExecutionRevision', ARGV[13], 'ModelExecutionUntil', ARGV[14],
-  'ModelPolicyEpoch', ARGV[15], 'PlaygroundBillingContextRef', ARGV[16])
+  'ModelPolicyEpoch', ARGV[15], 'PlaygroundBillingContextRef', ARGV[16], 'QuotaReclaimedTotal', ARGV[17])
 if ARGV[10] == '1' and redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
   redis.call('HSET', KEYS[1], 'Quota', ARGV[11])
 end
 redis.call('EXPIRE', KEYS[1], ARGV[12])
 return 1`
 	result, err := common.RDB.Eval(context.Background(), script,
-		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getModelExecutionFenceKey(user.Id), getModelExecutionVersionKey(user.Id)},
+		[]string{getUserCacheKey(user.Id), getUserAuthFenceKey(user.Id), getUserAuthVersionKey(user.Id), getModelExecutionFenceKey(user.Id), getModelExecutionVersionKey(user.Id), getUserQuotaReclaimFenceKey(user.Id), getUserQuotaReclaimVersionKey(user.Id)},
 		user.AuthVersion, user.Id, user.Group, user.Email, user.Status, user.Role,
 		user.Username, user.Setting, user.CacheSchema, includeQuotaArg, user.Quota, ttl,
-		user.ModelExecutionRevision, user.ModelExecutionUntil, user.ModelPolicyEpoch, user.PlaygroundBillingContextRef,
+		user.ModelExecutionRevision, user.ModelExecutionUntil, user.ModelPolicyEpoch, user.PlaygroundBillingContextRef, user.QuotaReclaimedTotal,
 	).Int()
 	if err != nil {
 		return err
@@ -113,31 +156,34 @@ return 1`
 	if result == -2 {
 		return ErrModelExecutionCachePending
 	}
+	if result == -3 {
+		return ErrUserQuotaReclaimPending
+	}
 	return nil
 }
 
 // Both metadata generations use the existing single MGET round trip. Model
 // policy changes must not revoke a person's login/session AuthVersion.
-func getUserCacheVersionFloors(userId int) (int64, int64, error) {
+func getUserCacheVersionFloors(userId int) (int64, int64, int64, error) {
 	if !common.RedisEnabled {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
-	values, err := common.RDB.MGet(context.Background(), getUserAuthFenceKey(userId), getUserAuthVersionKey(userId), getModelExecutionFenceKey(userId), getModelExecutionVersionKey(userId)).Result()
+	values, err := common.RDB.MGet(context.Background(), getUserAuthFenceKey(userId), getUserAuthVersionKey(userId), getModelExecutionFenceKey(userId), getModelExecutionVersionKey(userId), getUserQuotaReclaimFenceKey(userId), getUserQuotaReclaimVersionKey(userId)).Result()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	var floors [2]int64
+	var floors [3]int64
 	for i, value := range values {
 		if value == nil {
 			continue
 		}
 		parsed, err := strconv.ParseInt(fmt.Sprint(value), 10, 64)
 		if err != nil {
-			return 0, 0, err
+			return 0, 0, 0, err
 		}
 		floors[i/2] = max(floors[i/2], parsed)
 	}
-	return floors[0], floors[1], nil
+	return floors[0], floors[1], floors[2], nil
 }
 
 // SetUserAuthVersionFence publishes a fail-closed version before a restrictive

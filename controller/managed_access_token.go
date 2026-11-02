@@ -193,19 +193,21 @@ func EnsureManagedRedemption(c *gin.Context) {
 		return
 	}
 	var req struct {
-		GrantRef string `json:"grant_ref"`
-		UserID   int    `json:"user_id"`
-		Name     string `json:"name"`
-		Quota    int    `json:"quota"`
+		GrantRef                  string `json:"grant_ref"`
+		UserID                    int    `json:"user_id"`
+		Name                      string `json:"name"`
+		Quota                     int    `json:"quota"`
+		ExpectedExecutionRevision *int64 `json:"expected_execution_revision"`
 	}
-	if common.DecodeJson(c.Request.Body, &req) != nil || len(req.GrantRef) != 36 || req.UserID <= 0 ||
-		req.Quota <= 0 || common.ValidateWalletQuota(req.Quota) != nil || len(req.Name) == 0 || len(req.Name) > 20 {
+	if common.DecodeJson(c.Request.Body, &req) != nil || !model.ValidManagedGrantRef(req.GrantRef) || req.UserID <= 0 ||
+		req.Quota <= 0 || common.ValidateWalletQuota(req.Quota) != nil || len(req.Name) == 0 || len(req.Name) > 20 ||
+		req.ExpectedExecutionRevision == nil || *req.ExpectedExecutionRevision < 0 {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
 	value := model.Redemption{UserId: c.GetInt("id"), Name: req.Name, Quota: req.Quota,
 		Key: common.GetUUID(), Status: common.RedemptionCodeStatusEnabled, CreatedTime: common.GetTimestamp(),
-		ManagedGrantRef: &req.GrantRef, ManagedOwnerID: req.UserID}
+		ManagedGrantRef: &req.GrantRef, ManagedOwnerID: req.UserID, ManagedExecutionRevision: req.ExpectedExecutionRevision}
 	err := model.DB.Transaction(func(tx *gorm.DB) error {
 		var owner model.User
 		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&owner, req.UserID).Error; err != nil {
@@ -221,6 +223,9 @@ func EnsureManagedRedemption(c *gin.Context) {
 		var current model.Redemption
 		err := tx.Unscoped().Where("managed_grant_ref = ?", req.GrantRef).First(&current).Error
 		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if owner.ModelExecutionRevision < *req.ExpectedExecutionRevision || owner.ModelExecutionRevokedRevision > *req.ExpectedExecutionRevision {
+				return model.ErrManagedReclaimConflict
+			}
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&value).Error; err != nil {
 				return err
 			}
@@ -230,18 +235,70 @@ func EnsureManagedRedemption(c *gin.Context) {
 			return err
 		}
 		if current.DeletedAt.Valid || current.ManagedOwnerID != req.UserID || current.UserId != c.GetInt("id") ||
-			current.Name != req.Name || current.Quota != req.Quota {
-			return errors.New("managed grant differs")
+			current.Name != req.Name || current.Quota != req.Quota || current.ManagedExecutionRevision == nil ||
+			*current.ManagedExecutionRevision != *req.ExpectedExecutionRevision {
+			return model.ErrManagedReclaimConflict
 		}
 		value = current
 		return nil
 	})
 	if err != nil {
+		if errors.Is(err, model.ErrManagedReclaimConflict) {
+			c.JSON(http.StatusConflict, gin.H{"success": false, "code": "managed_grant_execution_changed"})
+			return
+		}
 		common.ApiError(c, err)
 		return
 	}
 	recordManageAudit(c, "redemption.create", map[string]any{"grant_ref": req.GrantRef, "redemption_id": value.Id, "user_id": req.UserID})
 	common.ApiSuccess(c, value)
+}
+
+func GetManagedRedemptionReclaim(c *gin.Context) {
+	if !requireManagedProvisioner(c) {
+		return
+	}
+	userID, err := strconv.Atoi(c.Query("user_id"))
+	if err != nil {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	receipt, err := model.ReadManagedRedemptionReclaim(c.Param("grant_ref"), userID)
+	writeManagedReclaimResult(c, receipt, err)
+}
+
+func ReclaimManagedRedemption(c *gin.Context) {
+	if !requireManagedProvisioner(c) {
+		return
+	}
+	var request model.ManagedReclaimRequest
+	if common.DecodeJson(c.Request.Body, &request) != nil {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	receipt, err := model.ReclaimManagedRedemption(request)
+	if err == nil {
+		recordManageAudit(c, "redemption.update", map[string]any{"grant_ref": request.GrantRef,
+			"redemption_id": receipt.RedemptionID, "reclaimed_quota": receipt.ReclaimedQuota, "outcome": receipt.Outcome})
+	}
+	writeManagedReclaimResult(c, receipt, err)
+}
+
+func writeManagedReclaimResult(c *gin.Context, receipt *model.ManagedReclaimReceipt, err error) {
+	if err == nil {
+		common.ApiSuccess(c, receipt)
+		return
+	}
+	status, code := http.StatusServiceUnavailable, "managed_reclaim_pending"
+	switch {
+	case errors.Is(err, model.ErrManagedReclaimInvalid):
+		status, code = http.StatusBadRequest, "invalid_managed_reclaim"
+	case errors.Is(err, model.ErrManagedReclaimConflict):
+		status, code = http.StatusConflict, "managed_reclaim_conflict"
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		status, code = http.StatusNotFound, "managed_grant_not_found"
+	}
+	c.JSON(status, gin.H{"success": false, "code": code})
 }
 
 // CreateManagedAccessToken lets the trusted provisioning operator delegate

@@ -319,6 +319,8 @@ func SetApiRouter(router *gin.Engine) {
 			redemptionRoute.GET("/:id", controller.GetRedemption)
 			redemptionRoute.POST("/", controller.AddRedemption)
 			redemptionRoute.POST("/managed", middleware.DisableCache(), controller.EnsureManagedRedemption)
+			redemptionRoute.GET("/managed/:grant_ref/reclaim", middleware.DisableCache(), controller.GetManagedRedemptionReclaim)
+			redemptionRoute.POST("/managed/reclaim", middleware.DisableCache(), controller.ReclaimManagedRedemption)
 			redemptionRoute.POST("/batch", controller.DeleteRedemptionBatch)
 			redemptionRoute.PUT("/", controller.UpdateRedemption)
 			redemptionRoute.DELETE("/invalid", controller.DeleteInvalidRedemption)

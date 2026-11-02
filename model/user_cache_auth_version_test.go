@@ -297,7 +297,7 @@ func TestUserAuthVersionFenceAndCommittedFloorAreMonotonic(t *testing.T) {
 	pending, err := common.RDB.Get(t.Context(), getUserAuthFenceKey(userID)).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "5", pending)
-	floor, _, err := getUserCacheVersionFloors(userID)
+	floor, _, _, err := getUserCacheVersionFloors(userID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 5, floor)
 
@@ -307,7 +307,7 @@ func TestUserAuthVersionFenceAndCommittedFloorAreMonotonic(t *testing.T) {
 	pending, err = common.RDB.Get(t.Context(), getUserAuthFenceKey(userID)).Result()
 	require.NoError(t, err)
 	assert.Equal(t, "5", pending)
-	floor, _, err = getUserCacheVersionFloors(userID)
+	floor, _, _, err = getUserCacheVersionFloors(userID)
 	require.NoError(t, err)
 	assert.EqualValues(t, 5, floor)
 

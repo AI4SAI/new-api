@@ -11,20 +11,24 @@ import (
 )
 
 type Redemption struct {
-	Id              int            `json:"id"`
-	UserId          int            `json:"user_id"`
-	Key             string         `json:"key" gorm:"type:char(32);uniqueIndex"`
-	Status          int            `json:"status" gorm:"default:1"`
-	Name            string         `json:"name" gorm:"index"`
-	Quota           int            `json:"quota" gorm:"default:100"`
-	CreatedTime     int64          `json:"created_time" gorm:"bigint"`
-	RedeemedTime    int64          `json:"redeemed_time" gorm:"bigint"`
-	Count           int            `json:"count" gorm:"-:all"` // only for api request
-	UsedUserId      int            `json:"used_user_id"`
-	DeletedAt       gorm.DeletedAt `gorm:"index"`
-	ExpiredTime     int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
-	ManagedGrantRef *string        `json:"managed_grant_ref,omitempty" gorm:"type:varchar(36);uniqueIndex"`
-	ManagedOwnerID  int            `json:"managed_owner_id,omitempty" gorm:"not null;default:0"`
+	Id                       int            `json:"id"`
+	UserId                   int            `json:"user_id"`
+	Key                      string         `json:"key" gorm:"type:char(32);uniqueIndex"`
+	Status                   int            `json:"status" gorm:"default:1"`
+	Name                     string         `json:"name" gorm:"index"`
+	Quota                    int            `json:"quota" gorm:"default:100"`
+	CreatedTime              int64          `json:"created_time" gorm:"bigint"`
+	RedeemedTime             int64          `json:"redeemed_time" gorm:"bigint"`
+	Count                    int            `json:"count" gorm:"-:all"` // only for api request
+	UsedUserId               int            `json:"used_user_id"`
+	DeletedAt                gorm.DeletedAt `gorm:"index"`
+	ExpiredTime              int64          `json:"expired_time" gorm:"bigint"` // 过期时间，0 表示不过期
+	ManagedGrantRef          *string        `json:"managed_grant_ref,omitempty" gorm:"type:varchar(36);uniqueIndex"`
+	ManagedOwnerID           int            `json:"managed_owner_id,omitempty" gorm:"not null;default:0"`
+	ManagedExecutionRevision *int64         `json:"managed_execution_revision,omitempty" gorm:"type:bigint"`
+	ReclaimedQuota           int            `json:"reclaimed_quota" gorm:"type:bigint;not null;default:0"`
+	ReclaimedAt              int64          `json:"reclaimed_at" gorm:"type:bigint;not null;default:0"`
+	ReclaimQuotaBefore       int            `json:"reclaim_quota_before" gorm:"type:bigint;not null;default:0"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {
@@ -159,6 +163,16 @@ func Redeem(key string, userId int) (quota int, err error) {
 		}
 		if redemption.ManagedOwnerID != 0 && redemption.ManagedOwnerID != userId {
 			return errors.New("redemption account differs")
+		}
+		if redemption.ManagedGrantRef != nil {
+			var owner User
+			if err := lockForUpdate(tx).First(&owner, userId).Error; err != nil {
+				return err
+			}
+			if redemption.ManagedExecutionRevision == nil || owner.ModelExecutionRevision < *redemption.ManagedExecutionRevision ||
+				owner.ModelExecutionRevokedRevision > *redemption.ManagedExecutionRevision {
+				return errors.New("managed grant execution revision changed")
+			}
 		}
 		if redemption.ExpiredTime != 0 && redemption.ExpiredTime < common.GetTimestamp() {
 			return errors.New("redemption code expired")

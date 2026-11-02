@@ -237,15 +237,17 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"POST /api/token/batch/keys":     accessTokenScopeRule("api_key:reveal"),
 
 	// router/api-router.go: /api/redemption
-	"GET /api/redemption/":           accessTokenScopeRule("redemption:read"),
-	"GET /api/redemption/search":     accessTokenScopeRule("redemption:read"),
-	"GET /api/redemption/:id":        accessTokenScopeRule("redemption:read"),
-	"POST /api/redemption/":          accessTokenScopeRule("redemption:write"),
-	"POST /api/redemption/managed":   accessTokenScopeRule("redemption:write"),
-	"POST /api/redemption/batch":     accessTokenScopeRule("redemption:write"),
-	"PUT /api/redemption/":           accessTokenScopeRule("redemption:write"),
-	"DELETE /api/redemption/invalid": accessTokenScopeRule("redemption:write"),
-	"DELETE /api/redemption/:id":     accessTokenScopeRule("redemption:write"),
+	"GET /api/redemption/":                           accessTokenScopeRule("redemption:read"),
+	"GET /api/redemption/search":                     accessTokenScopeRule("redemption:read"),
+	"GET /api/redemption/:id":                        accessTokenScopeRule("redemption:read"),
+	"POST /api/redemption/":                          accessTokenScopeRule("redemption:write"),
+	"POST /api/redemption/managed":                   accessTokenScopeRule("redemption:write"),
+	"GET /api/redemption/managed/:grant_ref/reclaim": accessTokenScopeRule("redemption:write"),
+	"POST /api/redemption/managed/reclaim":           accessTokenScopeRule("redemption:write"),
+	"POST /api/redemption/batch":                     accessTokenScopeRule("redemption:write"),
+	"PUT /api/redemption/":                           accessTokenScopeRule("redemption:write"),
+	"DELETE /api/redemption/invalid":                 accessTokenScopeRule("redemption:write"),
+	"DELETE /api/redemption/:id":                     accessTokenScopeRule("redemption:write"),
 
 	// router/api-router.go: /api/audit, /api/log, /api/data
 	"GET /api/audit/self":                       accessTokenScopeRule("usage:read"),

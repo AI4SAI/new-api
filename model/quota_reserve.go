@@ -20,6 +20,8 @@ const (
 )
 
 const userQuotaReserveScript = `
+local reclaimed = tonumber(redis.call('HGET', KEYS[1], 'QuotaReclaimedTotal') or '0')
+if math.max(tonumber(redis.call('GET', KEYS[2]) or '0'), tonumber(redis.call('GET', KEYS[3]) or '0')) > reclaimed then return -3 end
 if tonumber(redis.call('HGET', KEYS[1], 'Id') or '0') ~= tonumber(ARGV[2])
   or tonumber(redis.call('HGET', KEYS[1], 'CacheSchema') or '0') ~= tonumber(ARGV[3])
   or redis.call('HEXISTS', KEYS[1], 'Quota') == 0 then
@@ -88,7 +90,7 @@ func quotaResultFromLua(result int, err error) (cacheQuotaResult, error) {
 
 func cacheTryReserveUserQuota(userID int, amount int64) (cacheQuotaResult, error) {
 	result, err := common.RDB.Eval(context.Background(), userQuotaReserveScript,
-		[]string{getUserCacheKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
+		[]string{getUserCacheKey(userID), getUserQuotaReclaimFenceKey(userID), getUserQuotaReclaimVersionKey(userID)}, amount, userID, userCacheSchemaVersion).Int()
 	return quotaResultFromLua(result, err)
 }
 
@@ -231,6 +233,9 @@ func TryReserveUserQuota(id int, quota int) (bool, error) {
 		if _, hydrateErr := GetUserCache(id); hydrateErr == nil {
 			result, err = cacheTryReserveUserQuota(id, int64(quota))
 		}
+	}
+	if err == nil && result == cacheQuotaUnknown {
+		return false, ErrUserQuotaReclaimPending
 	}
 	if err != nil || result == cacheQuotaMiss {
 		if err != nil {
