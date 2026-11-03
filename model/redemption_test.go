@@ -75,8 +75,7 @@ func TestManagedReclaimPreservesInflightDeltasAndResolvesUnknownResults(t *testi
 			require.NoError(t, err)
 			assert.True(t, receipt.Completed)
 			assert.Equal(t, "reclaimed", receipt.Outcome)
-			assert.Equal(t, 100, receipt.QuotaBefore)
-			assert.Equal(t, 20, receipt.QuotaAfter)
+			assert.Equal(t, 20, getUserQuotaFromDB(t, user.Id))
 			assert.Equal(t, 80, receipt.ReclaimedQuota)
 			repeated, err := ReadManagedRedemptionReclaim(request.GrantRef, user.Id)
 			require.NoError(t, err)
@@ -158,8 +157,6 @@ func TestManagedReclaimCancellationAndZeroCloseDoNotReopenGrant(t *testing.T) {
 			value, err := ReclaimManagedRedemption(request)
 			require.NoError(t, err)
 			assert.True(t, value.Completed)
-			assert.Equal(t, 100, value.QuotaBefore)
-			assert.Equal(t, 100, value.QuotaAfter)
 			if used {
 				assert.Equal(t, "reclaimed", value.Outcome)
 			} else {
@@ -193,7 +190,6 @@ func TestManagedGrantRenewalPreservesDeliveryAndOffFencesOriginalAttempt(t *test
 	closed, err := ReclaimManagedRedemption(request)
 	require.NoError(t, err)
 	assert.Equal(t, "cancelled", closed.Outcome)
-	assert.Equal(t, 200, closed.QuotaAfter)
 	repeat, err := ReclaimManagedRedemption(request)
 	require.NoError(t, err)
 	assert.Equal(t, closed, repeat)

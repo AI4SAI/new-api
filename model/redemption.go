@@ -28,7 +28,6 @@ type Redemption struct {
 	ManagedExecutionRevision *int64         `json:"managed_execution_revision,omitempty" gorm:"type:bigint"`
 	ReclaimedQuota           int            `json:"reclaimed_quota" gorm:"type:bigint;not null;default:0"`
 	ReclaimedAt              int64          `json:"reclaimed_at" gorm:"type:bigint;not null;default:0"`
-	ReclaimQuotaBefore       int            `json:"reclaim_quota_before" gorm:"type:bigint;not null;default:0"`
 }
 
 func GetAllRedemptions(startIdx int, num int) (redemptions []*Redemption, total int64, err error) {

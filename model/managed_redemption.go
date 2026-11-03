@@ -30,21 +30,17 @@ type ManagedReclaimReceipt struct {
 	Outcome        string `json:"outcome,omitempty"`
 	ReclaimedQuota int    `json:"reclaimed_quota"`
 	ReclaimedAt    int64  `json:"reclaimed_at"`
-	QuotaBefore    int    `json:"quota_before"`
-	QuotaAfter     int    `json:"quota_after"`
 }
 
 func (grant *Redemption) reclaimReceipt() *ManagedReclaimReceipt {
 	receipt := &ManagedReclaimReceipt{Exists: true, Completed: grant.ReclaimedAt > 0,
 		GrantRef: *grant.ManagedGrantRef, RedemptionID: grant.Id, UserID: grant.ManagedOwnerID,
 		Status: grant.Status, Quota: grant.Quota, ReclaimedQuota: grant.ReclaimedQuota,
-		ReclaimedAt: grant.ReclaimedAt, QuotaBefore: grant.ReclaimQuotaBefore, QuotaAfter: grant.ReclaimQuotaBefore}
+		ReclaimedAt: grant.ReclaimedAt}
 	if receipt.Completed {
 		receipt.Outcome = "reclaimed"
 		if grant.Status == common.RedemptionCodeStatusDisabled {
 			receipt.Outcome = "cancelled"
-		} else {
-			receipt.QuotaAfter -= grant.ReclaimedQuota
 		}
 	}
 	return receipt
@@ -125,7 +121,7 @@ func ReclaimManagedRedemption(request ManagedReclaimRequest) (*ManagedReclaimRec
 			cancelled := Redemption{UserId: 0, Key: common.GetUUID(), Name: "managed-cancelled", Quota: *request.Quota,
 				Status: common.RedemptionCodeStatusDisabled, CreatedTime: common.GetTimestamp(), ManagedGrantRef: &request.GrantRef,
 				ManagedOwnerID: request.UserID, ManagedExecutionRevision: request.ExpectedExecutionRevision,
-				ReclaimedQuota: *request.Quota, ReclaimedAt: common.GetTimestamp(), ReclaimQuotaBefore: owner.Quota}
+				ReclaimedQuota: *request.Quota, ReclaimedAt: common.GetTimestamp()}
 			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&cancelled).Error; err != nil {
 				return err
 			}
@@ -182,7 +178,7 @@ func ReclaimManagedRedemption(request ManagedReclaimRequest) (*ManagedReclaimRec
 			}
 		}
 		return tx.Model(&grant).Updates(map[string]any{"status": grant.Status, "reclaimed_quota": *request.Quota,
-			"reclaimed_at": common.GetTimestamp(), "reclaim_quota_before": owner.Quota}).Error
+			"reclaimed_at": common.GetTimestamp()}).Error
 	})
 	if err != nil && attempted > 0 {
 		// A failed COMMIT acknowledgement is not evidence of rollback. The

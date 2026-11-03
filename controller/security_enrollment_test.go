@@ -587,6 +587,8 @@ func TestManagedGrantReclaimUsesScopedControlAndClosesUnredeemedRequests(t *test
 	assert.Contains(t, first.Body.String(), `"outcome":"cancelled"`)
 	assert.Contains(t, first.Body.String(), `"completed":true`)
 	assert.NotContains(t, first.Body.String(), original.Key)
+	assert.NotContains(t, first.Body.String(), `"quota_before"`)
+	assert.NotContains(t, first.Body.String(), `"quota_after"`)
 	assert.JSONEq(t, first.Body.String(), invoke(http.MethodPost, "/api/redemption/managed/reclaim", request, pat).Body.String())
 	assert.JSONEq(t, first.Body.String(), invoke(http.MethodGet, query, nil, pat).Body.String())
 	assert.Contains(t, invoke(http.MethodPost, "/api/redemption/managed", create, pat).Body.String(), `"status":2`)
