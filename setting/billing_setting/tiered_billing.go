@@ -30,9 +30,10 @@ const (
 // DB keys: billing_setting.billing_mode, billing_setting.billing_expr,
 // billing_setting.plugin_billing_expr
 type BillingSetting struct {
-	BillingMode       map[string]string `json:"billing_mode"`
-	BillingExpr       map[string]string `json:"billing_expr"`
-	PluginBillingExpr map[string]string `json:"plugin_billing_expr"`
+	RequireConfirmedStreamUsage bool              `json:"require_confirmed_stream_usage"`
+	BillingMode                 map[string]string `json:"billing_mode"`
+	BillingExpr                 map[string]string `json:"billing_expr"`
+	PluginBillingExpr           map[string]string `json:"plugin_billing_expr"`
 }
 
 var billingSetting = BillingSetting{
@@ -43,6 +44,10 @@ var billingSetting = BillingSetting{
 
 func init() {
 	config.GlobalConfig.Register("billing_setting", &billingSetting)
+}
+
+func RequireConfirmedStreamUsage() bool {
+	return billingSetting.RequireConfirmedStreamUsage
 }
 
 // ---------------------------------------------------------------------------

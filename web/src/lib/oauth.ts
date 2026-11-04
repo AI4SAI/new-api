@@ -60,23 +60,6 @@ export function buildDiscordOAuthUrl(clientId: string, state: string): string {
 }
 
 /**
- * Build OIDC OAuth URL
- */
-export function buildOIDCOAuthUrl(
-  authUrl: string,
-  clientId: string,
-  state: string
-): string {
-  const url = new URL(authUrl)
-  url.searchParams.set('client_id', clientId)
-  url.searchParams.set('redirect_uri', `${window.location.origin}/oauth/oidc`)
-  url.searchParams.set('response_type', 'code')
-  url.searchParams.set('scope', 'openid profile email')
-  url.searchParams.set('state', state)
-  return url.toString()
-}
-
-/**
  * Build LinuxDO OAuth URL
  */
 export function buildLinuxDOOAuthUrl(clientId: string, state: string): string {
@@ -100,14 +83,7 @@ export function buildOAuthAuthorizationUrl(
       }
       break
     case 'oidc':
-      if (status.oidc_authorization_endpoint && status.oidc_client_id) {
-        return buildOIDCOAuthUrl(
-          status.oidc_authorization_endpoint,
-          status.oidc_client_id,
-          state
-        )
-      }
-      break
+      throw new Error('Failed to initialize OAuth')
     case 'linuxdo':
       if (status.linuxdo_client_id) {
         return buildLinuxDOOAuthUrl(status.linuxdo_client_id, state)

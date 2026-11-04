@@ -1,16 +1,29 @@
 package model
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
+
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
-const ExternalIdentityProviderTelegram = "telegram"
+const (
+	ExternalIdentityProviderTelegram = "telegram"
+	ExternalIdentityProviderOIDC     = "oidc"
+)
+
+// OIDCIdentityKey is the collation-safe index key. ExternalIdentityClaim
+// preserves the exact signed issuer and subject alongside it.
+func OIDCIdentityKey(issuer, subject string) string {
+	encoded, _ := common.Marshal([]string{"oidc/v1", issuer, subject})
+	return fmt.Sprintf("v1:%x", sha256.Sum256(encoded))
+}
 
 var ErrExternalIdentityAlreadyClaimed = errors.New("external identity is already claimed")
 
@@ -19,11 +32,13 @@ var ErrExternalIdentityAlreadyClaimed = errors.New("external identity is already
 // subject and the user's provider slot single-owner without relying on a
 // check-then-update sequence.
 type ExternalIdentityClaim struct {
-	Id        int64     `json:"id" gorm:"primaryKey"`
-	Provider  string    `json:"provider" gorm:"type:varchar(32);not null;uniqueIndex:idx_external_identity_subject,priority:1;uniqueIndex:idx_external_identity_user,priority:1"`
-	Subject   string    `json:"subject" gorm:"type:varchar(128);not null;uniqueIndex:idx_external_identity_subject,priority:2"`
-	UserId    int       `json:"user_id" gorm:"not null;index;uniqueIndex:idx_external_identity_user,priority:2"`
-	CreatedAt time.Time `json:"created_at"`
+	Id          int64     `json:"id" gorm:"primaryKey"`
+	Provider    string    `json:"provider" gorm:"type:varchar(32);not null;uniqueIndex:idx_external_identity_subject,priority:1;uniqueIndex:idx_external_identity_user,priority:1"`
+	Subject     string    `json:"subject" gorm:"type:varchar(128);not null;uniqueIndex:idx_external_identity_subject,priority:2"`
+	UserId      int       `json:"user_id" gorm:"not null;index;uniqueIndex:idx_external_identity_user,priority:2"`
+	CreatedAt   time.Time `json:"created_at"`
+	OIDCIssuer  *string   `json:"-" gorm:"column:oidc_issuer;type:text"`
+	OIDCSubject *string   `json:"-" gorm:"column:oidc_subject;type:text"`
 }
 
 func (ExternalIdentityClaim) TableName() string {
@@ -37,34 +52,97 @@ func (ExternalIdentityClaim) TableName() string {
 func ClaimExternalIdentityWithTx(tx *gorm.DB, provider, subject string, userId int) error {
 	provider = strings.TrimSpace(provider)
 	subject = strings.TrimSpace(subject)
-	if tx == nil || provider == "" || subject == "" || userId == 0 {
+	if provider == ExternalIdentityProviderOIDC {
+		return errors.New("OIDC claim requires its verified issuer and subject")
+	}
+	return claimExternalIdentityWithTx(tx, ExternalIdentityClaim{Provider: provider, Subject: subject, UserId: userId})
+}
+
+func claimExternalIdentityWithTx(tx *gorm.DB, claim ExternalIdentityClaim) error {
+	if tx == nil || claim.Provider == "" || claim.Subject == "" || claim.UserId <= 0 {
 		return errors.New("external identity claim is invalid")
 	}
-
-	claim := ExternalIdentityClaim{Provider: provider, Subject: subject, UserId: userId}
-	result := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim)
-	if result.Error != nil {
-		return result.Error
+	if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&claim).Error; err != nil {
+		return err
 	}
-	var subjectOwner ExternalIdentityClaim
-	if err := tx.Where("provider = ? AND subject = ?", provider, subject).First(&subjectOwner).Error; err != nil {
+	var owner ExternalIdentityClaim
+	if err := lockForUpdate(tx).Where("provider = ? AND subject = ?", claim.Provider, claim.Subject).First(&owner).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return ErrExternalIdentityAlreadyClaimed
 		}
 		return err
 	}
-	if subjectOwner.UserId != userId {
+	if owner.UserId != claim.UserId || owner.Subject != claim.Subject {
 		return ErrExternalIdentityAlreadyClaimed
 	}
+	if claim.Provider == ExternalIdentityProviderOIDC &&
+		(owner.OIDCIssuer == nil || owner.OIDCSubject == nil || claim.OIDCIssuer == nil || claim.OIDCSubject == nil ||
+			*owner.OIDCIssuer != *claim.OIDCIssuer || *owner.OIDCSubject != *claim.OIDCSubject) {
+		return ErrExternalIdentityAlreadyClaimed
+	}
+	// The provider/user unique index also rejects a second identity for this slot.
+	return nil
+}
 
-	var userClaim ExternalIdentityClaim
-	if err := tx.Where("provider = ? AND user_id = ?", provider, userId).First(&userClaim).Error; err != nil {
+// BindOIDCIdentityWithTx owns the exact verified identity and its native user
+// projection in the same transaction. The caller owns login/registration proof.
+func BindOIDCIdentityWithTx(tx *gorm.DB, userId int, issuer, subject string) error {
+	if tx == nil || userId <= 0 || issuer == "" || subject == "" {
+		return ErrAccountBindingChanged
+	}
+	var user User
+	if err := lockForUpdate(tx).Select("id", "oidc_id").First(&user, userId).Error; err != nil {
 		return err
 	}
-	if userClaim.Subject != subject {
+	key := OIDCIdentityKey(issuer, subject)
+	if user.OidcId != "" && user.OidcId != key {
 		return ErrExternalIdentityAlreadyClaimed
 	}
-	return nil
+	if err := claimExternalIdentityWithTx(tx, ExternalIdentityClaim{Provider: ExternalIdentityProviderOIDC, Subject: key, UserId: userId, OIDCIssuer: &issuer, OIDCSubject: &subject}); err != nil {
+		return err
+	}
+	if user.OidcId == key {
+		return nil
+	}
+	return tx.Model(&User{}).Where("id = ?", userId).Update("oidc_id", key).Error
+}
+
+// GetUserByOIDCIdentity requires the exact signed pair and native projection.
+// Legacy digest-only bindings are not imported or repaired on a login path.
+func GetUserByOIDCIdentity(issuer, subject string) (*User, error) {
+	if issuer == "" || subject == "" {
+		return nil, ErrAccountBindingChanged
+	}
+	key := OIDCIdentityKey(issuer, subject)
+	var claim ExternalIdentityClaim
+	err := DB.Where("provider = ? AND subject = ?", ExternalIdentityProviderOIDC, key).First(&claim).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		var count int64
+		if err := DB.Unscoped().Model(&User{}).Where("oidc_id = ?", key).Count(&count).Error; err != nil {
+			return nil, err
+		}
+		if count != 0 {
+			return nil, ErrAccountBindingChanged
+		}
+		return nil, gorm.ErrRecordNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if claim.Subject != key || claim.OIDCIssuer == nil || claim.OIDCSubject == nil || *claim.OIDCIssuer != issuer || *claim.OIDCSubject != subject {
+		return nil, ErrAccountBindingChanged
+	}
+	var user User
+	if err := DB.Unscoped().First(&user, claim.UserId).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrAccountBindingChanged
+		}
+		return nil, err
+	}
+	if user.DeletedAt.Valid || user.OidcId != key {
+		return nil, ErrAccountBindingChanged
+	}
+	return &user, nil
 }
 
 func ReleaseExternalIdentityWithTx(tx *gorm.DB, provider string, userId int) error {

@@ -202,7 +202,6 @@ func UpdateUserSetting(userId int, setting dto.UserSetting) error {
 var userBindColumns = map[string]bool{
 	"github_id":   true,
 	"discord_id":  true,
-	"oidc_id":     true,
 	"linux_do_id": true,
 	"wechat_id":   true,
 }
@@ -928,8 +927,8 @@ func (user *User) ClearBinding(bindingType string) error {
 		if err := tx.Model(&User{}).Where("id = ?", user.Id).Update(column, "").Error; err != nil {
 			return err
 		}
-		if bindingType == ExternalIdentityProviderTelegram {
-			return ReleaseExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.Id)
+		if bindingType == ExternalIdentityProviderTelegram || bindingType == ExternalIdentityProviderOIDC {
+			return ReleaseExternalIdentityWithTx(tx, bindingType, user.Id)
 		}
 		return nil
 	}); err != nil {

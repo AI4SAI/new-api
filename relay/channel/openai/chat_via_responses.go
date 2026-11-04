@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/logger"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
@@ -187,6 +188,7 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		return nil, types.NewOpenAIError(err, types.ErrorCodeBadResponse, http.StatusInternalServerError)
 	}
 	streamErr := (*types.NewAPIError)(nil)
+	var confirmedUsage *dto.Usage
 	// upstreamFailed records a response.failed / response.error event and
 	// failedUsage the usage it reported, if any.
 	upstreamFailed := false
@@ -278,6 +280,14 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 
 		if streamResp.Response != nil {
 			info.ObserveResponseModel(streamResp.Response.Model)
+			if info.RequireConfirmedStreamUsage {
+				switch streamResp.Type {
+				case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
+					if service.ConfirmedOpenAIStreamUsage([]byte(data), streamResp.Response.Usage, true) {
+						confirmedUsage = streamResp.Response.Usage
+					}
+				}
+			}
 		}
 		if streamResp.Type == "response.error" || streamResp.Type == "response.failed" {
 			upstreamFailed = true
@@ -307,6 +317,9 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 			}
 		}
 	})
+	if info.RequireConfirmedStreamUsage && confirmedUsage == nil {
+		common.SetContextKey(c, constant.ContextKeyLocalCountTokens, true)
+	}
 
 	if streamErr != nil {
 		if !upstreamFailed || state.UsageText() == "" {
@@ -317,12 +330,15 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 		// estimate) and send the client the same error the failed request
 		// path writes. stream_status already records the failure.
 		usage := relayconvert.UsageFromResponsesUsage(failedUsage)
-		if usage.TotalTokens == 0 {
+		if confirmedUsage != nil {
+			usage = relayconvert.UsageFromResponsesUsage(confirmedUsage)
+		}
+		if usage.TotalTokens == 0 && confirmedUsage == nil {
 			usage = state.Usage()
 		}
-		if usage == nil || usage.TotalTokens == 0 {
+		if confirmedUsage == nil && (usage == nil || usage.TotalTokens == 0) {
 			usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
-		} else if usage.CompletionTokens == 0 || usage.PromptTokens == 0 {
+		} else if confirmedUsage == nil && (usage.CompletionTokens == 0 || usage.PromptTokens == 0) {
 			// As in the native Responses accumulator, reported usage that
 			// omits the output or the prompt is completed from the estimate of
 			// the delivered output and the prompt.
@@ -349,7 +365,11 @@ func OaiResponsesToChatStreamHandler(c *gin.Context, info *relaycommon.RelayInfo
 	}
 
 	usage := state.Usage()
-	if usage == nil || usage.TotalTokens == 0 {
+	if confirmedUsage != nil {
+		usage = relayconvert.UsageFromResponsesUsage(confirmedUsage)
+		state.SetUsage(usage)
+	}
+	if confirmedUsage == nil && (usage == nil || usage.TotalTokens == 0) {
 		usage = service.ResponseText2Usage(c, state.UsageText(), info.UpstreamModelName, info.GetEstimatePromptTokens())
 		state.SetUsage(usage)
 	}

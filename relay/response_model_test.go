@@ -241,7 +241,8 @@ func TestResponseModelSharedResponsesAccumulator(t *testing.T) {
 	// WebSocket turns and HTTP SSE use this same accumulator. A model-free
 	// terminal must not erase the model declared before an interrupted stream.
 	info := &relaycommon.RelayInfo{OriginModelName: "requested", ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "mapped"}}
-	accumulator := service.NewResponsesUsageAccumulator(info)
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	accumulator := service.NewResponsesUsageAccumulator(c, info)
 	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.created", Response: &dto.OpenAIResponsesResponse{Model: "returned"}}, nil)
 	accumulator.Observe(&dto.ResponsesStreamResponse{Type: "response.failed", Response: &dto.OpenAIResponsesResponse{Usage: &dto.Usage{InputTokens: 2, OutputTokens: 3}}}, nil)
 	assert.Equal(t, 5, accumulator.Finish().TotalTokens)

@@ -56,3 +56,13 @@ and other third-party components. Electron and Chromium third-party license
 notices must remain available with desktop installers and installed apps.
 
 ==== End of Notices ====
+
+==== SAI modifications, 2026-11-04 / 2026-11-05 ====
+
+This version preserves confirmed stream usage accounting and hardens the native
+OIDC authorization-code flow with PKCE, nonce and ID-token verification,
+browser-bound authorization transactions, and atomic identity ownership.
+Exact verified issuer/subject pairs are preserved beside their index keys;
+account linking requires recent authentication on both sides.
+Native account binding, session management, and administrator registration
+settings remain authoritative. Upstream New API attribution is unchanged.

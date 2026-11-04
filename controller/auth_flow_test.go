@@ -5,18 +5,22 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/oauth"
 	"github.com/QuantumNous/new-api/service"
@@ -24,9 +28,12 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/go-jose/go-jose/v4"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/pquerna/otp/totp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 	"gorm.io/gorm"
 )
 
@@ -1122,4 +1129,281 @@ func TestOAuthBindIgnoresLegacyGitHubUsernames(t *testing.T) {
 			assert.Equal(t, "This GitHub account has already been bound", result.Message)
 		})
 	}
+}
+
+func TestOIDCFlowRequiresTheBrowserThatStartedIt(t *testing.T) {
+	setupAuthFlowControllerTest(t)
+	previous := oauth.GetProvider("oidc")
+	provider := &authFlowTestOAuthProvider{exchangeErr: errors.New("provider unavailable")}
+	oauth.Register("oidc", provider)
+	t.Cleanup(func() { oauth.Register("oidc", previous) })
+	proof := strings.Repeat("p", 43)
+	payload, err := common.Marshal(oauthFlowPayload{OIDCPKCEVerifier: strings.Repeat("v", 43),
+		OIDCNonce: strings.Repeat("n", 43), OIDCBrowserHash: fmt.Sprintf("%x", sha256.Sum256([]byte(proof))),
+		OIDCClientID: "test-client", OIDCIssuer: "https://identity.example.test"})
+	require.NoError(t, err)
+	state, _, err := model.CreateAuthFlow(model.AuthFlowCreate{Purpose: model.AuthFlowPurposeOAuth,
+		Provider: "oidc", Intent: model.AuthFlowIntentLogin, Payload: string(payload), ExpiresAt: time.Now().Add(time.Minute)})
+	require.NoError(t, err)
+	router := gin.New()
+	router.GET("/api/oauth/:provider", HandleOAuth)
+	for _, cookie := range []string{"", "another-browser", proof} {
+		request := httptest.NewRequest("GET", "/api/oauth/oidc?state="+state+"&code=code", nil)
+		if cookie != "" {
+			request.AddCookie(&http.Cookie{Name: oidcBrowserCookieName(state), Value: cookie})
+		}
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, request)
+		if cookie != proof {
+			assert.Equal(t, http.StatusForbidden, response.Code)
+			assert.Zero(t, provider.exchangeCalls)
+		}
+	}
+	assert.Equal(t, 1, provider.exchangeCalls)
+}
+
+// Exercise the native state, step-up binding, login, session and logout handlers
+// over HTTPS against a signed local OIDC issuer. No provider method is mocked.
+func TestOIDCNativeAccountJourney(t *testing.T) {
+	user, _ := setupSecurityEnrollmentTest(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.Token{}, &model.ExternalIdentityClaim{}))
+	previousSettings := *system_setting.GetOIDCSettings()
+	previousAddress, previousRegister, previousSecure := system_setting.ServerAddress, common.RegisterEnabled, common.SessionCookieSecure
+	common.RegisterEnabled, common.SessionCookieSecure = false, true
+	t.Cleanup(func() {
+		*system_setting.GetOIDCSettings() = previousSettings
+		system_setting.ServerAddress, common.RegisterEnabled, common.SessionCookieSecure = previousAddress, previousRegister, previousSecure
+	})
+	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 12345, "used_quota": 678, "email": "same@example.test"}).Error)
+	apiToken := model.Token{UserId: user.Id, Key: strings.Repeat("k", 48), Name: "existing key", Status: common.TokenStatusEnabled, RemainQuota: 345, UsedQuota: 67}
+	require.NoError(t, model.DB.Create(&apiToken).Error)
+	native, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "oidc-binding-test")
+	require.NoError(t, err)
+	identity, err := service.ParseAccessToken(native.AccessToken)
+	require.NoError(t, err)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	grants := map[string]url.Values{}
+	var grantsMu sync.Mutex
+	var issuer string
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var payload any
+		switch r.URL.Path {
+		case "/.well-known/openid-configuration":
+			payload = map[string]any{"issuer": issuer, "authorization_endpoint": issuer + "/authorize", "token_endpoint": issuer + "/token", "jwks_uri": issuer + "/jwks", "userinfo_endpoint": issuer + "/userinfo", "id_token_signing_alg_values_supported": []string{"RS256"}, "code_challenge_methods_supported": []string{"S256"}, "token_endpoint_auth_methods_supported": []string{"client_secret_basic"}}
+		case "/jwks":
+			payload = jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "native-test", Algorithm: "RS256", Use: "sig"}}}
+		case "/token":
+			if r.ParseForm() != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			grantsMu.Lock()
+			grant, ok := grants[r.Form.Get("code")]
+			delete(grants, r.Form.Get("code"))
+			grantsMu.Unlock()
+			id, secret, authenticated := r.BasicAuth()
+			if !ok || !authenticated || id != "personal-client" || secret != "fixture-secret" || r.Form.Get("redirect_uri") != system_setting.ServerAddress+"/oauth/oidc" || oauth2.S256ChallengeFromVerifier(r.Form.Get("code_verifier")) != grant.Get("code_challenge") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			token := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{"iss": issuer, "sub": "person", "aud": "personal-client", "nonce": grant.Get("nonce"), "iat": time.Now().Unix(), "auth_time": time.Now().Unix(), "exp": time.Now().Add(time.Minute).Unix()})
+			token.Header["kid"] = "native-test"
+			signed, signErr := token.SignedString(key)
+			if !assert.NoError(t, signErr) {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			payload = map[string]any{"access_token": "fixture-access", "token_type": "Bearer", "id_token": signed}
+		case "/userinfo":
+			if r.Header.Get("Authorization") != "Bearer fixture-access" {
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			payload = map[string]any{"sub": "person", "preferred_username": user.Username, "email": "same@example.test", "name": "Federated name"}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		encoded, marshalErr := common.Marshal(payload)
+		if assert.NoError(t, marshalErr) {
+			_, _ = w.Write(encoded)
+		}
+	}))
+	t.Cleanup(provider.Close)
+	issuer = provider.URL
+	*system_setting.GetOIDCSettings() = system_setting.OIDCSettings{Enabled: true, ClientId: "personal-client", ClientSecret: "fixture-secret", WellKnown: issuer + "/.well-known/openid-configuration"}
+	router := gin.New()
+	router.POST("/api/oauth/state", middleware.TryUserAuth(), GenerateOAuthCode)
+	router.GET("/api/oauth/:provider", middleware.TryUserAuth(), HandleOAuth)
+	router.GET("/api/user/self", middleware.UserAuth(), GetSelf)
+	router.POST("/api/user/auth/logout", middleware.SessionCookieOriginGuard(), AuthLogout)
+	gateway := httptest.NewTLSServer(router)
+	t.Cleanup(gateway.Close)
+	system_setting.ServerAddress = gateway.URL
+	client := gateway.Client()
+	client.Jar, err = cookiejar.New(nil)
+	require.NoError(t, err)
+	request := func(method, path, body, access, proof string) (*http.Response, securityEnrollmentResponse) {
+		t.Helper()
+		req, requestErr := http.NewRequest(method, gateway.URL+path, strings.NewReader(body))
+		require.NoError(t, requestErr)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", gateway.URL)
+		if access != "" {
+			req.Header.Set("Authorization", "Bearer "+access)
+		}
+		if proof != "" {
+			req.Header.Set("X-Security-Proof", proof)
+		}
+		response, requestErr := client.Do(req)
+		require.NoError(t, requestErr)
+		defer response.Body.Close()
+		var result securityEnrollmentResponse
+		require.NoError(t, common.DecodeJson(response.Body, &result))
+		return response, result
+	}
+	start := func(intent, access, proof string) (string, string) {
+		t.Helper()
+		response, result := request("POST", "/api/oauth/state", `{"provider":"oidc","intent":"`+intent+`"}`, access, proof)
+		require.True(t, result.Success, result.Message)
+		var auth struct {
+			State string `json:"flow_token"`
+			URL   string `json:"authorization_url"`
+		}
+		require.NoError(t, common.Unmarshal(result.Data, &auth))
+		target, parseErr := url.Parse(auth.URL)
+		require.NoError(t, parseErr)
+		assert.Equal(t, "S256", target.Query().Get("code_challenge_method"))
+		assert.NotEmpty(t, target.Query().Get("nonce"))
+		assert.Empty(t, target.Query().Get("code_verifier"))
+		if intent == "bind" {
+			assert.Equal(t, "0", target.Query().Get("max_age"))
+			assert.Equal(t, "login", target.Query().Get("prompt"))
+		} else {
+			assert.Empty(t, target.Query().Get("max_age"))
+			assert.Empty(t, target.Query().Get("prompt"))
+		}
+		assert.NotContains(t, auth.URL, "fixture-secret")
+		var proofCookie *http.Cookie
+		for _, cookie := range response.Cookies() {
+			if strings.HasPrefix(cookie.Name, "__Host-newapi_oidc_") {
+				proofCookie = cookie
+			}
+		}
+		require.NotNil(t, proofCookie)
+		assert.True(t, proofCookie.HttpOnly && proofCookie.Secure)
+		assert.Equal(t, http.SameSiteLaxMode, proofCookie.SameSite)
+		assert.Equal(t, "/", proofCookie.Path)
+		assert.Empty(t, proofCookie.Domain)
+		code := "code-" + auth.State
+		grantsMu.Lock()
+		grants[code] = target.Query()
+		grantsMu.Unlock()
+		return auth.State, "/api/oauth/oidc?" + url.Values{"state": {auth.State}, "code": {code}}.Encode()
+	}
+	t.Run("unbound same-email person is not imported when registration is closed", func(t *testing.T) {
+		_, callback := start("login", "", "")
+		_, result := request("GET", callback, "", "", "")
+		assert.False(t, result.Success)
+		assert.Contains(t, result.Message, "registration has been disabled")
+		var users int64
+		require.NoError(t, model.DB.Model(&model.User{}).Count(&users).Error)
+		assert.EqualValues(t, 1, users)
+	})
+	t.Run("binding requires native security proof and the original session", func(t *testing.T) {
+		response, result := request("POST", "/api/oauth/state", `{"provider":"oidc","intent":"bind"}`, native.AccessToken, "")
+		assert.Equal(t, http.StatusForbidden, response.StatusCode)
+		assert.False(t, result.Success)
+		proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: []byte(`{"provider":"oidc"}`)}, service.VerificationMethodPassword)
+		_, callback := start("bind", native.AccessToken, proof)
+		other, sessionErr := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "other-browser")
+		require.NoError(t, sessionErr)
+		response, result = request("GET", callback, "", other.AccessToken, "")
+		assert.Equal(t, http.StatusForbidden, response.StatusCode)
+		assert.False(t, result.Success)
+		_, result = request("GET", callback, "", native.AccessToken, "")
+		require.True(t, result.Success, result.Message)
+		var stored model.User
+		require.NoError(t, model.DB.First(&stored, user.Id).Error)
+		assert.Equal(t, model.OIDCIdentityKey(issuer, "person"), stored.OidcId)
+		assert.Equal(t, user.Username, stored.Username)
+		assert.Equal(t, 12345, stored.Quota)
+		assert.Equal(t, 678, stored.UsedQuota)
+		var preserved model.Token
+		require.NoError(t, model.DB.First(&preserved, apiToken.Id).Error)
+		assert.Equal(t, apiToken, preserved)
+	})
+	t.Run("expired flow is rejected and a fresh flow recovers", func(t *testing.T) {
+		state, callback := start("login", "", "")
+		flow, flowErr := model.GetAuthFlow(state, model.AuthFlowMatch{Purpose: model.AuthFlowPurposeOAuth})
+		require.NoError(t, flowErr)
+		require.NoError(t, model.DB.Model(flow).Update("expires_at", time.Now().Add(-time.Minute)).Error)
+		response, result := request("GET", callback, "", "", "")
+		assert.Equal(t, http.StatusForbidden, response.StatusCode)
+		assert.False(t, result.Success)
+		_, callback = start("login", "", "")
+		_, result = request("GET", callback, "", "", "")
+		require.True(t, result.Success, result.Message)
+		var login struct {
+			service.AuthBundle
+			User struct {
+				ID int `json:"id"`
+			} `json:"user"`
+		}
+		require.NoError(t, common.Unmarshal(result.Data, &login))
+		assert.Equal(t, "oauth:oidc", login.Session.LoginMethod)
+		assert.Equal(t, user.Id, login.User.ID)
+		_, result = request("GET", "/api/user/self", "", login.AccessToken, "")
+		require.True(t, result.Success, result.Message)
+		response, result = request("GET", callback, "", "", "")
+		assert.Equal(t, http.StatusForbidden, response.StatusCode)
+		assert.False(t, result.Success)
+		_, result = request("POST", "/api/user/auth/logout", "{}", login.AccessToken, "")
+		require.True(t, result.Success, result.Message)
+		response, result = request("GET", "/api/user/self", "", login.AccessToken, "")
+		assert.Equal(t, http.StatusUnauthorized, response.StatusCode)
+		assert.False(t, result.Success)
+	})
+
+	t.Run("enabled registration uses one claim and repeat login keeps its owner", func(t *testing.T) {
+		common.RegisterEnabled = true
+		defer func() { common.RegisterEnabled = false }()
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		var registrations sync.WaitGroup
+		for i := range 2 {
+			registrations.Go(func() {
+				<-start
+				c, _ := gin.CreateTestContext(httptest.NewRecorder())
+				c.Request = httptest.NewRequest("GET", "/api/oauth/oidc", nil)
+				external := &oauth.OAuthUser{OIDCIssuer: issuer, OIDCSubject: "registered", ProviderUserID: model.OIDCIdentityKey(issuer, "registered"), Username: fmt.Sprintf("oidc-register-%d", i)}
+				_, _, err := findOrCreateOAuthUser(c, &oauth.OIDCProvider{}, external, &oauth.OAuthToken{}, "")
+				results <- err
+			})
+		}
+		close(start)
+		registrations.Wait()
+		close(results)
+		accepted := 0
+		for err := range results {
+			if err == nil {
+				accepted++
+			} else {
+				require.ErrorIs(t, err, model.ErrExternalIdentityAlreadyClaimed)
+			}
+		}
+		require.GreaterOrEqual(t, accepted, 1)
+		var count int64
+		require.NoError(t, model.DB.Model(&model.User{}).Where("username LIKE ?", "oidc-register-%").Count(&count).Error)
+		require.EqualValues(t, 1, count)
+		owner, err := model.GetUserByOIDCIdentity(issuer, "registered")
+		require.NoError(t, err)
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest("GET", "/api/oauth/oidc", nil)
+		repeated, _, err := findOrCreateOAuthUser(c, &oauth.OIDCProvider{}, &oauth.OAuthUser{OIDCIssuer: issuer, OIDCSubject: "registered", ProviderUserID: model.OIDCIdentityKey(issuer, "registered")}, &oauth.OAuthToken{}, "")
+		require.NoError(t, err)
+		assert.Equal(t, owner.Id, repeated.Id)
+	})
 }

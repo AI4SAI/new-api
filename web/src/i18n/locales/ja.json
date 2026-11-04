@@ -7319,5 +7319,6 @@
     "Zhipu GLM": "Zhipu GLM",
     "Zhipu V4": "Zhipu V 4",
     "Zoom": "ズーム"
-  }
+  },
+  "Token usage was not confirmed; no token charge was applied": "トークン使用量が確認できなかったため、トークン料金は請求されませんでした"
 }
