@@ -191,7 +191,9 @@ func GenerateOAuthCode(c *gin.Context) {
 		query := authorize.Query()
 		query.Set("client_id", flowPayload.OIDCClientID)
 		query.Set("nonce", flowPayload.OIDCNonce)
-		if flowPayload.OIDCAuthAfter != 0 {
+		if request.Intent == model.AuthFlowIntentBind {
+			query.Set("max_age", strconv.FormatInt(oauth.OIDCBindingMaxAgeSeconds, 10))
+		} else if flowPayload.OIDCAuthAfter != 0 {
 			query.Set("max_age", "0")
 			query.Set("prompt", "login")
 		}
@@ -329,6 +331,7 @@ func HandleOAuth(c *gin.Context) {
 		c.Set("oidc_client_id", payload.OIDCClientID)
 		c.Set("oidc_issuer", payload.OIDCIssuer)
 		c.Set("oidc_auth_after", payload.OIDCAuthAfter)
+		c.Set("oidc_binding", pendingFlow.Intent == model.AuthFlowIntentBind)
 	}
 
 	// 4. Handle error from provider

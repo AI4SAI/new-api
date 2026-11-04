@@ -22,6 +22,9 @@ func init() {
 	Register("oidc", &OIDCProvider{})
 }
 
+// OIDCBindingMaxAgeSeconds keeps account linking within a recent IdP login.
+const OIDCBindingMaxAgeSeconds int64 = 300
+
 // OIDCProvider implements OAuth for OIDC
 type OIDCProvider struct{}
 
@@ -128,7 +131,11 @@ func (p *OIDCProvider) ExchangeToken(ctx context.Context, code string, c *gin.Co
 		(len(verified.Audience) > 1 && claims.AuthorizedParty != clientID) {
 		return nil, errors.New("OIDC audience differs")
 	}
-	if after := c.GetInt64("oidc_auth_after"); after != 0 && (claims.AuthTime < after-30 || claims.AuthTime > time.Now().Unix()+60) {
+	after := c.GetInt64("oidc_auth_after")
+	if c.GetBool("oidc_binding") {
+		after = time.Now().Unix() - OIDCBindingMaxAgeSeconds
+	}
+	if after != 0 && (claims.AuthTime < after-30 || claims.AuthTime > time.Now().Unix()+60) {
 		return nil, errors.New("OIDC recent authentication is required")
 	}
 	if verified.AccessTokenHash != "" && verified.VerifyAccessToken(token.AccessToken) != nil {

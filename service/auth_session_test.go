@@ -10,6 +10,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/system_setting"
 	"github.com/alicebob/miniredis/v2"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
@@ -441,4 +442,179 @@ func TestUserAuthVersionInvalidatesExistingSession(t *testing.T) {
 	assert.ErrorIs(t, err, ErrLoginSessionRevoked)
 	_, err = CreateLoginSessionAtAuthVersion(user.Id, identity.UserAuthVersion, "2fa", "127.0.0.1", "test-agent")
 	assert.ErrorIs(t, err, ErrLoginSessionRevoked, "a pending 2FA flow must not survive an auth-version change")
+}
+
+func TestRecentBindingSessionProofPreservesPolicyAndSingleUse(t *testing.T) {
+	for _, scenario := range []string{"password", "passkey", "expired", "future", "oauth", "unknown", "2fa-policy", "passkey-policy", "password-disabled", "passkey-disabled", "wrong-auth-version", "wrong-session-version", "revoked", "pat"} {
+		t.Run(scenario, func(t *testing.T) {
+			useTestSessionSecret(t)
+			user := setupAuthSessionTestDB(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
+			passwordEnabled := common.PasswordLoginEnabled
+			passkeySettings := *system_setting.GetPasskeySettings()
+			common.PasswordLoginEnabled = true
+			system_setting.GetPasskeySettings().Enabled = true
+			t.Cleanup(func() {
+				common.PasswordLoginEnabled = passwordEnabled
+				*system_setting.GetPasskeySettings() = passkeySettings
+			})
+			method := "password"
+			if scenario == "passkey" || scenario == "passkey-disabled" {
+				method = "passkey"
+			}
+			if scenario == "oauth" {
+				method = "oauth:oidc"
+			}
+			if scenario == "unknown" {
+				method = "unknown"
+			}
+			if method == "passkey" || scenario == "passkey-policy" {
+				require.NoError(t, model.DB.Create(&model.PasskeyCredential{UserID: user.Id, CredentialID: "binding-passkey", PublicKey: "native-fixture"}).Error)
+			}
+			if scenario == "2fa-policy" {
+				require.NoError(t, model.DB.Create(&model.TwoFA{UserId: user.Id, Secret: "JBSWY3DPEHPK3PXP", IsEnabled: true}).Error)
+			}
+			bundle, err := CreateLoginSession(user.Id, method, "127.0.0.1", "binding-test")
+			require.NoError(t, err)
+			identity, err := ParseAccessToken(bundle.AccessToken)
+			require.NoError(t, err)
+			switch scenario {
+			case "expired":
+				require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("created_at", time.Now().Add(-301*time.Second).Unix()).Error)
+			case "future":
+				require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("created_at", time.Now().Add(time.Minute).Unix()).Error)
+			case "password-disabled":
+				common.PasswordLoginEnabled = false
+			case "passkey-disabled":
+				system_setting.GetPasskeySettings().Enabled = false
+			case "wrong-auth-version":
+				identity.UserAuthVersion++
+			case "wrong-session-version":
+				identity.SessionVersion++
+			case "revoked":
+				_, err := model.RevokeUserSession(user.Id, identity.SessionID, "test")
+				require.NoError(t, err)
+			case "pat":
+				pat := &model.UserAccessToken{Name: "binding-scoped-pat", TokenHash: model.AccessTokenFingerprint("nap_binding-test")}
+				require.NoError(t, pat.SetScopes([]string{"account_security:write"}))
+				require.NoError(t, model.CreateUserAccessToken(user.Id, pat, AccessTokenMaxPerUser))
+				identity.SessionID = model.AccessTokenSessionID(pat.Id)
+				identity.SessionVersion = model.AccessTokenSessionVersion
+				require.NoError(t, model.ValidateAccessTokenIdentity(identity))
+			}
+			eligible := scenario == "password" || scenario == "passkey"
+			requirements, requirementsErr := GetVerificationRequirements(identity, VerificationScopeAccountBind)
+			if requirementsErr == nil {
+				assert.Equal(t, eligible, requirements.RecentSession)
+			} else {
+				require.False(t, eligible)
+			}
+			input := VerificationInput{Method: VerificationMethodSession, Scope: VerificationScopeAccountBind, Context: []byte(`{"provider":"oidc"}`)}
+			proof, err := VerifySecurityInput(identity, input)
+			if !eligible {
+				require.Error(t, err)
+				require.Nil(t, proof)
+				var count int64
+				require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Count(&count).Error)
+				assert.Zero(t, count)
+				return
+			}
+			require.NoError(t, err)
+			require.NotNil(t, proof)
+			assert.Equal(t, method, proof.Method)
+			assert.Equal(t, input.Scope, proof.Scope)
+			assert.InDelta(t, time.Now().Unix()+60, proof.ExpiresAt, 1)
+			operation := VerificationOperation{Scope: input.Scope, Context: input.Context}
+			_, err = ConsumeOperationProof(proof.ProofToken, identity, VerificationOperation{Scope: input.Scope, Context: []byte(`{"provider":"github"}`)})
+			require.Error(t, err)
+			otherBundle, err := CreateLoginSession(user.Id, method, "127.0.0.2", "another-browser")
+			require.NoError(t, err)
+			other, err := ParseAccessToken(otherBundle.AccessToken)
+			require.NoError(t, err)
+			_, err = ConsumeOperationProof(proof.ProofToken, other, operation)
+			require.Error(t, err)
+			_, err = ConsumeOperationProof(proof.ProofToken, identity, operation)
+			require.NoError(t, err)
+			_, err = ConsumeOperationProof(proof.ProofToken, identity, operation)
+			require.ErrorIs(t, err, ErrProofConsumed)
+			next, err := VerifySecurityInput(identity, input)
+			require.NoError(t, err)
+			assert.NotEqual(t, proof.ProofToken, next.ProofToken)
+			_, err = VerifySecurityInput(identity, VerificationInput{Method: VerificationMethodSession, Scope: VerificationScopePasskeyRegister})
+			require.ErrorIs(t, err, ErrProofMethod)
+		})
+	}
+}
+
+func TestRecentBindingSessionAgeBoundaryAndRefresh(t *testing.T) {
+	useTestSessionSecret(t)
+	user := setupAuthSessionTestDB(t)
+	require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
+	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "binding-age")
+	require.NoError(t, err)
+	identity, err := ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+	created := bundle.Session.CreatedAt
+	for _, test := range []struct {
+		age     int64
+		allowed bool
+	}{{-1, false}, {0, true}, {299, true}, {300, true}, {301, false}} {
+		t.Run(fmt.Sprint(test.age), func(t *testing.T) {
+			method, err := recentBindingSessionMethod(identity, created+test.age)
+			if test.allowed {
+				require.NoError(t, err)
+				assert.Equal(t, "password", method)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+	oldCreated := time.Now().Add(-10 * time.Minute).Unix()
+	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("created_at", oldCreated).Error)
+	refreshed, _, err := RefreshLoginSession(bundle.RefreshToken, bundle.Session.SID, "127.0.0.2", "refreshed-browser")
+	require.NoError(t, err)
+	assert.Equal(t, oldCreated, refreshed.Session.CreatedAt)
+	assert.Greater(t, refreshed.Session.LastActiveAt, oldCreated)
+	current, err := ParseAccessToken(refreshed.AccessToken)
+	require.NoError(t, err)
+	_, err = VerifySecurityInput(current, VerificationInput{Method: VerificationMethodSession, Scope: VerificationScopeAccountBind, Context: []byte(`{"provider":"oidc"}`)})
+	require.Error(t, err)
+}
+
+func TestRecentBindingSessionRechecksAgeAndNewFactorBeforeIssuingProof(t *testing.T) {
+	for _, change := range []string{"age crossed five minutes", "MFA enrolled"} {
+		t.Run(change, func(t *testing.T) {
+			useTestSessionSecret(t)
+			user := setupAuthSessionTestDB(t)
+			require.NoError(t, model.DB.AutoMigrate(&model.TwoFA{}, &model.PasskeyCredential{}, &model.UserOAuthBinding{}))
+			enabled := common.PasswordLoginEnabled
+			common.PasswordLoginEnabled = true
+			t.Cleanup(func() { common.PasswordLoginEnabled = enabled })
+			bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "binding-race")
+			require.NoError(t, err)
+			identity, err := ParseAccessToken(bundle.AccessToken)
+			require.NoError(t, err)
+			before, err := GetVerificationRequirements(identity, VerificationScopeAccountBind)
+			require.NoError(t, err)
+			require.True(t, before.RecentSession)
+			if change == "age crossed five minutes" {
+				require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", identity.SessionID).Update("created_at", time.Now().Add(-301*time.Second).Unix()).Error)
+			} else {
+				require.NoError(t, model.DB.Create(&model.TwoFA{UserId: user.Id, Secret: "JBSWY3DPEHPK3PXP", IsEnabled: true}).Error)
+				advanced, err := AdvanceCurrentSessionSecurity(identity, "mfa_enabled")
+				require.NoError(t, err)
+				identity, err = ParseAccessToken(advanced.AccessToken)
+				require.NoError(t, err)
+			}
+			proof, err := VerifySecurityInput(identity, VerificationInput{Method: VerificationMethodSession, Scope: VerificationScopeAccountBind, Context: []byte(`{"provider":"oidc"}`)})
+			require.ErrorIs(t, err, ErrProofMethod)
+			assert.Nil(t, proof)
+			after, err := GetVerificationRequirements(identity, VerificationScopeAccountBind)
+			require.NoError(t, err)
+			assert.False(t, after.RecentSession)
+			var count int64
+			require.NoError(t, model.DB.Model(&model.AuthFlow{}).Where("purpose = ?", model.AuthFlowPurposeSecurityProof).Count(&count).Error)
+			assert.Zero(t, count)
+		})
+	}
 }

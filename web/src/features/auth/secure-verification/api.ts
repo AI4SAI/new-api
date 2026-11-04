@@ -260,10 +260,14 @@ export async function verify(
         break
     }
     signal.throwIfAborted()
+    const matchesMethod =
+      input.method === 'session' && operation.scope === 'account.binding.bind'
+        ? proof.method === 'password' || proof.method === 'passkey'
+        : proof.method === input.method
     if (
       !proof.proof_token ||
       proof.scope !== operation.scope ||
-      proof.method !== input.method ||
+      !matchesMethod ||
       proof.expires_at * 1000 <= Date.now()
     ) {
       throw new AuthOperationError('Verification proof was not returned')

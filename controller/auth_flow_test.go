@@ -1170,6 +1170,9 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 	previousSettings := *system_setting.GetOIDCSettings()
 	previousAddress, previousRegister, previousSecure := system_setting.ServerAddress, common.RegisterEnabled, common.SessionCookieSecure
 	common.RegisterEnabled, common.SessionCookieSecure = false, true
+	previousPasswordLogin := common.PasswordLoginEnabled
+	common.PasswordLoginEnabled = true
+	t.Cleanup(func() { common.PasswordLoginEnabled = previousPasswordLogin })
 	t.Cleanup(func() {
 		*system_setting.GetOIDCSettings() = previousSettings
 		system_setting.ServerAddress, common.RegisterEnabled, common.SessionCookieSecure = previousAddress, previousRegister, previousSecure
@@ -1177,10 +1180,6 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 	require.NoError(t, model.DB.Model(user).Updates(map[string]any{"quota": 12345, "used_quota": 678, "email": "same@example.test"}).Error)
 	apiToken := model.Token{UserId: user.Id, Key: strings.Repeat("k", 48), Name: "existing key", Status: common.TokenStatusEnabled, RemainQuota: 345, UsedQuota: 67}
 	require.NoError(t, model.DB.Create(&apiToken).Error)
-	native, err := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "oidc-binding-test")
-	require.NoError(t, err)
-	identity, err := service.ParseAccessToken(native.AccessToken)
-	require.NoError(t, err)
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	require.NoError(t, err)
 	grants := map[string]url.Values{}
@@ -1235,6 +1234,9 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 	issuer = provider.URL
 	*system_setting.GetOIDCSettings() = system_setting.OIDCSettings{Enabled: true, ClientId: "personal-client", ClientSecret: "fixture-secret", WellKnown: issuer + "/.well-known/openid-configuration"}
 	router := gin.New()
+	router.POST("/api/user/login", Login)
+	router.GET("/api/verify/methods", middleware.UserAuth(), GetVerificationMethods)
+	router.POST("/api/verify", middleware.UserAuth(), UniversalVerify)
 	router.POST("/api/oauth/state", middleware.TryUserAuth(), GenerateOAuthCode)
 	router.GET("/api/oauth/:provider", middleware.TryUserAuth(), HandleOAuth)
 	router.GET("/api/user/self", middleware.UserAuth(), GetSelf)
@@ -1264,6 +1266,11 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 		require.NoError(t, common.DecodeJson(response.Body, &result))
 		return response, result
 	}
+	_, signedIn := request("POST", "/api/user/login", `{"username":"enrollment-user","password":"enrollment-password"}`, "", "")
+	require.True(t, signedIn.Success, signedIn.Message)
+	var native service.AuthBundle
+	require.NoError(t, common.Unmarshal(signedIn.Data, &native))
+	require.Equal(t, "password", native.Session.LoginMethod)
 	start := func(intent, access, proof string) (string, string) {
 		t.Helper()
 		response, result := request("POST", "/api/oauth/state", `{"provider":"oidc","intent":"`+intent+`"}`, access, proof)
@@ -1279,8 +1286,8 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 		assert.NotEmpty(t, target.Query().Get("nonce"))
 		assert.Empty(t, target.Query().Get("code_verifier"))
 		if intent == "bind" {
-			assert.Equal(t, "0", target.Query().Get("max_age"))
-			assert.Equal(t, "login", target.Query().Get("prompt"))
+			assert.Equal(t, "300", target.Query().Get("max_age"))
+			assert.Empty(t, target.Query().Get("prompt"))
 		} else {
 			assert.Empty(t, target.Query().Get("max_age"))
 			assert.Empty(t, target.Query().Get("prompt"))
@@ -1316,8 +1323,17 @@ func TestOIDCNativeAccountJourney(t *testing.T) {
 		response, result := request("POST", "/api/oauth/state", `{"provider":"oidc","intent":"bind"}`, native.AccessToken, "")
 		assert.Equal(t, http.StatusForbidden, response.StatusCode)
 		assert.False(t, result.Success)
-		proof := issueSecurityEnrollmentProof(t, identity, service.VerificationOperation{Scope: service.VerificationScopeAccountBind, Context: []byte(`{"provider":"oidc"}`)}, service.VerificationMethodPassword)
-		_, callback := start("bind", native.AccessToken, proof)
+		_, methods := request("GET", "/api/verify/methods?scope=account.binding.bind", "", native.AccessToken, "")
+		require.True(t, methods.Success, methods.Message)
+		var requirements service.VerificationRequirements
+		require.NoError(t, common.Unmarshal(methods.Data, &requirements))
+		require.True(t, requirements.RecentSession)
+		_, verified := request("POST", "/api/verify", `{"method":"session","scope":"account.binding.bind","context":{"provider":"oidc"}}`, native.AccessToken, "")
+		require.True(t, verified.Success, verified.Message)
+		var proof service.SecurityProof
+		require.NoError(t, common.Unmarshal(verified.Data, &proof))
+		require.Equal(t, "password", proof.Method)
+		_, callback := start("bind", native.AccessToken, proof.ProofToken)
 		other, sessionErr := service.CreateLoginSession(user.Id, "password", "127.0.0.1", "other-browser")
 		require.NoError(t, sessionErr)
 		response, result = request("GET", callback, "", other.AccessToken, "")

@@ -569,3 +569,154 @@ it('verifies with the clicked provider when several linked accounts are availabl
     screen.getByRole('button', { name: 'Continue with Linux DO' })
   ).toBeDisabled()
 })
+
+const bindingOperation: RequestVerificationOptions = {
+  scope: 'account.binding.bind',
+  context: { provider: 'oidc' },
+}
+
+it.each(['password', 'passkey'] as const)(
+  'reuses a recent allowed %s login for one new binding proof without asking again',
+  async (method) => {
+    vi.spyOn(api, 'get').mockResolvedValue({
+      data: {
+        success: true,
+        data: {
+          ...passwordRequirements,
+          scope: 'account.binding.bind',
+          methods: [{ method, available: true }],
+          recent_session: true,
+        },
+      },
+    })
+    const proof: SecurityProof = {
+      proof_token: 'new-binding-proof',
+      scope: 'account.binding.bind',
+      method,
+      expires_at: Math.floor(Date.now() / 1000) + 60,
+    }
+    const post = vi
+      .spyOn(api, 'post')
+      .mockResolvedValue({ data: { success: true, data: proof } })
+    const result = vi.fn()
+    const user = userEvent.setup()
+    render(<Harness operation={bindingOperation} onResult={result} />)
+    await user.click(screen.getByRole('button', { name: 'Protected action' }))
+    await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(proof))
+    expect(post).toHaveBeenCalledExactlyOnceWith(
+      '/api/verify',
+      {
+        method: 'session',
+        scope: 'account.binding.bind',
+        context: { provider: 'oidc' },
+      },
+      expect.anything()
+    )
+    expect(
+      screen.queryByLabelText('Password', { selector: 'input' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  }
+)
+
+it('falls back once to the existing dialog when the recent binding session expires', async () => {
+  const requirements = {
+    ...passwordRequirements,
+    scope: 'account.binding.bind',
+    recent_session: true,
+  }
+  const get = vi
+    .spyOn(api, 'get')
+    .mockResolvedValue({ data: { success: true, data: requirements } })
+  const proof: SecurityProof = {
+    proof_token: 'manual-binding-proof',
+    scope: 'account.binding.bind',
+    method: 'password',
+    expires_at: Math.floor(Date.now() / 1000) + 60,
+  }
+  const post = vi
+    .spyOn(api, 'post')
+    .mockResolvedValueOnce({
+      data: {
+        success: false,
+        code: 'SECURITY_PROOF_METHOD_MISMATCH',
+        message: 'This verification method is not allowed for this action.',
+      },
+    })
+    .mockResolvedValue({ data: { success: true, data: proof } })
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(<Harness operation={bindingOperation} onResult={result} />)
+  await user.click(screen.getByRole('button', { name: 'Protected action' }))
+  const password = await screen.findByLabelText('Password', {
+    selector: 'input',
+  })
+  expect(get).toHaveBeenCalledTimes(2)
+  expect(post).toHaveBeenCalledTimes(1)
+  expect(result).not.toHaveBeenCalled()
+  await user.type(password, 'current-password')
+  await user.click(screen.getByRole('button', { name: 'Verify' }))
+  await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(proof))
+  expect(
+    post.mock.calls.map(([, data]) => (data as { method: string }).method)
+  ).toEqual(['session', 'password'])
+})
+
+it('does not extend the recent-session binding shortcut to other protected actions', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: { ...passwordRequirements, recent_session: true },
+    },
+  })
+  const post = vi.spyOn(api, 'post')
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(<Harness onResult={result} />)
+  await user.click(screen.getByRole('button', { name: 'Protected action' }))
+  expect(
+    await screen.findByLabelText('Password', { selector: 'input' })
+  ).toBeVisible()
+  expect(post).not.toHaveBeenCalled()
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(null))
+})
+
+it('discards a late recent-session binding proof after the user cancels', async () => {
+  vi.spyOn(api, 'get').mockResolvedValue({
+    data: {
+      success: true,
+      data: {
+        ...passwordRequirements,
+        scope: 'account.binding.bind',
+        recent_session: true,
+      },
+    },
+  })
+  const reply = pendingResponse<{
+    data: { success: boolean; data: SecurityProof }
+  }>()
+  const post = vi.spyOn(api, 'post').mockReturnValue(reply.promise)
+  const result = vi.fn()
+  const user = userEvent.setup()
+  render(<Harness operation={bindingOperation} onResult={result} />)
+  await user.click(screen.getByRole('button', { name: 'Protected action' }))
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1))
+  await user.click(screen.getByRole('button', { name: 'Cancel' }))
+  await act(async () => {
+    reply.resolve({
+      data: {
+        success: true,
+        data: {
+          proof_token: 'late',
+          method: 'password',
+          scope: 'account.binding.bind',
+          expires_at: Math.floor(Date.now() / 1000) + 60,
+        },
+      },
+    })
+    await reply.promise
+  })
+  await waitFor(() => expect(result).toHaveBeenCalledExactlyOnceWith(null))
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+})

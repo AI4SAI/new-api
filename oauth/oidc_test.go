@@ -75,8 +75,16 @@ func TestOIDCVerifiedCodeExchange(t *testing.T) {
 				claims["exp"] = time.Now().Add(-time.Hour).Unix()
 			case "fresh-auth":
 				claims["auth_time"] = time.Now().Unix()
-			case "old-auth":
+			case "old-auth", "binding-old":
 				claims["auth_time"] = time.Now().Add(-time.Hour).Unix()
+			case "binding-recent":
+				claims["auth_time"] = time.Now().Add(-4 * time.Minute).Unix()
+			case "binding-five-minutes":
+				claims["auth_time"] = time.Now().Add(-5 * time.Minute).Unix()
+			case "binding-too-old":
+				claims["auth_time"] = time.Now().Add(-331 * time.Second).Unix()
+			case "binding-future":
+				claims["auth_time"] = time.Now().Add(2 * time.Minute).Unix()
 			}
 			token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
 			token.Header["kid"] = "test"
@@ -104,7 +112,7 @@ func TestOIDCVerifiedCodeExchange(t *testing.T) {
 	defer server.Close()
 	issuer = server.URL
 	settings.WellKnown, settings.ClientId, settings.ClientSecret = issuer+"/.well-known/openid-configuration", clientID, "test-secret"
-	for _, name := range []string{"success", "nonce", "issuer", "audience", "azp", "expired", "signature", "missing-id-token", "userinfo", "fresh-auth", "old-auth", "missing-auth-time"} {
+	for _, name := range []string{"success", "nonce", "issuer", "audience", "azp", "expired", "signature", "missing-id-token", "userinfo", "fresh-auth", "old-auth", "missing-auth-time", "binding-recent", "binding-five-minutes", "binding-too-old", "binding-old", "binding-future", "binding-missing"} {
 		t.Run(name, func(t *testing.T) {
 			scenario = name
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
@@ -115,9 +123,13 @@ func TestOIDCVerifiedCodeExchange(t *testing.T) {
 			if name == "fresh-auth" || name == "old-auth" || name == "missing-auth-time" {
 				c.Set("oidc_auth_after", time.Now().Unix())
 			}
+			if strings.HasPrefix(name, "binding-") {
+				c.Set("oidc_binding", true)
+				c.Set("oidc_auth_after", time.Now().Add(-10*time.Minute).Unix())
+			}
 			provider := &OIDCProvider{}
 			token, err := provider.ExchangeToken(context.Background(), "one-time-code", c)
-			if name != "success" && name != "userinfo" && name != "fresh-auth" {
+			if name != "success" && name != "userinfo" && name != "fresh-auth" && name != "binding-recent" && name != "binding-five-minutes" {
 				require.Error(t, err)
 				return
 			}

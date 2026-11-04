@@ -114,6 +114,7 @@ export interface VerificationRequirements {
   methods: { method: VerificationMethod; available: boolean; reason?: string }[]
   oauth_providers: { slug: string; name: string }[]
   password_encryption_enabled: boolean
+  recent_session?: boolean
 }
 
 export type VerificationInput =

@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -306,6 +307,7 @@ type VerificationRequirements struct {
 	Methods                   []VerificationMethodOption  `json:"methods"`
 	OAuthProviders            []VerificationOAuthProvider `json:"oauth_providers"`
 	PasswordEncryptionEnabled bool                        `json:"password_encryption_enabled"`
+	RecentSession             bool                        `json:"recent_session"`
 }
 
 // securityVerificationPolicy is the only operation-to-method policy. Device
@@ -425,7 +427,33 @@ func GetVerificationRequirements(identity AuthIdentity, scope string) (*Verifica
 			}
 		}
 	}
+	if scope == VerificationScopeAccountBind {
+		if method, err := recentBindingSessionMethod(identity, time.Now().Unix()); err == nil {
+			requirements.RecentSession = slices.ContainsFunc(methods, func(option VerificationMethodOption) bool {
+				return option.Method == method && option.Available
+			})
+		}
+	}
 	return requirements, nil
+}
+
+// Only an actual, recent browser login can stand in for the same allowed
+// authentication method. Refresh and OAuth session creation are not new proofs.
+func recentBindingSessionMethod(identity AuthIdentity, now int64) (string, error) {
+	if _, isAccessToken := model.ParseAccessTokenSessionID(identity.SessionID); isAccessToken {
+		return "", ErrProofMethod
+	}
+	session, _, err := ValidateLoginSession(identity)
+	if err != nil {
+		return "", err
+	}
+	if session.CreatedAt <= 0 || session.CreatedAt > now || now-session.CreatedAt > 300 {
+		return "", ErrProofMethod
+	}
+	if session.LoginMethod != VerificationMethodPassword && session.LoginMethod != VerificationMethodPasskey {
+		return "", ErrProofMethod
+	}
+	return session.LoginMethod, nil
 }
 
 func verificationOAuthProviders(user *model.User) ([]VerificationOAuthProvider, error) {
@@ -574,6 +602,16 @@ func VerifySecurityInput(identity AuthIdentity, input VerificationInput) (*Secur
 	binding, err := BindVerificationOperation(VerificationOperation{Scope: input.Scope, Context: input.Context})
 	if err != nil {
 		return nil, err
+	}
+	if input.Method == VerificationMethodSession {
+		if input.Scope != VerificationScopeAccountBind {
+			return nil, ErrProofMethod
+		}
+		method, err := recentBindingSessionMethod(identity, time.Now().Unix())
+		if err != nil {
+			return nil, err
+		}
+		return CompleteSecurityVerification(identity, binding, method)
 	}
 	if _, err := RequireVerificationMethod(identity, input.Scope, input.Method); err != nil {
 		return nil, err

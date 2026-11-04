@@ -120,6 +120,7 @@ interface PendingVerificationBase {
   controller: AbortController
   reject: (error: unknown) => void
   submitting: boolean
+  recentSessionAttempted?: boolean
 }
 
 type PendingVerification = PendingVerificationBase &
@@ -173,6 +174,42 @@ export function useSecureVerification() {
       if (pending.current !== current) return
       const initialPassword = current.initialPassword
       current.initialPassword = undefined
+      if (
+        current.kind === 'operation' &&
+        current.request.scope === 'account.binding.bind' &&
+        requirements.recent_session === true &&
+        !current.recentSessionAttempted
+      ) {
+        current.recentSessionAttempted = true
+        try {
+          const proof = await verify(
+            { method: 'session' },
+            current.request,
+            requirements.password_encryption_enabled,
+            current.controller.signal
+          )
+          if (pending.current !== current) return
+          pending.current = null
+          dispatch({ type: 'reset' })
+          current.resolve(proof)
+        } catch (error) {
+          if (pending.current !== current) return
+          const failure = AuthOperationError.from(error)
+          if (
+            failure.code !== 'SECURITY_PROOF_METHOD_MISMATCH' &&
+            failure.code !== 'SECURITY_METHOD_UNAVAILABLE'
+          ) {
+            throw error
+          }
+          const refreshed = await checkVerificationMethods(
+            current.request.scope,
+            current.controller.signal
+          )
+          if (pending.current !== current) return
+          dispatch({ type: 'loaded', requirements: refreshed })
+        }
+        return
+      }
       if (
         current.kind === 'operation' &&
         initialPassword !== undefined &&
