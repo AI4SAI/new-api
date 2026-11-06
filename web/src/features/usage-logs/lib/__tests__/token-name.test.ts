@@ -19,9 +19,34 @@ For commercial licensing, please contact support@quantumnous.com
 import { createInstance } from 'i18next'
 import { describe, expect, test } from 'vitest'
 
+import { usageLogSchema } from '../../data/schema'
 import { logTokenName } from '../format'
 
 describe('usage log token name', () => {
+  test('identifies managed usage with the same member and workspace as the key page', async () => {
+    const i18n = createInstance()
+    await i18n.init({ lng: 'en', resources: {} })
+    const log = usageLogSchema.parse({
+      id: 1,
+      user_id: 41,
+      created_at: 1,
+      type: 2,
+      content: '',
+      token_id: 7,
+      token_name: 'Pilot',
+      attribution: {
+        state: 'ready',
+        actor: { display_name: 'Alice', username: 'alice' },
+        workspace: {
+          kind: 'project',
+          code: 'proj-climate',
+          label: 'Climate study',
+        },
+      },
+    })
+    expect(logTokenName(log, i18n.t)).toBe('Alice · Pilot · Climate study')
+  })
+
   test('translates the name the gateway wrote when the log has no token', async () => {
     const i18n = createInstance()
     await i18n.init({

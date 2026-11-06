@@ -35,7 +35,8 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 	if len(managedOwner) == 1 {
 		visibility, err := model.UserTokenLogVisibility(managedOwner[0])
 		require.NoError(t, err)
-		ctx.Set("managed_account", &service.ManagedAccount{OwnerID: managedOwner[0]})
+		ctx.Set("managed_account", &service.ManagedAccount{OwnerID: managedOwner[0], ManagementRequest: service.ManagementRequest{
+			Instance: "fixture-gateway", ActorID: userId, SessionID: "fixture-session", WorkspaceKey: "org:fixture", Operation: "model.usage.read"}})
 		ctx.Set("management_token_visibility", visibility)
 	}
 	handler(ctx)
@@ -71,6 +72,34 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			legacy := seedToken(t, mainDB, 41, "unknown-old-source", "legacy-log-key")
 			require.NoError(t, mainDB.Model(external).Update("management_creator_id", 7).Error)
 			require.NoError(t, mainDB.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+			credential := t.TempDir() + "/credential"
+			require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
+			t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
+			t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+			calls, attributionStatus := 0, http.StatusOK
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				require.Equal(t, "/v1/internal/models/key-attributions", r.URL.Path)
+				var body struct {
+					OwnerID int                           `json:"native_owner_id"`
+					Tokens  []service.ManagedKeyReference `json:"tokens"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &body))
+				require.Equal(t, 41, body.OwnerID)
+				require.Equal(t, []service.ManagedKeyReference{{TokenID: internal.Id, BindingRef: "11111111-1111-4111-8111-111111111111"}}, body.Tokens)
+				if attributionStatus != http.StatusOK {
+					w.WriteHeader(attributionStatus)
+					return
+				}
+				data, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41,
+					"items": []map[string]any{{"native_token_id": internal.Id, "managed_binding_ref": body.Tokens[0].BindingRef,
+						"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: "Current member", Username: "member"},
+							Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}}}})
+				require.NoError(t, err)
+				_, _ = w.Write(data)
+			}))
+			defer server.Close()
+			t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
 			for _, search := range []struct {
 				name  string
 				human bool
@@ -85,6 +114,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			for _, entry := range []model.Log{
 				{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5, TokenName: "device"},
 				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100, TokenName: internal.Name},
+				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private-repeat", Quota: 5, TokenName: internal.Name},
 				{UserId: 41, TokenId: legacy.Id, RequestId: "legacy-private", Quota: 20, TokenName: legacy.Name},
 				{UserId: 41, TokenId: 9999, RequestId: "missing-key-private", Quota: 10},
 				{UserId: 41, TokenId: 0, RequestId: "playground-private", Quota: 7},
@@ -104,14 +134,15 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				entry.ChannelId = 17
 				entry.UpstreamRequestId = "upstream-private"
 				entry.BillingContextRef = "private-context"
-				entry.Other = `{"search_request":{"query":"private search query"},"content_parts":[{"message":"private details"}],"input_tokens_total":120,"cache_tokens":40,"model_price":0.002,"billing_unit":"request","billing_mode":"tiered_expr","fixed_price":0.00075,"expr_b64":"private-expression","admin_info":{"credential":"private"}}`
+				entry.Other = `{"frt":1250,"search_request":{"query":"private search query"},"content_parts":[{"message":"private details"}],"input_tokens_total":120,"cache_tokens":40,"model_price":0.002,"billing_unit":"request","billing_mode":"tiered_expr","fixed_price":0.00075,"expr_b64":"private-expression","admin_info":{"credential":"private"}}`
 				require.NoError(t, logDB.Create(&entry).Error)
 			}
 			require.NoError(t, logDB.Create(&model.Log{UserId: 41, TokenId: 0, Type: model.LogTypeTopup, Quota: 10000, CreatedAt: now, Content: "unrelated owner payment"}).Error)
 			require.NoError(t, external.Delete())
 			require.NoError(t, legacy.Delete())
 			listed := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
-			require.EqualValues(t, 6, listed["data"].(map[string]any)["total"])
+			require.Equal(t, 1, calls, "one page resolves repeated tokens in one batch")
+			require.EqualValues(t, 7, listed["data"].(map[string]any)["total"])
 			rows := listed["data"].(map[string]any)["items"].([]any)
 			for _, item := range rows {
 				row := item.(map[string]any)
@@ -136,9 +167,11 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				require.Equal(t, "request", billing["billing_unit"])
 				require.Equal(t, "tiered_expr", billing["billing_mode"])
 				require.Equal(t, 0.00075, billing["fixed_price"])
+				require.EqualValues(t, 1250, billing["frt"])
 				require.EqualValues(t, 40, row["metering"].(map[string]any)["cache_read_tokens"])
 				if int(row["token_id"].(float64)) == internal.Id {
 					require.Equal(t, "Pilot", row["token_name"])
+					require.Equal(t, "Current member", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
 				} else {
 					if int(row["token_id"].(float64)) == legacy.Id {
 						require.Equal(t, legacy.Name, row["token_name"])
@@ -150,27 +183,44 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				}
 			}
 			stat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "", 41)[0]
-			require.EqualValues(t, 145, stat["data"].(map[string]any)["quota"])
+			require.EqualValues(t, 150, stat["data"].(map[string]any)["quota"])
 			exported := callLogHandler(t, ExportUserLogs, 7, common.RoleAdminUser, "", 41)
-			require.Len(t, exported, 7)
-			for _, row := range exported[:6] {
+			require.Len(t, exported, 8)
+			require.Equal(t, 2, calls)
+			for _, row := range exported[:7] {
 				if int(row["token_id"].(float64)) != external.Id {
 					require.NotContains(t, fmt.Sprint(row), "private")
+					require.Contains(t, row["other"], `"frt":1250`)
+				}
+				if int(row["token_id"].(float64)) == internal.Id {
+					require.Equal(t, "Current member", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
 				}
 			}
 			byAlias := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
-			require.EqualValues(t, 2, byAlias["data"].(map[string]any)["total"])
+			require.EqualValues(t, 3, byAlias["data"].(map[string]any)["total"])
 			aliasStat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
-			require.EqualValues(t, 103, aliasStat["data"].(map[string]any)["quota"])
+			require.EqualValues(t, 108, aliasStat["data"].(map[string]any)["quota"])
 			hiddenName := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name="+internal.Name, 41)[0]
 			require.EqualValues(t, 0, hiddenName["data"].(map[string]any)["total"])
 			query := fmt.Sprintf("token_id=%d", internal.Id)
 			own := callLogHandler(t, GetUserLogs, 41, common.RoleCommonUser, query)[0]
 			require.Contains(t, fmt.Sprint(own), "private research prompt")
+			personal := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query+"&user_id=41")[0]
+			require.EqualValues(t, 0, personal["data"].(map[string]any)["total"])
 			require.NoError(t, internal.Delete())
 			historical := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
-			require.EqualValues(t, 1, historical["data"].(map[string]any)["total"])
+			require.EqualValues(t, 2, historical["data"].(map[string]any)["total"])
 			require.NotContains(t, fmt.Sprint(historical), "private")
+			require.Contains(t, fmt.Sprint(historical), "Current member")
+			attributionStatus = http.StatusServiceUnavailable
+			unavailable := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
+			require.Equal(t, true, unavailable["success"])
+			require.Contains(t, fmt.Sprint(unavailable), "unavailable")
+			require.NotContains(t, fmt.Sprint(unavailable), "Current member")
+			attributionStatus = http.StatusForbidden
+			denied := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
+			require.Equal(t, false, denied["success"])
+			require.NotContains(t, denied, "data")
 
 		})
 	}

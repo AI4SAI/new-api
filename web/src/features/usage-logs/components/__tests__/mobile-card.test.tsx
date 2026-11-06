@@ -18,6 +18,12 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+} from '@tanstack/react-router'
+import {
   getCoreRowModel,
   useReactTable,
   type VisibilityState,
@@ -83,23 +89,33 @@ function Fixture(props: {
   )
 }
 
-function renderLogs(props: Parameters<typeof Fixture>[0] = {}) {
+async function renderLogs(props: Parameters<typeof Fixture>[0] = {}) {
+  const root = createRootRoute({
+    component: () => (
+      <UsageLogsProvider>
+        <Fixture {...props} />
+      </UsageLogsProvider>
+    ),
+  })
+  const router = createRouter({
+    routeTree: root,
+    history: createMemoryHistory(),
+  })
+  await router.load()
   return render(
     <QueryClientProvider
       client={
         new QueryClient({ defaultOptions: { queries: { retry: false } } })
       }
     >
-      <UsageLogsProvider>
-        <Fixture {...props} />
-      </UsageLogsProvider>
+      <RouterProvider router={router} />
     </QueryClientProvider>
   )
 }
 
 it('shows model mismatch evidence when tapping the mobile model badge', async () => {
   const user = userEvent.setup()
-  renderLogs({
+  await renderLogs({
     logs: [
       {
         ...log,
@@ -129,7 +145,7 @@ it('shows model mismatch evidence when tapping the mobile model badge', async ()
 it('opens long channel text on tap and copies the complete value', async () => {
   const user = userEvent.setup()
   const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
-  renderLogs()
+  await renderLogs()
   await user.click(
     screen.getByRole('button', { name: `Channel: ${longName} #372` })
   )
@@ -155,7 +171,7 @@ it.each([false, true])(
   async (observed) => {
     const user = userEvent.setup()
     const copy = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
-    renderLogs({
+    await renderLogs({
       logs: [
         {
           ...log,
@@ -194,7 +210,7 @@ it.each([false, true])(
 
 it('hides sensitive names and disables full-text inspection when privacy is enabled', async () => {
   const user = userEvent.setup()
-  renderLogs()
+  await renderLogs()
   await user.click(screen.getByRole('button', { name: 'Hide sensitive data' }))
   expect(screen.queryByText('production-admin')).not.toBeInTheDocument()
   expect(
@@ -205,8 +221,8 @@ it('hides sensitive names and disables full-text inspection when privacy is enab
   ).not.toBeInTheDocument()
 })
 
-it('respects hidden columns and omits admin fields in the self view', () => {
-  renderLogs({
+it('respects hidden columns and omits admin fields in the self view', async () => {
+  await renderLogs({
     admin: false,
     visibility: { token_name: false, model_name: false },
   })
@@ -218,23 +234,51 @@ it('respects hidden columns and omits admin fields in the self view', () => {
   expect(screen.queryByText('enterprise-production')).not.toBeInTheDocument()
 })
 
-it('keeps input, output and cache quantities readable without empty metric cells', () => {
-  renderLogs()
+it('keeps input, output and cache quantities readable without empty metric cells', async () => {
+  await renderLogs()
   expect(screen.getByText('Input')).toBeVisible()
   expect(screen.getByText('Output')).toBeVisible()
   expect(screen.getByText(/300/)).toBeVisible()
   expect(screen.getByText('Cache ↑ 200')).toBeVisible()
 })
 
-it('shows the established empty state when no logs exist', () => {
-  renderLogs({ logs: [] })
+it('shows member attribution and recorded first-token latency in the ordinary user view', async () => {
+  await renderLogs({
+    admin: false,
+    logs: [
+      {
+        ...log,
+        token_name: 'Pilot',
+        is_stream: true,
+        other: JSON.stringify({ frt: 1250 }),
+        attribution: {
+          state: 'ready',
+          actor: { display_name: 'Alice', username: 'alice' },
+          workspace: { kind: 'org', code: 'org-lab', label: 'Research lab' },
+        },
+      },
+    ],
+  })
+  expect(
+    screen.getByRole('button', { name: 'Token: Alice · Pilot · Research lab' })
+  ).toBeVisible()
+  expect(screen.getByText('First token')).toBeVisible()
+  expect(screen.getByText('1.3s')).toBeVisible()
+  await userEvent
+    .setup()
+    .click(screen.getByRole('button', { name: 'Hide sensitive data' }))
+  expect(screen.queryByText(/Alice/)).not.toBeInTheDocument()
+})
+
+it('shows the established empty state when no logs exist', async () => {
+  await renderLogs({ logs: [] })
   expect(screen.getByText('No Logs Found')).toBeVisible()
 })
 
 it.each([false, true])(
   'keeps timing in the right column for streaming=%s',
-  (streaming) => {
-    renderLogs({
+  async (streaming) => {
+    await renderLogs({
       logs: [
         {
           ...log,
@@ -262,15 +306,15 @@ it.each([false, true])(
   }
 )
 
-it('retains the user avatar and model badge in the mobile summary', () => {
-  renderLogs()
+it('retains the user avatar and model badge in the mobile summary', async () => {
+  await renderLogs()
   expect(screen.getByText('P')).toBeVisible()
   const modelButton = screen.getByRole('button', { name: `Model: ${longName}` })
   expect(modelButton.querySelector('[data-slot="status-badge"]')).not.toBeNull()
 })
 
-it('omits unused token and throughput placeholders for async jobs', () => {
-  renderLogs({
+it('omits unused token and throughput placeholders for async jobs', async () => {
+  await renderLogs({
     logs: [
       {
         ...log,
@@ -288,8 +332,8 @@ it('omits unused token and throughput placeholders for async jobs', () => {
   expect(within(timing as HTMLElement).queryByText('—')).not.toBeInTheDocument()
 })
 
-it('labels a task whose result was returned in the response as synchronous', () => {
-  renderLogs({
+it('labels a task whose result was returned in the response as synchronous', async () => {
+  await renderLogs({
     logs: [
       {
         ...log,
@@ -305,7 +349,7 @@ it('labels a task whose result was returned in the response as synchronous', () 
 
 it('shows mapped model names in full when inspecting a mobile model badge', async () => {
   const user = userEvent.setup()
-  renderLogs({
+  await renderLogs({
     logs: [
       {
         ...log,
@@ -327,8 +371,8 @@ it('shows mapped model names in full when inspecting a mobile model badge', asyn
   ).toBeVisible()
 })
 
-it('shows loading placeholders without displaying stale log fields', () => {
-  renderLogs({ loading: true })
+it('shows loading placeholders without displaying stale log fields', async () => {
+  await renderLogs({ loading: true })
   expect(screen.getByRole('status', { name: 'Loading' })).toHaveAttribute(
     'aria-busy',
     'true'

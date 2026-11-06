@@ -39,6 +39,10 @@ import type { LogOtherData } from '../../types'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
 
 vi.mock('@lobehub/icons', () => ({}))
+vi.mock('@tanstack/react-router', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-router')>()),
+  useSearch: () => ({}),
+}))
 vi.hoisted(() => {
   vi.stubGlobal('localStorage', {
     getItem: () => null,
@@ -112,7 +116,7 @@ beforeEach(async () => {
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   client.setQueryData(['status'], {}, { updatedAt: Date.now() + 60_000 })
   client.setQueryData(
-    ['pricing'],
+    ['pricing', undefined, undefined, ''],
     { data: [], vendors: [] },
     { updatedAt: Date.now() + 60_000 }
   )
@@ -379,7 +383,7 @@ test.each([
 ])(
   'task expression $tier shows its recorded unit price',
   ({ expression, tier, expected }) => {
-    client.setQueryData(['pricing'], {
+    client.setQueryData(['pricing', undefined, undefined, ''], {
       data: [
         {
           model_name: 'wan2.5-i2v-preview',
@@ -408,7 +412,7 @@ test.each([
 )
 
 test('task log prices use localized unit labels from pricing metadata', async () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', undefined, undefined, ''], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -437,7 +441,7 @@ test('task log prices use localized unit labels from pricing metadata', async ()
 })
 
 test('task log prices select the executing provider’s schema', () => {
-  client.setQueryData(['pricing'], {
+  client.setQueryData(['pricing', undefined, undefined, ''], {
     data: [
       {
         model_name: 'wan2.5-i2v-preview',
@@ -476,7 +480,7 @@ test.each(['missing schema', 'unsupported expression', 'unknown tier'])(
   'task pricing with %s preserves the saved tier without guessing prices',
   (scenario) => {
     if (scenario !== 'missing schema') {
-      client.setQueryData(['pricing'], {
+      client.setQueryData(['pricing', undefined, undefined, ''], {
         data: [
           {
             model_name: 'wan2.5-i2v-preview',

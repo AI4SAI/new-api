@@ -854,6 +854,7 @@ func visibleTokenQuery(query *gorm.DB, externalOnly []bool) *gorm.DB {
 type TokenLogVisibility struct {
 	Managed     bool
 	FullDetails bool
+	BindingRef  string
 }
 
 // Derive disclosure from immutable provenance, including retired credentials.
@@ -867,7 +868,7 @@ func UserTokenLogVisibility(userID int) (map[int]TokenLogVisibility, error) {
 	visibility := make(map[int]TokenLogVisibility, len(tokens))
 	for _, token := range tokens {
 		managed := token.ManagedBindingRef != ""
-		visibility[token.Id] = TokenLogVisibility{Managed: managed, FullDetails: !managed && token.ManagementCreatorID > 0}
+		visibility[token.Id] = TokenLogVisibility{Managed: managed, FullDetails: !managed && token.ManagementCreatorID > 0, BindingRef: token.ManagedBindingRef}
 	}
 	return visibility, nil
 }

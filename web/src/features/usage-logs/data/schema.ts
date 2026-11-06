@@ -22,6 +22,8 @@ For commercial licensing, please contact support@quantumnous.com
  */
 import { z } from 'zod'
 
+import { apiKeySchema } from '@/features/keys/types'
+
 // Usage log schema
 export const usageLogSchema = z.object({
   id: z.number(),
@@ -31,6 +33,7 @@ export const usageLogSchema = z.object({
   content: z.string(),
   username: z.string().default(''),
   token_name: z.string().default(''),
+  attribution: apiKeySchema.shape.attribution,
   model_name: z.string().default(''),
   quota: z.number().default(0),
   prompt_tokens: z.number().default(0),

@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 
@@ -120,10 +121,51 @@ func GetUserLogs(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
+	items, err := presentUsageLogPage(c, logs, filter.TokenVisibility)
+	if err != nil {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
 	pageInfo.SetTotal(int(total))
-	pageInfo.SetItems(logs)
+	pageInfo.SetItems(items)
 	common.ApiSuccess(c, pageInfo)
 	return
+}
+
+type usageLogResponse struct {
+	*model.Log
+	Attribution *service.ManagedKeyAttribution `json:"attribution,omitempty"`
+}
+
+// Reuse key attribution for the already-authorized page, including retired keys.
+// The stored name, billing facts and private-log projection remain unchanged.
+func presentUsageLogPage(c *gin.Context, logs []*model.Log, visibility map[int]model.TokenLogVisibility) ([]usageLogResponse, error) {
+	items := make([]usageLogResponse, len(logs))
+	references := []service.ManagedKeyReference{}
+	seen := make(map[int]bool)
+	for i, log := range logs {
+		items[i].Log = log
+		if token := visibility[log.TokenId]; token.Managed {
+			items[i].Attribution = &service.ManagedKeyAttribution{State: "unavailable"}
+			if !seen[log.TokenId] {
+				references = append(references, service.ManagedKeyReference{TokenID: log.TokenId, BindingRef: token.BindingRef})
+				seen[log.TokenId] = true
+			}
+		}
+	}
+	attributions, err := service.ReadManagedKeyAttributions(c, references)
+	if errors.Is(err, service.ErrManagedAccountDenied) {
+		return nil, err
+	}
+	if err != nil {
+		common.SysError(common.LogText("managed key attribution unavailable"))
+	}
+	for i := range items {
+		if attribution := attributions[items[i].TokenId]; attribution != nil {
+			items[i].Attribution = attribution
+		}
+	}
+	return items, nil
 }
 
 // ExportAllLogs streams every user's logs matching the search.
@@ -172,15 +214,30 @@ func exportLogs(c *gin.Context, all bool) {
 	c.Status(http.StatusOK)
 
 	count := 0
-	writeLog := func(log *model.Log) error {
-		line, err := common.Marshal(log)
+	page := make([]*model.Log, 0, 100)
+	writePage := func() error {
+		items, err := presentUsageLogPage(c, page, filter.TokenVisibility)
 		if err != nil {
 			return err
 		}
-		if _, err := c.Writer.Write(append(line, '\n')); err != nil {
-			return err
+		for _, item := range items {
+			line, err := common.Marshal(item)
+			if err != nil {
+				return err
+			}
+			if _, err := c.Writer.Write(append(line, '\n')); err != nil {
+				return err
+			}
+			count++
 		}
-		count++
+		page = page[:0]
+		return nil
+	}
+	writeLog := func(log *model.Log) error {
+		page = append(page, log)
+		if len(page) == cap(page) {
+			return writePage()
+		}
 		return nil
 	}
 	ctx := c.Request.Context()
@@ -188,6 +245,9 @@ func exportLogs(c *gin.Context, all bool) {
 		err = model.StreamAllLogs(ctx, filter, c.GetInt("role"), writeLog)
 	} else {
 		err = model.StreamUserLogs(ctx, userId, filter, writeLog)
+	}
+	if err == nil && len(page) > 0 {
+		err = writePage()
 	}
 	if ctx.Err() != nil {
 		return

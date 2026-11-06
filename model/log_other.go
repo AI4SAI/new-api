@@ -326,7 +326,7 @@ func formatLogOtherJSON(value string, visibility logOtherVisibility) string {
 	changed := false
 	if visibility == logOtherVisibilityBillingFacts {
 		facts := map[string]json.RawMessage{}
-		for _, key := range []string{"input_tokens_total", "cache_tokens", "cache_write_tokens",
+		for _, key := range []string{"frt", "input_tokens_total", "cache_tokens", "cache_write_tokens",
 			"cache_creation_tokens", "cache_creation_tokens_5m", "cache_creation_tokens_1h",
 			"model_price", "model_ratio", "group_ratio", "completion_ratio", "cache_ratio", "user_group_ratio", "fixed_price", "image_count"} {
 			var number *float64

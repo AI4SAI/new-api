@@ -218,7 +218,7 @@ func ReadManagedKeyAttributions(c *gin.Context, references []ManagedKeyReference
 	if account == nil || len(references) == 0 {
 		return nil, nil
 	}
-	if len(references) > 100 || account.Operation != "model.keys.read" {
+	if len(references) > 100 || (account.Operation != "model.keys.read" && account.Operation != "model.usage.read") {
 		return nil, ErrManagedAccountDenied
 	}
 	expected := make(map[int]string, len(references))
