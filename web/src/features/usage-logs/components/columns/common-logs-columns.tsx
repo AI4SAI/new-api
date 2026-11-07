@@ -644,6 +644,28 @@ export function useCommonLogsColumns(
                 )}
               </Tooltip>
             </TooltipProvider>
+            {log.attribution && (
+              <div className='text-muted-foreground text-xs break-words'>
+                {log.attribution.state === 'ready' ? (
+                  <>
+                    <div>
+                      {t('Member')}:{' '}
+                      {sensitiveVisible
+                        ? log.attribution.actor.display_name
+                        : '••••'}
+                    </div>
+                    <div>
+                      {t('Workspace')}:{' '}
+                      {sensitiveVisible
+                        ? log.attribution.workspace.label
+                        : '••••'}
+                    </div>
+                  </>
+                ) : (
+                  t('Attribution unavailable')
+                )}
+              </div>
+            )}
             {(group || groupRatio != null) && (
               <span className='block max-w-full truncate text-xs leading-none'>
                 {group ? (

@@ -100,6 +100,8 @@ describe('usage log CSV export', () => {
       '2026-10-12 08:30:05',
       '消费',
       'prod',
+      '',
+      '',
       'default',
       'gpt-4o-mini',
       '是',
@@ -131,7 +133,7 @@ describe('usage log CSV export', () => {
     const row = getLogCsvRow(topup, false, t)
 
     expect(row.slice(1, 2)).toEqual(['充值'])
-    expect(row.slice(5, 12)).toEqual(['', '', '', '', '', '', ''])
+    expect(row.slice(7, 14)).toEqual(['', '', '', '', '', '', ''])
     expect(row.at(-1)).toBe('充值 $5')
   })
 
@@ -139,5 +141,34 @@ describe('usage log CSV export', () => {
     expect(
       toCsvLine(['=HYPERLINK("x")', '-12.5', '+cmd', 'a"b', 'two\nlines'])
     ).toBe(`"'=HYPERLINK(""x"")","-12.5","'+cmd","a""b","two\nlines"\r\n`)
+  })
+
+  test('keeps the original key name and exports member attribution in separate columns', async () => {
+    const t = await chineseTranslator()
+    const header = getLogCsvHeader(false, t)
+    const row = getLogCsvRow(
+      {
+        ...consumeLog,
+        attribution: {
+          state: 'ready',
+          actor: { display_name: 'Alice', username: 'alice' },
+          workspace: { kind: 'org', code: 'org-lab', label: 'Research lab' },
+        },
+      },
+      false,
+      t
+    )
+    expect(row).toHaveLength(header.length)
+    expect(row[header.indexOf('Token')]).toBe('prod')
+    expect(row[header.indexOf('Member')]).toBe('Alice')
+    expect(row[header.indexOf('Workspace')]).toBe('Research lab')
+    const unavailable = getLogCsvRow(
+      { ...consumeLog, attribution: { state: 'unavailable' } },
+      false,
+      t
+    )
+    expect(unavailable[header.indexOf('Member')]).toBe(
+      'Attribution unavailable'
+    )
   })
 })

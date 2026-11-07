@@ -19,11 +19,16 @@ For commercial licensing, please contact support@quantumnous.com
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, within } from '@testing-library/react'
 import i18next from 'i18next'
-import { afterEach, beforeAll, describe, expect, test } from 'vitest'
+import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 
 import type { UsageLog } from '../../data/schema'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
+
+vi.mock('@tanstack/react-router', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-router')>()),
+  useSearch: () => ({}),
+}))
 
 const i18nKeys = {
   'Log Details': 'Log Details',
@@ -64,14 +69,18 @@ function makeLog(other: LogOtherData): UsageLog {
   }
 }
 
-function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
+function renderDetails(
+  other: LogOtherData,
+  promptTokens = 0,
+  attribution?: UsageLog['attribution']
+): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   const freshAt = Date.now() + 60_000
   queryClient.setQueryData(['status'], {}, { updatedAt: freshAt })
   queryClient.setQueryData(
-    ['pricing'],
+    ['pricing', undefined, undefined, ''],
     { data: [], vendors: [] },
     { updatedAt: freshAt }
   )
@@ -79,7 +88,7 @@ function renderDetails(other: LogOtherData, promptTokens = 0): QueryClient {
   render(
     <QueryClientProvider client={queryClient}>
       <DetailsDialog
-        log={{ ...makeLog(other), prompt_tokens: promptTokens }}
+        log={{ ...makeLog(other), prompt_tokens: promptTokens, attribution }}
         isAdmin={false}
         isRoot={false}
         open
@@ -110,6 +119,32 @@ test('shows the recorded request and response models in log details', () => {
 })
 
 describe('usage facts billing details', () => {
+  test('shows the recorded billing expression to an ordinary user with name and attribution separate', () => {
+    const queryClient = renderDetails(
+      {
+        billing_mode: 'tiered_expr',
+        expr_b64: btoa('tier("recorded", p * 2 + cr * 0.5 + c * 8)'),
+        matched_tier: 'recorded',
+        billing_unit: 'token',
+        cache_tokens: 40,
+      },
+      120,
+      {
+        state: 'ready',
+        actor: { display_name: 'Alice', username: 'alice' },
+        workspace: { kind: 'org', code: 'org-lab', label: 'Research lab' },
+      }
+    )
+    expect(rowValue('Token')).toBe('token')
+    expect(rowValue('Member')).toBe('Alice')
+    expect(rowValue('Workspace')).toBe('Research lab')
+    expect(screen.getAllByText('recorded').length).toBeGreaterThan(0)
+    expect(screen.getByText('$2/M')).toBeVisible()
+    expect(screen.getByText('$0.5/M')).toBeVisible()
+    expect(screen.getByText('$8/M')).toBeVisible()
+    queryClient.clear()
+  })
+
   test('shows recorded per-request price when the expression is not shared', () => {
     const queryClient = renderDetails({
       billing_mode: 'tiered_expr',

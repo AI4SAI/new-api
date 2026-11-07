@@ -701,6 +701,24 @@ export function DetailsDialog(props: DetailsDialogProps) {
               mono
             />
           )}
+          {props.log.attribution?.state === 'ready' && (
+            <>
+              <DetailRow
+                label={t('Member')}
+                value={props.log.attribution.actor.display_name}
+              />
+              <DetailRow
+                label={t('Workspace')}
+                value={props.log.attribution.workspace.label}
+              />
+            </>
+          )}
+          {props.log.attribution?.state === 'unavailable' && (
+            <DetailRow
+              label={t('Member')}
+              value={t('Attribution unavailable')}
+            />
+          )}
 
           {(props.log.group || other?.group) && (
             <DetailRow

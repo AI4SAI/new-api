@@ -38,6 +38,8 @@ export function getLogCsvHeader(isAdmin: boolean, t: Translate): string[] {
     t('Type'),
     ...(isAdmin ? [t('User')] : []),
     t('Token'),
+    t('Member'),
+    t('Workspace'),
     t('Group'),
     t('Model'),
     ...(isAdmin ? [t('Channel')] : []),
@@ -73,11 +75,19 @@ export function getLogCsvRow(
       ? `#${log.channel} ${log.channel_name}`
       : `#${log.channel}`
   }
+  let member = ''
+  if (log.attribution?.state === 'ready') {
+    member = log.attribution.actor.display_name
+  } else if (log.attribution?.state === 'unavailable') {
+    member = t('Attribution unavailable')
+  }
   return [
     formatTimestampToDate(log.created_at),
     t(getLogTypeConfig(log.type).label),
     ...(isAdmin ? [log.username ?? ''] : []),
     logTokenName(log, t),
+    member,
+    log.attribution?.state === 'ready' ? log.attribution.workspace.label : '',
     log.group ?? '',
     log.model_name ?? '',
     ...(isAdmin ? [channel] : []),

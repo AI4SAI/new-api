@@ -585,19 +585,9 @@ export function renderLogContent(
  * channel test, carries a name the gateway stored as an English source key.
  */
 export function logTokenName(
-  log: Pick<UsageLog, 'token_id' | 'token_name' | 'attribution'>,
+  log: Pick<UsageLog, 'token_id' | 'token_name'>,
   t: (key: string, opts?: Record<string, unknown>) => string
 ): string {
-  if (log.attribution?.state === 'ready') {
-    return [
-      log.attribution.actor.display_name,
-      log.token_name,
-      log.attribution.workspace.label,
-    ].join(' · ')
-  }
-  if (log.attribution?.state === 'unavailable') {
-    return `${log.token_name} · ${t('Attribution unavailable')}`
-  }
   return log.token_id === 0
     ? translateServerText(t, log.token_name)
     : log.token_name

@@ -248,7 +248,7 @@ it('shows member attribution and recorded first-token latency in the ordinary us
     logs: [
       {
         ...log,
-        token_name: 'Pilot',
+        token_name: 'pilot-recorded-name',
         is_stream: true,
         other: JSON.stringify({ frt: 1250 }),
         attribution: {
@@ -260,7 +260,11 @@ it('shows member attribution and recorded first-token latency in the ordinary us
     ],
   })
   expect(
-    screen.getByRole('button', { name: 'Token: Alice · Pilot · Research lab' })
+    screen.getByRole('button', { name: 'Token: pilot-recorded-name' })
+  ).toBeVisible()
+  expect(screen.getByRole('button', { name: 'Member: Alice' })).toBeVisible()
+  expect(
+    screen.getByRole('button', { name: 'Workspace: Research lab' })
   ).toBeVisible()
   expect(screen.getByText('First token')).toBeVisible()
   expect(screen.getByText('1.3s')).toBeVisible()

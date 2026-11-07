@@ -48,6 +48,8 @@ type FieldName =
   | 'user'
   | 'channel'
   | 'token'
+  | 'member'
+  | 'workspace'
   | 'group'
   | 'time'
 type LogField = {
@@ -110,6 +112,28 @@ export function CommonLogMobileCard<TData>(props: {
       visible: displayable && props.cells.has('token_name') && !!log.token_name,
       sensitive: true,
     },
+    member: {
+      label: t('Member'),
+      value:
+        log.attribution?.state === 'ready'
+          ? log.attribution.actor.display_name
+          : t('Attribution unavailable'),
+      visible:
+        displayable && props.cells.has('token_name') && !!log.attribution,
+      sensitive: true,
+    },
+    workspace: {
+      label: t('Workspace'),
+      value:
+        log.attribution?.state === 'ready'
+          ? log.attribution.workspace.label
+          : '',
+      visible:
+        displayable &&
+        props.cells.has('token_name') &&
+        log.attribution?.state === 'ready',
+      sensitive: true,
+    },
     group: {
       label: t('Group'),
       value: group,
@@ -122,7 +146,14 @@ export function CommonLogMobileCard<TData>(props: {
     selected?.visible && (!selected.sensitive || context.sensitiveVisible)
       ? selected
       : undefined
-  const metadata: FieldName[] = ['user', 'channel', 'token', 'group']
+  const metadata: FieldName[] = [
+    'user',
+    'channel',
+    'token',
+    'group',
+    'member',
+    'workspace',
+  ]
   const visibleMetadata = metadata.filter((id) => fields[id].visible)
   const costCell = props.cells.get('quota')
   const contentCell = props.cells.get('content')

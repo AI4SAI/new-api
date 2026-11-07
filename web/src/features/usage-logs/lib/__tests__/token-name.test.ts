@@ -23,7 +23,7 @@ import { usageLogSchema } from '../../data/schema'
 import { logTokenName } from '../format'
 
 describe('usage log token name', () => {
-  test('identifies managed usage with the same member and workspace as the key page', async () => {
+  test('keeps the recorded token name when separate attribution is available', async () => {
     const i18n = createInstance()
     await i18n.init({ lng: 'en', resources: {} })
     const log = usageLogSchema.parse({
@@ -33,7 +33,7 @@ describe('usage log token name', () => {
       type: 2,
       content: '',
       token_id: 7,
-      token_name: 'Pilot',
+      token_name: 'pilot-recorded-name',
       attribution: {
         state: 'ready',
         actor: { display_name: 'Alice', username: 'alice' },
@@ -44,7 +44,7 @@ describe('usage log token name', () => {
         },
       },
     })
-    expect(logTokenName(log, i18n.t)).toBe('Alice · Pilot · Climate study')
+    expect(logTokenName(log, i18n.t)).toBe('pilot-recorded-name')
   })
 
   test('translates the name the gateway wrote when the log has no token', async () => {

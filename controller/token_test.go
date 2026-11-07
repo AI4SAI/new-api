@@ -112,7 +112,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.Equal(t, 2, page.Total)
 	require.Equal(t, internal.Id, page.Items[0].ID)
 	require.True(t, page.Items[0].Managed)
-	require.Equal(t, "Pilot", page.Items[0].Name)
+	require.Equal(t, internal.Name, page.Items[0].Name)
 	require.Empty(t, page.Items[0].Key)
 	require.Empty(t, page.Items[0].ManagedBindingRef)
 	require.Nil(t, page.Items[0].AllowIps)
@@ -127,7 +127,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	for _, query := range []struct {
 		query string
 		count int
-	}{{"?keyword=Pilot", 1}, {"?keyword=internal", 0}, {"?keyword=external", 1}, {"?token=internal%25", 0}, {"?token=internal-key", 0}, {"?keyword=Pilot&token=internal%25", 0}} {
+	}{{"?keyword=Pilot", 0}, {"?keyword=internal", 1}, {"?keyword=external", 1}, {"?token=internal%25", 0}, {"?token=internal-key", 0}, {"?keyword=internal&token=internal%25", 0}} {
 		c, w = request("GET", "/api/token/search"+query.query, nil)
 		SearchTokens(c)
 		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
@@ -151,7 +151,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 			require.Equal(t, "192.0.2.3", *detail.AllowIps)
 		} else {
 			require.Equal(t, "Current member", detail.Attribution.Actor.DisplayName)
-			require.Equal(t, "Pilot", detail.Name)
+			require.Equal(t, internal.Name, detail.Name)
 			require.Empty(t, detail.Key)
 			require.Empty(t, detail.ManagedBindingRef)
 			require.Nil(t, detail.AllowIps)
@@ -227,11 +227,16 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", internal.Id).Count(&count).Error)
 	require.EqualValues(t, 1, count)
+	var stored model.Token
+	require.NoError(t, db.First(&stored, internal.Id).Error)
+	require.Equal(t, internal.Name, stored.Name)
+	require.Equal(t, internal.Key, stored.Key)
+	require.Equal(t, internal.RemainQuota, stored.RemainQuota)
 	historical, err := model.UserTokenLogVisibility(41)
 	require.NoError(t, err)
-	require.True(t, historical[external.Id].FullDetails)
+	require.False(t, historical[external.Id].Managed)
 	require.True(t, historical[internal.Id].Managed)
-	require.False(t, historical[internal.Id].FullDetails)
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", historical[internal.Id].BindingRef)
 	c, w = request("GET", "/api/token/", nil)
 	GetAllTokens(c)
 	require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))

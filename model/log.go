@@ -139,26 +139,18 @@ func formatUserLog(log *Log, tokenVisibility ...map[int]TokenLogVisibility) {
 	if log.Type == LogTypeConsume {
 		log.Metering = log.TokenMetering()
 	}
+	visibility := logOtherVisibilityUser
 	if len(tokenVisibility) != 0 && tokenVisibility[0] != nil {
-		visibility := tokenVisibility[0][log.TokenId]
-		if !visibility.FullDetails {
-			name := log.TokenName
-			if name == "" && log.TokenId > 0 {
-				name = fmt.Sprintf("Key #%d", log.TokenId)
-			}
-			if visibility.Managed {
-				name = ManagedTokenDisplayName
-			}
-			*log = Log{Id: log.Id, UserId: log.UserId, CreatedAt: log.CreatedAt, Type: log.Type,
-				ModelName: log.ModelName, BillingProduct: log.BillingProduct, Group: log.Group, Quota: log.Quota, PromptTokens: log.PromptTokens,
-				CompletionTokens: log.CompletionTokens, UseTime: log.UseTime, IsStream: log.IsStream,
-				TokenId: log.TokenId, TokenName: name, Metering: log.Metering,
-				Other: formatLogOtherJSON(log.Other, logOtherVisibilityBillingFacts)}
-			return
-		}
+		// Delegated usage access does not grant the caller another user's
+		// request content, even when they created or can reveal the key.
+		log.Content, log.Ip, log.Username = "", "", ""
+		log.ChannelId = 0
+		log.RequestId, log.UpstreamRequestId, log.BillingContextRef = "", "", ""
+		log.BillingPolicyEpoch, log.RequestStartedAt = "", 0
+		visibility = logOtherVisibilityDelegated
 	}
 	log.ChannelName = ""
-	log.Other = formatLogOtherJSON(log.Other, logOtherVisibilityUser)
+	log.Other = formatLogOtherJSON(log.Other, visibility)
 }
 
 // FormatAdminLogs removes root-only diagnostics while retaining operational
@@ -573,19 +565,7 @@ func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 		return nil, err
 	}
 	if f.TokenName != "" {
-		managedIDs := []int{}
-		for id, visibility := range f.TokenVisibility {
-			if visibility.Managed {
-				managedIDs = append(managedIDs, id)
-			}
-		}
-		if len(managedIDs) == 0 {
-			tx = tx.Where("logs.token_name = ?", f.TokenName)
-		} else if f.TokenName == ManagedTokenDisplayName {
-			tx = tx.Where("(logs.token_id IN ? OR logs.token_name = ?)", managedIDs, f.TokenName)
-		} else {
-			tx = tx.Where("logs.token_id NOT IN ? AND logs.token_name = ?", managedIDs, f.TokenName)
-		}
+		tx = tx.Where("logs.token_name = ?", f.TokenName)
 	}
 	if f.RequestId != "" {
 		tx = tx.Where("logs.request_id = ?", f.RequestId)

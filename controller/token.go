@@ -74,7 +74,6 @@ func buildMaskedTokenResponse(token *model.Token, machine ...bool) *tokenRespons
 	}
 	managed := token.ManagedBindingRef != ""
 	if managed && (len(machine) == 0 || !machine[0]) {
-		maskedToken.Name = model.ManagedTokenDisplayName
 		maskedToken.Key = ""
 		maskedToken.ManagedBindingRef = ""
 		maskedToken.AllowIps = nil

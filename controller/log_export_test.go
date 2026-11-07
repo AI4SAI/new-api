@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -64,7 +65,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			mainDB, _ := newAuditTestDatabase(t, database.name, dsn)
 			logDB, _ := newAuditTestDatabase(t, database.name, dsn)
 			useLogExportDatabases(t, mainDB, logDB, database.kind, database.kind)
-			require.NoError(t, mainDB.AutoMigrate(&model.Token{}, &model.User{}))
+			require.NoError(t, mainDB.AutoMigrate(&model.Token{}, &model.User{}, &model.Channel{}))
 			require.NoError(t, logDB.AutoMigrate(&model.Log{}))
 			require.NoError(t, mainDB.Create(&model.User{Id: 41, Username: "org-owner", Group: "default", AffCode: "logs-owner"}).Error)
 			external := seedToken(t, mainDB, 41, "device", "external-log-key")
@@ -104,13 +105,14 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				name  string
 				human bool
 				count int
-			}{{"Pilot", true, 1}, {internal.Name, true, 0}, {internal.Name, false, 1}, {"Pilot", false, 0}} {
+			}{{"Pilot", true, 0}, {internal.Name, true, 1}, {internal.Name, false, 1}, {"Pilot", false, 0}} {
 				rows, total, err := model.SearchUserTokens(41, search.name, "", 0, 10, search.human)
 				require.NoError(t, err)
 				require.EqualValues(t, search.count, total)
 				require.Len(t, rows, search.count)
 			}
 			now := time.Now().Unix()
+			expression := base64.StdEncoding.EncodeToString([]byte(`tier("request", fixed(0.00075))`))
 			for _, entry := range []model.Log{
 				{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5, TokenName: "device"},
 				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100, TokenName: internal.Name},
@@ -134,7 +136,20 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				entry.ChannelId = 17
 				entry.UpstreamRequestId = "upstream-private"
 				entry.BillingContextRef = "private-context"
-				entry.Other = `{"frt":1250,"search_request":{"query":"private search query"},"content_parts":[{"message":"private details"}],"input_tokens_total":120,"cache_tokens":40,"model_price":0.002,"billing_unit":"request","billing_mode":"tiered_expr","fixed_price":0.00075,"expr_b64":"private-expression","admin_info":{"credential":"private"}}`
+				entry.Other = common.MapToJsonStr(map[string]any{
+					"frt": 1250, "input_tokens_total": 120, "cache_tokens": 40,
+					"model_price": 0.002, "billing_unit": "request", "billing_mode": "tiered_expr",
+					"fixed_price": 0.00075, "expr_b64": expression, "matched_tier": "request",
+					"usage_facts": map[string]any{"image_count": 2}, "is_task": true,
+					"request_rules":   []map[string]any{{"cond": `param("quality") == "hd"`, "multiplier": 2, "matched": true}},
+					"tool_surcharges": []map[string]any{{"name": "web_search", "count": 1, "price": 0.01}},
+					"search_request":  map[string]any{"query": "private search query"},
+					"fetch_request":   map[string]any{"url": "https://private.example/report"},
+					"content_parts":   []map[string]any{{"message": "private details"}},
+					"po":              []string{"private prompt override"}, "task_id": "private-task", "reason": "private reason",
+					"stream_status": map[string]any{"status": "error", "end_error": "private provider error"},
+					"admin_info":    map[string]any{"credential": "private"},
+				})
 				require.NoError(t, logDB.Create(&entry).Error)
 			}
 			require.NoError(t, logDB.Create(&model.Log{UserId: 41, TokenId: 0, Type: model.LogTypeTopup, Quota: 10000, CreatedAt: now, Content: "unrelated owner payment"}).Error)
@@ -146,10 +161,6 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			rows := listed["data"].(map[string]any)["items"].([]any)
 			for _, item := range rows {
 				row := item.(map[string]any)
-				if int(row["token_id"].(float64)) == external.Id {
-					require.Equal(t, "private research prompt", row["content"])
-					continue
-				}
 				for _, field := range []string{"content", "ip", "username"} {
 					require.Empty(t, row[field])
 				}
@@ -167,17 +178,21 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				require.Equal(t, "request", billing["billing_unit"])
 				require.Equal(t, "tiered_expr", billing["billing_mode"])
 				require.Equal(t, 0.00075, billing["fixed_price"])
+				require.Equal(t, expression, billing["expr_b64"])
+				require.Equal(t, "request", billing["matched_tier"])
+				require.Equal(t, true, billing["is_task"])
+				require.EqualValues(t, 2, billing["usage_facts"].(map[string]any)["image_count"])
+				require.Len(t, billing["request_rules"], 1)
+				require.Len(t, billing["tool_surcharges"], 1)
 				require.EqualValues(t, 1250, billing["frt"])
 				require.EqualValues(t, 40, row["metering"].(map[string]any)["cache_read_tokens"])
 				if int(row["token_id"].(float64)) == internal.Id {
-					require.Equal(t, "Pilot", row["token_name"])
+					require.Equal(t, internal.Name, row["token_name"])
 					require.Equal(t, "Current member", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
 				} else {
 					if int(row["token_id"].(float64)) == legacy.Id {
 						require.Equal(t, legacy.Name, row["token_name"])
-					} else if int(row["token_id"].(float64)) > 0 {
-						require.Equal(t, "Key #9999", row["token_name"])
-					} else {
+					} else if int(row["token_id"].(float64)) != external.Id {
 						require.Empty(t, row["token_name"])
 					}
 				}
@@ -188,20 +203,23 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			require.Len(t, exported, 8)
 			require.Equal(t, 2, calls)
 			for _, row := range exported[:7] {
-				if int(row["token_id"].(float64)) != external.Id {
-					require.NotContains(t, fmt.Sprint(row), "private")
-					require.Contains(t, row["other"], `"frt":1250`)
-				}
+				require.Empty(t, row["content"])
+				require.NotContains(t, row["other"], "private")
+				require.Contains(t, row["other"], `"frt":1250`)
+				require.Contains(t, row["other"], expression)
 				if int(row["token_id"].(float64)) == internal.Id {
 					require.Equal(t, "Current member", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
 				}
 			}
 			byAlias := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
-			require.EqualValues(t, 3, byAlias["data"].(map[string]any)["total"])
+			require.EqualValues(t, 1, byAlias["data"].(map[string]any)["total"])
 			aliasStat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
-			require.EqualValues(t, 108, aliasStat["data"].(map[string]any)["quota"])
-			hiddenName := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name="+internal.Name, 41)[0]
-			require.EqualValues(t, 0, hiddenName["data"].(map[string]any)["total"])
+			require.EqualValues(t, 3, aliasStat["data"].(map[string]any)["quota"])
+			byName := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name="+internal.Name, 41)[0]
+			require.EqualValues(t, 2, byName["data"].(map[string]any)["total"])
+			admin := callLogHandler(t, GetAllLogs, 7, common.RoleAdminUser, "token_name="+internal.Name)[0]
+			require.Equal(t, admin["data"].(map[string]any)["items"].([]any)[0].(map[string]any)["token_name"],
+				byName["data"].(map[string]any)["items"].([]any)[0].(map[string]any)["token_name"])
 			query := fmt.Sprintf("token_id=%d", internal.Id)
 			own := callLogHandler(t, GetUserLogs, 41, common.RoleCommonUser, query)[0]
 			require.Contains(t, fmt.Sprint(own), "private research prompt")
@@ -210,7 +228,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			require.NoError(t, internal.Delete())
 			historical := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
 			require.EqualValues(t, 2, historical["data"].(map[string]any)["total"])
-			require.NotContains(t, fmt.Sprint(historical), "private")
+			require.NotContains(t, fmt.Sprint(historical), "private research prompt")
 			require.Contains(t, fmt.Sprint(historical), "Current member")
 			attributionStatus = http.StatusServiceUnavailable
 			unavailable := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]

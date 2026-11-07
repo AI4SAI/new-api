@@ -43,8 +43,6 @@ type Token struct {
 	AllowUserQuotaQuery bool `json:"allow_user_quota_query"`
 }
 
-const ManagedTokenDisplayName = "Pilot"
-
 func (token *Token) GetAutoGroups() ([]string, error) {
 	if token.AutoGroups == "" {
 		return nil, nil
@@ -204,11 +202,7 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 		if err != nil {
 			return nil, 0, err
 		}
-		if humanMetadata {
-			baseQuery = baseQuery.Where("CASE WHEN COALESCE(managed_binding_ref, '') <> '' THEN ? ELSE name END LIKE ? ESCAPE '!'", ManagedTokenDisplayName, keywordPattern)
-		} else {
-			baseQuery = baseQuery.Where("name LIKE ? ESCAPE '!'", keywordPattern)
-		}
+		baseQuery = baseQuery.Where("name LIKE ? ESCAPE '!'", keywordPattern)
 	}
 	if token != "" {
 		tokenPattern, err := sanitizeLikePattern(token)
@@ -852,23 +846,22 @@ func visibleTokenQuery(query *gorm.DB, externalOnly []bool) *gorm.DB {
 }
 
 type TokenLogVisibility struct {
-	Managed     bool
-	FullDetails bool
-	BindingRef  string
+	Managed    bool
+	BindingRef string
 }
 
 // Derive disclosure from immutable provenance, including retired credentials.
 // Log and primary databases can be separate; names never establish provenance.
 func UserTokenLogVisibility(userID int) (map[int]TokenLogVisibility, error) {
 	var tokens []Token
-	err := DB.Unscoped().Select("id", "managed_binding_ref", "management_creator_id").Where("user_id = ?", userID).Find(&tokens).Error
+	err := DB.Unscoped().Select("id", "managed_binding_ref").Where("user_id = ?", userID).Find(&tokens).Error
 	if err != nil {
 		return nil, err
 	}
 	visibility := make(map[int]TokenLogVisibility, len(tokens))
 	for _, token := range tokens {
 		managed := token.ManagedBindingRef != ""
-		visibility[token.Id] = TokenLogVisibility{Managed: managed, FullDetails: !managed && token.ManagementCreatorID > 0, BindingRef: token.ManagedBindingRef}
+		visibility[token.Id] = TokenLogVisibility{Managed: managed, BindingRef: token.ManagedBindingRef}
 	}
 	return visibility, nil
 }

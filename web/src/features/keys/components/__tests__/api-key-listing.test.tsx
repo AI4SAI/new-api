@@ -372,7 +372,7 @@ async function renderKeysPage(
 }
 
 it.each([false, true])(
-  'shows an automatically managed Pilot key without secret or mutation controls on mobile=%s',
+  'shows the original managed key name and separate attribution without secret or mutation controls on mobile=%s',
   async (mobile) => {
     if (mobile) {
       const matchMedia = window.matchMedia
@@ -383,7 +383,7 @@ it.each([false, true])(
     }
     const { post, put, router } = await renderKeysPage(1, {
       managed: true,
-      name: 'Pilot',
+      name: 'pilot-recorded-name',
       key: '',
       allow_ips: null,
       attribution: {
@@ -396,7 +396,7 @@ it.each([false, true])(
         },
       },
     })
-    expect(screen.getByText('Pilot')).toBeVisible()
+    expect(screen.getByText('pilot-recorded-name')).toBeVisible()
     expect(screen.getByText('Current member')).toBeVisible()
     expect(screen.getByText(/Climate study/)).toBeVisible()
     expect(screen.queryByText('member-user')).not.toBeInTheDocument()
@@ -422,7 +422,7 @@ it.each([false, true])(
     await waitFor(() =>
       expect(router.state.location.search).toMatchObject({
         token_id: 7,
-        token: 'Pilot',
+        token: 'pilot-recorded-name',
       })
     )
     expect(post).not.toHaveBeenCalled()
