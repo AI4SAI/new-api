@@ -173,31 +173,6 @@ export async function updateApiKey(
   return res.data
 }
 
-// Delete a single API key
-export async function deleteApiKey(
-  id: number,
-  workspaceKey?: string
-): Promise<ApiResponse> {
-  const res = await api.delete(
-    `/api/token/${id}/`,
-    modelAccountRequest(workspaceKey)
-  )
-  return res.data
-}
-
-// Batch delete multiple API keys
-export async function batchDeleteApiKeys(
-  ids: number[],
-  workspaceKey?: string
-): Promise<ApiResponse<number>> {
-  const res = await api.post(
-    '/api/token/batch',
-    { ids },
-    modelAccountRequest(workspaceKey)
-  )
-  return res.data
-}
-
 // Update API key status (enable/disable)
 export async function updateApiKeyStatus(
   id: number,

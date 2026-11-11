@@ -130,13 +130,13 @@ func TestManagedResourceScopeQueriesAndMutations(t *testing.T) {
 			require.NoError(t, member.SelectUpdate())
 			member.Id = tokens[2].Id
 			require.ErrorIs(t, member.UpdateManagedName("forbidden"), ErrManagedResourceScopeDenied)
-			require.ErrorIs(t, member.Delete(), ErrManagedResourceScopeDenied)
+			require.ErrorIs(t, member.Delete(), ErrTokenDeletionNotAllowed)
 
 			for _, batch := range [][]int{{tokens[0].Id, tokens[2].Id}, {tokens[0].Id, -1}} {
 				_, err = scope.GetTokenKeys(batch)
 				require.ErrorIs(t, err, ErrManagedResourceScopeDenied)
 				_, err = scope.BatchDeleteTokens(batch)
-				require.ErrorIs(t, err, ErrManagedResourceScopeDenied)
+				require.ErrorIs(t, err, ErrTokenDeletionNotAllowed)
 				_, err = scope.GetToken(tokens[0].Id)
 				require.NoError(t, err, "a denied batch must not delete the authorized item")
 			}
@@ -151,35 +151,37 @@ func TestManagedResourceScopeQueriesAndMutations(t *testing.T) {
 				_, err = managerScope.GetTokenKeys(batch)
 				require.ErrorIs(t, err, ErrManagedResourceScopeDenied)
 				_, err = managerScope.BatchDeleteTokens(batch)
-				require.ErrorIs(t, err, ErrManagedResourceScopeDenied)
+				require.ErrorIs(t, err, ErrTokenDeletionNotAllowed)
 				_, err = managerScope.GetToken(tokens[0].Id)
 				require.NoError(t, err, "a denied administrator batch must not partially mutate the account")
 			}
-			countDeleted, err := scope.BatchDeleteTokens([]int{tokens[0].Id, tokens[0].Id})
-			require.NoError(t, err)
-			assert.Equal(t, 1, countDeleted)
-			countDeleted, err = scope.BatchDeleteTokens([]int{tokens[0].Id})
-			require.NoError(t, err)
+			for _, selected := range []ManagedResourceScope{scope, managerScope, {OwnerID: owner}} {
+				countDeleted, err := selected.BatchDeleteTokens([]int{tokens[0].Id, tokens[0].Id})
+				require.ErrorIs(t, err, ErrTokenDeletionNotAllowed)
+				assert.Zero(t, countDeleted)
+				retained, err := selected.GetToken(tokens[0].Id)
+				require.NoError(t, err)
+				require.ErrorIs(t, retained.Delete(), ErrTokenDeletionNotAllowed)
+				assert.False(t, retained.DeletedAt.Valid)
+				assert.Equal(t, common.TokenStatusDisabled, retained.Status)
+			}
+			countDeleted, err := BatchDeleteTokens([]int{tokens[4].Id, tokens[5].Id}, owner)
+			require.ErrorIs(t, err, ErrTokenDeletionNotAllowed)
 			assert.Zero(t, countDeleted)
+			require.ErrorIs(t, DeleteTokenById(tokens[0].Id, owner), ErrTokenDeletionNotAllowed)
+			// Seed a pre-policy deleted row directly, preserving historical read coverage.
+			require.NoError(t, DB.Delete(&tokens[0]).Error)
 			visibility, err = scope.UserTokenLogVisibility()
 			require.NoError(t, err)
-			assert.Contains(t, visibility, tokens[0].Id, "retired credentials retain their scoped historical visibility")
+			assert.Contains(t, visibility, tokens[0].Id)
 			keys, err = scope.GetTokenKeys([]int{tokens[0].Id, tokens[1].Id})
 			require.NoError(t, err)
 			require.Len(t, keys, 1)
 			assert.Equal(t, tokens[1].Id, keys[0].Id)
-			countDeleted, err = managerScope.BatchDeleteTokens([]int{tokens[0].Id})
-			require.NoError(t, err)
-			assert.Zero(t, countDeleted)
 			keys, err = managerScope.GetTokenKeys([]int{tokens[0].Id, tokens[1].Id})
 			require.NoError(t, err)
-			require.Len(t, keys, 1, "deleted secrets must not be returned to account administrators")
+			require.Len(t, keys, 1)
 			assert.Equal(t, tokens[1].Id, keys[0].Id)
-			countDeleted, err = BatchDeleteTokens([]int{tokens[4].Id, tokens[5].Id}, owner)
-			require.NoError(t, err)
-			assert.Equal(t, 1, countDeleted, "ordinary personal callers retain their previous batch behavior")
-			_, err = GetTokenByIds(tokens[5].Id, owner+1)
-			require.NoError(t, err)
 		})
 	}
 }
@@ -294,7 +296,7 @@ func TestManagedResourceScopeSeparateLogsAndWriters(t *testing.T) {
 			retired := Token{UserId: owner.Id, Key: "retired-task-subject", Name: "task key", ManagedSubjectRef: "member-a",
 				BillingContextRef: &taskContext, BillingContextConfirmed: true}
 			require.NoError(t, DB.Create(&retired).Error)
-			require.NoError(t, retired.Delete())
+			require.NoError(t, DB.Delete(&retired).Error) // pre-policy historical fixture
 			RecordTaskBillingLog(RecordTaskBillingLogParams{UserId: owner.Id, TokenId: retired.Id,
 				LogType: LogTypeConsume, ModelName: "model-a", Quota: 5, Other: NewLogOther()})
 			filter.Type, filter.TokenID = LogTypeConsume, &retired.Id

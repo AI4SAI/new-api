@@ -325,8 +325,7 @@ export function ApiKeysTable() {
     data: apiKeys,
     columns,
     enableRowSelection: (row) =>
-      !row.original.managed &&
-      (canPerform('model.keys.reveal') || canPerform('model.keys.delete')),
+      !row.original.managed && canPerform('model.keys.reveal'),
     columnFilters,
     columnVisibilityStorageKey: API_KEYS_COLUMN_VISIBILITY_STORAGE_KEY,
     globalFilter,

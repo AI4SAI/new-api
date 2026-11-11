@@ -90,7 +90,9 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, DB.Transaction(func(tx *gorm.DB) error {
 		return ClaimExternalIdentityWithTx(tx, ExternalIdentityProviderTelegram, user.TelegramId, user.Id)
 	}))
-	require.NoError(t, DB.Create(&Token{UserId: user.Id, Key: "hard-delete-success-token"}).Error)
+	token := Token{UserId: user.Id, Key: "hard-delete-success-token", ExpiredTime: -1, UnlimitedQuota: true}
+	require.NoError(t, DB.Create(&token).Error)
+	require.NoError(t, cacheSetTokenForTest(token))
 	require.NoError(t, DB.Create(&UserAccessToken{UserId: user.Id, TokenHash: AccessTokenFingerprint("nap_hard-delete-success-token")}).Error)
 	require.NoError(t, DB.Create(&TwoFA{UserId: user.Id, Secret: "secret", IsEnabled: true}).Error)
 	require.NoError(t, DB.Create(&TwoFABackupCode{UserId: user.Id, CodeHash: "hash"}).Error)
@@ -118,7 +120,6 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, DB.Unscoped().Model(&User{}).Where("id = ?", user.Id).Count(&count).Error)
 	assert.Zero(t, count)
 	for _, record := range []any{
-		&Token{},
 		&TwoFA{},
 		&TwoFABackupCode{},
 		&PasskeyCredential{},
@@ -136,6 +137,14 @@ func TestHardDeleteUserPublishesTombstoneAndPurgesAuthenticationData(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, "2", committed)
 	assert.False(t, server.Exists(getUserCacheKey(user.Id)))
+	var retained Token
+	require.NoError(t, DB.First(&retained, token.Id).Error)
+	assert.Equal(t, token.Key, retained.Key)
+	assert.Equal(t, user.Id, retained.UserId)
+	_, err = GetUserCache(user.Id)
+	require.Error(t, err, "retaining model history does not restore the deleted owner's authorization")
+	_, err = cacheGetTokenByKey(token.Key)
+	require.Error(t, err, "preheated model key metadata is invalidated with its deleted owner")
 }
 
 func TestIncrementFailedAttemptsCountsConcurrentFailures(t *testing.T) {

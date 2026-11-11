@@ -46,6 +46,7 @@ type Token struct {
 }
 
 var ErrManagedResourceScopeDenied = errors.New("managed resource scope denied")
+var ErrTokenDeletionNotAllowed = errors.New("API keys cannot be deleted. Disable the key instead.")
 
 // ManagedResourceScope comes from the trusted authorizer, never request JSON.
 // A restricted scope without a subject cannot fall back to the whole account.
@@ -674,7 +675,7 @@ func (token *Token) SelectUpdate() (err error) {
 	if token.Status == common.TokenStatusEnabled && token.BillingContextRef != nil && !token.BillingContextConfirmed {
 		return ErrBillingContextConflict
 	}
-	return token.mutateMetadata(map[string]any{"status": token.Status}, false)
+	return token.mutateMetadata(map[string]any{"status": token.Status})
 }
 
 // UpdateManagedName cannot overwrite concurrently updated quota or routing.
@@ -682,15 +683,16 @@ func (token *Token) UpdateManagedName(name string) error {
 	if len(name) > 50 {
 		return errors.New("token name is too long")
 	}
-	return token.mutateMetadata(map[string]any{"name": name}, false)
+	return token.mutateMetadata(map[string]any{"name": name})
 }
 
-func (token *Token) Delete() (err error) {
-	return token.mutateMetadata(nil, true)
+// Created model keys retain their identity and history. Revocation uses status.
+func (token *Token) Delete() error {
+	return ErrTokenDeletionNotAllowed
 }
 
 // mutateMetadata serializes control-plane mutations, not inference requests.
-func (token *Token) mutateMetadata(fields map[string]any, deleting bool) (err error) {
+func (token *Token) mutateMetadata(fields map[string]any) (err error) {
 	var attempted int64
 	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
 	err = DB.Transaction(func(tx *gorm.DB) error {
@@ -720,17 +722,9 @@ func (token *Token) mutateMetadata(fields map[string]any, deleting bool) (err er
 		if err := setTokenMetadataFence(current.Key, next); err != nil {
 			return err
 		}
-		if fields == nil {
-			fields = map[string]any{}
-		}
 		fields["metadata_revision"] = next
 		if err := tx.Model(&current).Updates(fields).Error; err != nil {
 			return err
-		}
-		if deleting {
-			if err := tx.Delete(&current).Error; err != nil {
-				return err
-			}
 		}
 		token.Key, token.MetadataRevision = current.Key, next
 		if name, ok := fields["name"].(string); ok {
@@ -909,7 +903,7 @@ func (scope ManagedResourceScope) batch(query *gorm.DB, ids []int, externalOnly 
 	return tokens, nil
 }
 
-// BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
+// BatchDeleteTokens retains the legacy entrypoint and rejects key deletion.
 func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, operationErr error) {
 	return (ManagedResourceScope{OwnerID: userId}).BatchDeleteTokens(ids, externalOnly...)
 }
@@ -919,59 +913,7 @@ func (scope ManagedResourceScope) BatchDeleteTokens(ids []int, externalOnly ...b
 		return 0, common.NewMessage("Token IDs cannot be empty")
 	}
 
-	tx := DB.Begin()
-	if tx.Error != nil {
-		return 0, tx.Error
-	}
-
-	var tokens []Token
-	defer func() {
-		for i := range tokens {
-			tokens[i].resolveMetadataOutcome(&operationErr, tokens[i].MetadataRevision)
-		}
-	}()
-	selected, err := scope.batch(lockForUpdate(tx), ids, externalOnly)
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	for _, token := range selected {
-		if !token.DeletedAt.Valid {
-			tokens = append(tokens, token)
-		}
-	}
-	for i := range tokens {
-		tokens[i].MetadataRevision = max(tokens[i].MetadataRevision, 1) + 1
-		if err := setTokenMetadataFence(tokens[i].Key, tokens[i].MetadataRevision); err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-		if err := tx.Model(&tokens[i]).Update("metadata_revision", tokens[i].MetadataRevision).Error; err != nil {
-			tx.Rollback()
-			return 0, err
-		}
-	}
-
-	query, err := scope.apply(visibleTokenQuery(tx, externalOnly), "")
-	if err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-	if err := query.Where("id IN ?", ids).Delete(&Token{}).Error; err != nil {
-		tx.Rollback()
-		return 0, err
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		return 0, err
-	}
-	for _, token := range tokens {
-		if err := publishCommittedTokenMetadata(token.Key, token.MetadataRevision); err != nil {
-			return len(tokens), err
-		}
-	}
-
-	return len(tokens), nil
+	return 0, ErrTokenDeletionNotAllowed
 }
 
 func GetTokenKeysByIds(ids []int, userId int, externalOnly ...bool) ([]Token, error) {

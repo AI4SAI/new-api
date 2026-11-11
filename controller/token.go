@@ -75,6 +75,10 @@ type tokenResponse struct {
 }
 
 func managedTokenError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrTokenDeletionNotAllowed) {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("API keys cannot be deleted. Disable the key instead."), gin.H{"code": "KEY_DELETION_NOT_ALLOWED"})
+		return
+	}
 	if errors.Is(err, model.ErrManagedResourceScopeDenied) || errors.Is(err, service.ErrManagedAccountDenied) {
 		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
 		return
@@ -625,16 +629,7 @@ func DeleteToken(c *gin.Context) {
 	}
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
-	err = token.Delete()
-	if err != nil {
-		managedTokenError(c, err)
-		return
-	}
-	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-	})
+	managedTokenError(c, token.Delete())
 }
 
 func UpdateToken(c *gin.Context) {
@@ -807,24 +802,14 @@ func DeleteTokenBatch(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	params := tokenBatchAuditParams(c, tokenBatch.Ids)
+	tokenBatchAuditParams(c, tokenBatch.Ids)
 	if len(tokenBatch.Ids) == 0 {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
 	scope := service.ManagementResourceScope(c)
-	count, err := scope.BatchDeleteTokens(tokenBatch.Ids, !c.GetBool("access_token_managed"))
-	if err != nil {
-		managedTokenError(c, err)
-		return
-	}
-	params["count"] = count
-	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
-	c.JSON(http.StatusOK, gin.H{
-		"success": true,
-		"message": "",
-		"data":    count,
-	})
+	_, err := scope.BatchDeleteTokens(tokenBatch.Ids, !c.GetBool("access_token_managed"))
+	managedTokenError(c, err)
 }
 
 func GetTokenKeysBatch(c *gin.Context) {
@@ -866,8 +851,9 @@ func GetManagedAccountContext(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
 		return
 	}
+	actions := slices.DeleteFunc(slices.Clone(account.AllowedActions), func(action string) bool { return action == "model.keys.delete" })
 	common.ApiSuccess(c, gin.H{"workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID, "account_label": account.Label, "account_kind": account.Kind,
-		"schema_version": account.SchemaVersion, "resource_scope": account.ResourceScope, "allowed_actions": account.AllowedActions,
+		"schema_version": account.SchemaVersion, "resource_scope": account.ResourceScope, "allowed_actions": actions,
 		"allowed_update_fields": account.AllowedUpdateFields, "allowed_statuses": account.AllowedStatuses})
 }
 

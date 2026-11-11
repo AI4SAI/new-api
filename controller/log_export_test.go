@@ -175,8 +175,8 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				require.NoError(t, logDB.Create(&entry).Error)
 			}
 			require.NoError(t, logDB.Create(&model.Log{UserId: 41, TokenId: 0, Type: model.LogTypeTopup, Quota: 10000, CreatedAt: now, Content: "unrelated owner payment"}).Error)
-			require.NoError(t, external.Delete())
-			require.NoError(t, legacy.Delete())
+			require.NoError(t, mainDB.Delete(external).Error) // pre-policy historical fixture
+			require.NoError(t, mainDB.Delete(legacy).Error)   // pre-policy historical fixture
 			listed := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
 			require.Equal(t, 1, calls, "one page resolves repeated tokens in one batch")
 			require.EqualValues(t, 8, listed["data"].(map[string]any)["total"])
@@ -271,7 +271,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			require.Contains(t, fmt.Sprint(own), "private research prompt")
 			personal := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query+"&user_id=41")[0]
 			require.EqualValues(t, 0, personal["data"].(map[string]any)["total"])
-			require.NoError(t, internal.Delete())
+			require.NoError(t, mainDB.Delete(internal).Error) // pre-policy historical fixture
 			historical := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, query, 41)[0]
 			require.EqualValues(t, 2, historical["data"].(map[string]any)["total"])
 			require.NotContains(t, fmt.Sprint(historical), "private research prompt")

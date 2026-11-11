@@ -333,7 +333,8 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.NoError(t, db.First(&preserved, external.Id).Error, "a mixed batch must not delete its authorized item")
 	c, w = request("POST", "/api/token/batch", map[string]any{"ids": []int{external.Id}})
 	DeleteTokenBatch(c)
-	require.True(t, decodeAPIResponse(t, w).Success)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.False(t, decodeAPIResponse(t, w).Success)
 	var count int64
 	require.NoError(t, db.Model(&model.Token{}).Where("id = ?", internal.Id).Count(&count).Error)
 	require.EqualValues(t, 1, count)
@@ -350,10 +351,8 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	c, w = request("GET", "/api/token/", nil)
 	GetAllTokens(c)
 	require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
-	require.Equal(t, 2, page.Total)
-	for _, row := range page.Items {
-		require.NotEqual(t, external.Id, row.ID)
-	}
+	require.Equal(t, 3, page.Total)
+	require.NoError(t, db.First(&preserved, external.Id).Error)
 	pendingRef := "99999999-9999-4999-8999-999999999999"
 	pending := seedToken(t, db, 41, "pending registration", "pending-key")
 	require.NoError(t, db.Model(pending).Updates(map[string]any{"billing_context_ref": pendingRef, "status": common.TokenStatusDisabled}).Error)
@@ -362,7 +361,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	response = decodeAPIResponse(t, w)
 	require.True(t, response.Success, w.Body.String())
 	require.NoError(t, common.Unmarshal(response.Data, &page))
-	require.Equal(t, 3, page.Total)
+	require.Equal(t, 4, page.Total)
 	require.Equal(t, pending.Id, page.Items[0].ID)
 	require.Equal(t, common.TokenStatusDisabled, page.Items[0].Status)
 }
@@ -631,8 +630,8 @@ func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {
 			revealed := call("POST", fmt.Sprintf("/api/token/%d/key", owned.Id), nil)
 			require.True(t, decodeAPIResponse(t, revealed).Success)
 			require.Contains(t, revealed.Body.String(), owned.Key)
-			require.True(t, decodeAPIResponse(t, call("POST", "/api/token/batch", map[string]any{"ids": []int{owned.Id}})).Success)
-			require.ErrorIs(t, db.First(&model.Token{}, owned.Id).Error, gorm.ErrRecordNotFound)
+			require.Equal(t, http.StatusForbidden, call("POST", "/api/token/batch", map[string]any{"ids": []int{owned.Id}}).Code)
+			require.NoError(t, db.First(&model.Token{}, owned.Id).Error)
 		})
 	}
 }
@@ -1208,6 +1207,68 @@ func TestGetTokenKeyRequiresOwnershipAndReturnsFullKey(t *testing.T) {
 	}
 }
 
+func TestCreatedModelKeysRejectDeletionAndRetainDisable(t *testing.T) {
+	db := setupTokenControllerTestDB(t)
+	for _, mode := range []string{"personal", "administrator", "member", "pilot"} {
+		t.Run(mode, func(t *testing.T) {
+			token := seedToken(t, db, 41, "retained "+mode, "retained-secret-"+mode)
+			if mode == "member" {
+				require.NoError(t, db.Model(token).Update("managed_subject_ref", managedMemberA).Error)
+			}
+			if mode == "pilot" {
+				require.NoError(t, db.Model(token).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+			}
+			call := func(handler gin.HandlerFunc, method, path string, body any) *httptest.ResponseRecorder {
+				c, response := newAuthenticatedContext(t, method, path, body, 41)
+				c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(token.Id)}}
+				if mode == "administrator" || mode == "member" {
+					subject := ""
+					if mode == "member" {
+						subject = managedMemberA
+					}
+					c.Set("managed_account", managedControllerAccount(subject))
+				}
+				c.Set("access_token_managed", mode == "pilot")
+				handler(c)
+				return response
+			}
+			for _, status := range []int{common.TokenStatusEnabled, common.TokenStatusDisabled, common.TokenStatusExpired} {
+				require.NoError(t, db.Model(token).Update("status", status).Error)
+				before := model.Token{}
+				require.NoError(t, db.First(&before, token.Id).Error)
+				for _, operation := range []struct {
+					handler      gin.HandlerFunc
+					method, path string
+					body         any
+				}{{DeleteToken, "DELETE", "/api/token/1", nil}, {DeleteTokenBatch, "POST", "/api/token/batch", map[string]any{"ids": []int{token.Id}}}} {
+					response := call(operation.handler, operation.method, operation.path, operation.body)
+					require.Equal(t, http.StatusForbidden, response.Code)
+					require.False(t, decodeAPIResponse(t, response).Success)
+					require.Contains(t, response.Body.String(), "KEY_DELETION_NOT_ALLOWED")
+					var after model.Token
+					require.NoError(t, db.First(&after, token.Id).Error)
+					require.Equal(t, before, after, "a rejected delete preserves the key and all metadata")
+				}
+			}
+			response := call(UpdateToken, "PUT", "/api/token/?status_only=true", map[string]any{"id": token.Id, "status": common.TokenStatusDisabled})
+			require.True(t, decodeAPIResponse(t, response).Success, response.Body.String())
+			var retained model.Token
+			require.NoError(t, db.First(&retained, token.Id).Error)
+			require.Equal(t, common.TokenStatusDisabled, retained.Status)
+			require.Equal(t, token.Key, retained.Key)
+			if mode == "administrator" || mode == "member" {
+				response = call(GetManagedAccountContext, "GET", "/api/token/context", nil)
+				var capability struct {
+					AllowedActions []string `json:"allowed_actions"`
+				}
+				require.NoError(t, common.Unmarshal(decodeAPIResponse(t, response).Data, &capability))
+				require.NotContains(t, capability.AllowedActions, "model.keys.delete")
+				require.Contains(t, capability.AllowedActions, "model.keys.update")
+			}
+		})
+	}
+}
+
 func TestTokenAllowUserQuotaQueryOnCreateAndUpdate(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -1439,14 +1500,14 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "disable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":1,"to":2}`},
 		{name: "enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":2,"to":1}`, initialStatus: common.TokenStatusDisabled},
 		{name: "expired enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusExpired},
-		{name: "delete", method: "DELETE", path: "/$id", action: "token.delete", success: true, params: `{"id":$id,"name":"owned"}`},
+		{name: "delete is refused", method: "DELETE", path: "/$id", action: "token.delete", params: `{"id":$id,"name":"owned"}`},
 		{name: "foreign delete", method: "DELETE", path: "/$other", action: "token.delete", params: `{"id":$other}`},
 		{name: "missing delete", method: "DELETE", path: "/999999", action: "token.delete", params: `{"id":999999}`},
 		{name: "key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`},
 		{name: "PAT key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`, usePAT: true},
 		{name: "foreign key view", method: "POST", path: "/$other/key", action: "token.key_view", params: `{"id":$other}`},
 		{name: "rate limited key view", method: "POST", path: "/$id/key", action: "token.key_view", params: `{"id":$id}`, rateLimit: true},
-		{name: "batch delete partial and duplicate", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1}`},
+		{name: "batch delete is refused without partial changes", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", params: `{"requested_ids":[$id,$id,$other,999999],"total":4}`},
 		{name: "empty batch delete", method: "POST", path: "/batch", body: `{"ids":[]}`, action: "token.delete_batch", params: `{"requested_ids":[],"total":0}`},
 		{name: "batch keys partial and duplicate", method: "POST", path: "/batch/keys", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1,"returned_ids":[$id]}`},
 		{name: "batch keys no matches", method: "POST", path: "/batch/keys", body: `{"ids":[$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$other,999999],"total":2,"count":0,"returned_ids":[]}`},
@@ -1540,6 +1601,10 @@ func verifyAPITokenAudit(t *testing.T) {
 			assert.Equal(t, response.Code, operation.Status)
 			if tc.rateLimit {
 				assert.Equal(t, 429, response.Code)
+			} else if tc.name == "delete is refused" || tc.name == "batch delete is refused without partial changes" {
+				assert.Equal(t, http.StatusForbidden, response.Code)
+				assert.False(t, decodeAPIResponse(t, response).Success)
+				require.NoError(t, model.DB.First(&model.Token{}, owned.Id).Error)
 			} else if tc.name == "create storage failure" {
 				assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 				assert.False(t, decodeAPIResponse(t, response).Success)
@@ -1615,7 +1680,7 @@ func verifyAPITokenAudit(t *testing.T) {
 			assert.Equal(t, ids[:100], params.IDs)
 			assert.True(t, params.Truncated)
 			assert.Equal(t, 101, params.Total)
-			assert.Equal(t, path == "/api/token/batch", event.Success)
+			assert.False(t, event.Success)
 			if event.Success {
 				require.NotNil(t, params.Count)
 				assert.Zero(t, *params.Count)

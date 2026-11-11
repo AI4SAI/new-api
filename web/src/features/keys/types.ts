@@ -160,9 +160,4 @@ export interface TokenAutoGroupsConfig {
 // Dialog Types
 // ============================================================================
 
-export type ApiKeysDialogType =
-  | 'create'
-  | 'update'
-  | 'delete'
-  | 'batch-delete'
-  | 'cc-switch'
+export type ApiKeysDialogType = 'create' | 'update' | 'cc-switch'

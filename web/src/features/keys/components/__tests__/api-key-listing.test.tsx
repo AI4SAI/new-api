@@ -57,7 +57,6 @@ import {
 } from '../../types'
 import { ApiKeyQuotaCell } from '../api-key-quota-cell'
 import { useApiKeysColumns } from '../api-keys-columns'
-import { ApiKeysDeleteDialog } from '../api-keys-delete-dialog'
 import { ApiKeysPrimaryButtons } from '../api-keys-primary-buttons'
 import { ApiKeysProvider } from '../api-keys-provider'
 import { ApiKeysTable } from '../api-keys-table'
@@ -308,7 +307,6 @@ function KeysPage(props: { account?: ManagedAccountContext }) {
     >
       {props.account && <ApiKeysPrimaryButtons />}
       <ApiKeysTable />
-      <ApiKeysDeleteDialog />
       <Toaster />
     </ApiKeysProvider>
   )
@@ -321,15 +319,14 @@ async function renderKeysPage(
   account?: ManagedAccountContext
 ) {
   let currentKey = { ...key, status, ...overrides }
-  let deleted = false
   vi.mocked(api.get).mockImplementation(async (url) => {
     if (url.startsWith('/api/token/')) {
       return {
         data: {
           success: true,
           data: {
-            items: deleted ? additionalKeys : [currentKey, ...additionalKeys],
-            total: (deleted ? 0 : 1) + additionalKeys.length,
+            items: [currentKey, ...additionalKeys],
+            total: 1 + additionalKeys.length,
           },
         },
       }
@@ -344,10 +341,7 @@ async function renderKeysPage(
     currentKey = { ...currentKey, status: update.status }
     return { data: { success: true, data: currentKey } }
   })
-  vi.spyOn(api, 'delete').mockImplementation(async () => {
-    deleted = true
-    return { data: { success: true } }
-  })
+  vi.spyOn(api, 'delete').mockResolvedValue({ data: { success: false } })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: 10_000 } },
   })
@@ -479,7 +473,7 @@ it('excludes managed keys when selecting all rows for a batch copy', async () =>
   )
 })
 
-it('keeps updated rows after navigation and removes a deleted key without reviving cached state', async () => {
+it('keeps a disabled key and its usage action after navigation', async () => {
   const { router } = await renderKeysPage()
   await userEvent.click(screen.getByRole('button', { name: 'Disable' }))
   await screen.findByText('Disabled')
@@ -492,19 +486,13 @@ it('keeps updated rows after navigation and removes a deleted key without revivi
   await screen.findByText('Usage')
   await act(() => router.navigate({ to: '/keys' }))
   await screen.findByText('Disabled')
+  expect(screen.getByText('production')).toBeVisible()
   await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
-  await userEvent.click(screen.getByRole('menuitem', { name: /^Delete$/ }))
-  await userEvent.click(
-    within(screen.getByRole('alertdialog')).getByRole('button', {
-      name: /^Delete$/,
-    })
-  )
-  await waitFor(() =>
-    expect(
-      screen.queryByRole('row', { name: /production/ })
-    ).not.toBeInTheDocument()
-  )
-  await screen.findByText('No API Keys Found')
+  expect(screen.getByRole('menuitem', { name: 'Usage' })).toBeVisible()
+  expect(
+    screen.queryByRole('menuitem', { name: /^Delete$/ })
+  ).not.toBeInTheDocument()
+  expect(api.delete).not.toHaveBeenCalled()
 })
 
 it('combines creation and last use while keeping expiry, models and IP restrictions separate', async () => {
@@ -737,7 +725,9 @@ it('members can disable and copy their external key while create and re-enable s
     })
   )
   await user.click(screen.getByRole('button', { name: 'Open menu' }))
-  expect(screen.getByRole('menuitem', { name: /^Delete$/ })).toBeVisible()
+  expect(
+    screen.queryByRole('menuitem', { name: /^Delete$/ })
+  ).not.toBeInTheDocument()
   await user.click(screen.getByRole('menuitem', { name: 'Copy Key' }))
   await waitFor(() =>
     expect(post).toHaveBeenCalledWith(
@@ -819,6 +809,39 @@ it.each([
     expect(screen.getByRole('button', { name: 'Disable' })).toBeEnabled()
     await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
     expect(screen.getByRole('menuitem', { name: 'Copy Key' })).toBeEnabled()
-    expect(screen.getByRole('menuitem', { name: /^Delete$/ })).toBeEnabled()
+    expect(
+      screen.queryByRole('menuitem', { name: /^Delete$/ })
+    ).not.toBeInTheDocument()
+  }
+)
+
+it.each(['personal', 'member', 'administrator'] as const)(
+  '%s can copy selected keys but has no single or batch deletion entry',
+  async (kind) => {
+    let account: ManagedAccountContext | undefined
+    if (kind === 'member') account = memberAccount
+    if (kind === 'administrator') {
+      account = {
+        ...memberAccount,
+        resource_scope: { kind: 'all', subject_ref: '' },
+        allowed_statuses: [1, 2],
+      }
+    }
+    const user = userEvent.setup()
+    await renderKeysPage(1, {}, [], account)
+    await user.click(screen.getByRole('button', { name: 'Open menu' }))
+    expect(
+      screen.queryByRole('menuitem', { name: /^Delete$/ })
+    ).not.toBeInTheDocument()
+    await user.keyboard('{Escape}')
+    await user.click(screen.getByRole('checkbox', { name: 'Select all' }))
+    expect(
+      screen.getByRole('button', { name: 'Copy selected keys' })
+    ).toBeEnabled()
+    expect(
+      screen.queryByRole('button', { name: 'Delete selected API keys' })
+    ).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeEnabled()
+    expect(api.delete).not.toHaveBeenCalled()
   }
 )

@@ -19,7 +19,6 @@ For commercial licensing, please contact support@quantumnous.com
 import { useNavigate } from '@tanstack/react-router'
 import type { Row } from '@tanstack/react-table'
 import {
-  Trash2,
   Edit,
   Power,
   PowerOff,
@@ -107,7 +106,6 @@ export function DataTableRowActions<TData>({
   )
   const canEdit = canUpdateField('name')
   const canReveal = canPerform('model.keys.reveal')
-  const canDelete = canPerform('model.keys.delete')
   const canReadUsage = canPerform('model.usage.read')
 
   const handleOpenChatPreset = useCallback(
@@ -335,23 +333,6 @@ export function DataTableRowActions<TData>({
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
             )}
-          </>
-        )}
-        {canDelete && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              onClick={() => {
-                setCurrentRow(apiKey)
-                setOpen('delete')
-              }}
-              className='text-destructive focus:text-destructive'
-            >
-              {t('Delete')}
-              <DropdownMenuShortcut>
-                <Trash2 size={16} />
-              </DropdownMenuShortcut>
-            </DropdownMenuItem>
           </>
         )}
       </DataTableRowActionMenu>

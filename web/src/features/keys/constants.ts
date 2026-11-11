@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type StatusBadgeProps } from '@/components/status-badge'
+import type { StatusBadgeProps } from '@/components/status-badge'
 
 // ============================================================================
 // API Key Status Configuration
@@ -82,8 +82,6 @@ export const ERROR_MESSAGES = {
   SEARCH_FAILED: 'Failed to search API keys',
   CREATE_FAILED: 'Failed to create API key',
   UPDATE_FAILED: 'Failed to update API key',
-  DELETE_FAILED: 'Failed to delete API key',
-  BATCH_DELETE_FAILED: 'Failed to delete API keys',
   STATUS_UPDATE_FAILED: 'Failed to update API key status',
 } as const
 
@@ -94,7 +92,6 @@ export const ERROR_MESSAGES = {
 export const SUCCESS_MESSAGES = {
   API_KEY_CREATED: 'API Key created successfully',
   API_KEY_UPDATED: 'API Key updated successfully',
-  API_KEY_DELETED: 'API Key deleted successfully',
   API_KEY_ENABLED: 'API Key enabled successfully',
   API_KEY_DISABLED: 'API Key disabled successfully',
 } as const
