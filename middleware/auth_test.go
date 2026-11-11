@@ -149,14 +149,21 @@ func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServ
 	require.NoError(t, model.DB.Model(admin).Update("role", common.RoleRootUser).Error)
 	adminBundle, err := service.CreateLoginSession(admin.Id, "password", "127.0.0.1", "test")
 	require.NoError(t, err)
-	personal, _ := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write")
-	managed, managedToken := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write")
+	personal, _ := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write", "api_key:read", "api_key:write", "profile:read")
+	managed, managedToken := createMiddlewareScopedToken(t, user.Id, 0, "wallet:write", "api_key:read", "api_key:write", "profile:read")
 	require.NoError(t, model.DB.Model(managedToken).Update("managed", true).Error)
 
 	router := gin.New()
 	for _, route := range []struct{ method, path string }{
-		{http.MethodGet, "/api/user/self"}, {http.MethodGet, "/api/token/"},
+		{http.MethodGet, "/api/token/context"},
 		{http.MethodGet, "/api/token/member-candidates"},
+		{http.MethodPost, "/api/user/self/playground"},
+	} {
+		DeclareAccessTokenSessionRoute(route.method, route.path)
+		router.Handle(route.method, route.path, UserAuth(), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+	}
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/api/user/self"}, {http.MethodGet, "/api/token/"},
 		{http.MethodGet, "/api/log/self"}, {http.MethodPost, "/api/user/topup"},
 		{http.MethodGet, "/api/subscription/plans"}, {http.MethodDelete, "/api/user/self"},
 		{http.MethodPut, "/api/user/setting"}, {http.MethodGet, "/api/user/access_tokens"},
@@ -170,9 +177,18 @@ func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServ
 	}{
 		{http.MethodGet, "/api/user/self", bundle.AccessToken, http.StatusNoContent},
 		{http.MethodGet, "/api/token/", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/token/context", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/token/context", personal, http.StatusForbidden},
+		{http.MethodGet, "/api/token/context", managed, http.StatusForbidden},
+		{http.MethodGet, "/api/token/context", *user.AccessToken, http.StatusForbidden},
 		{http.MethodGet, "/api/token/member-candidates", bundle.AccessToken, http.StatusNoContent},
 		{http.MethodGet, "/api/token/member-candidates", personal, http.StatusForbidden},
 		{http.MethodGet, "/api/token/member-candidates", managed, http.StatusForbidden},
+		{http.MethodGet, "/api/token/member-candidates", *user.AccessToken, http.StatusForbidden},
+		{http.MethodPost, "/api/user/self/playground", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodPost, "/api/user/self/playground", personal, http.StatusForbidden},
+		{http.MethodPost, "/api/user/self/playground", managed, http.StatusForbidden},
+		{http.MethodPost, "/api/user/self/playground", *user.AccessToken, http.StatusForbidden},
 		{http.MethodGet, "/api/log/self", bundle.AccessToken, http.StatusNoContent},
 		{http.MethodPost, "/api/user/topup", bundle.AccessToken, http.StatusForbidden},
 		{http.MethodPost, "/api/user/topup", personal, http.StatusForbidden},
@@ -190,6 +206,32 @@ func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServ
 		response := httptest.NewRecorder()
 		router.ServeHTTP(response, request)
 		assert.Equal(t, test.status, response.Code, "%s %s: %s", test.method, test.path, response.Body.String())
+		if test.status == http.StatusForbidden && (test.path == "/api/token/context" ||
+			test.path == "/api/token/member-candidates" || test.path == "/api/user/self/playground") {
+			assert.Contains(t, response.Body.String(), "AUTH_SESSION_REQUIRED")
+		}
+	}
+}
+
+func TestAccessTokenRegistrationRejectsConflictingRules(t *testing.T) {
+	require.NotPanics(t, func() {
+		DeclareAccessTokenSessionRoute(http.MethodGet, "/api/token/context")
+		DeclareAccessTokenSessionRoute(http.MethodGet, "/api/token/context")
+		DeclareAccessTokenPermissionRoute(http.MethodGet, "/api/channel/", authz.ChannelRead)
+	})
+	require.Panics(t, func() {
+		DeclareAccessTokenPermissionRoute(http.MethodGet, "/api/token/context", authz.ChannelRead)
+	})
+	require.Panics(t, func() {
+		DeclareAccessTokenSessionRoute(http.MethodGet, "/api/channel/")
+	})
+	require.Panics(t, func() {
+		DeclareAccessTokenSessionRoute(http.MethodGet, "/api/user/self")
+	}, "registration cannot duplicate a rule in the static table")
+	for key, kind := range map[string]string{"GET /api/token/context": "session", "GET /api/channel/": "scope"} {
+		rule, found := AccessTokenRouteRule(key)
+		require.True(t, found)
+		require.Equal(t, kind, rule.Kind(), "a rejected conflicting declaration cannot replace the original rule")
 	}
 }
 

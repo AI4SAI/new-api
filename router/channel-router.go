@@ -24,6 +24,13 @@ func handlePermissionRoute(group *gin.RouterGroup, method, relativePath string, 
 	group.Handle(method, relativePath, append([]gin.HandlerFunc{middleware.RequirePermission(permission)}, handlers...)...)
 }
 
+// handleSessionRoute registers a dashboard route with its browser-only rule.
+// The caller's group provides the existing UserAuth middleware.
+func handleSessionRoute(group *gin.RouterGroup, method, relativePath string, handlers ...gin.HandlerFunc) {
+	middleware.DeclareAccessTokenSessionRoute(method, joinPaths(group.BasePath(), relativePath))
+	group.Handle(method, relativePath, handlers...)
+}
+
 // joinPaths matches gin's route path joining, which keeps a trailing slash
 // from the relative path, so declared keys equal c.FullPath().
 func joinPaths(absolutePath, relativePath string) string {

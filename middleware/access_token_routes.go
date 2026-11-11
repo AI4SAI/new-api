@@ -44,10 +44,9 @@ func accessTokenScopeRule(scope string) accessTokenRouteRule {
 	return accessTokenRouteRule{kind: accessTokenRuleScope, scope: scope}
 }
 
-// accessTokenRouteRules declares the token rule of every dashboard route that
-// is not guarded by RequirePermission, keyed by method and gin full path.
-// Casbin-guarded routes declare themselves through
-// DeclareAccessTokenPermissionRoute when they are registered.
+// accessTokenRouteRules contains dashboard rules not declared at registration,
+// keyed by method and gin full path. Registration declarations share the same
+// rule lookup and conflict checks.
 var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	// router/api-router.go: top level
 	"GET /api/models":                     accessTokenScopeRule("profile:read"),
@@ -223,19 +222,16 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 	"GET /api/authz/catalog": accessTokenScopeRule("user:read"),
 
 	// router/api-router.go: /api/token
-	"GET /api/token/":                  accessTokenScopeRule("api_key:read"),
-	"GET /api/token/context":           accessTokenSessionRule,
-	"GET /api/token/member-candidates": accessTokenSessionRule,
-	"POST /api/user/self/playground":   accessTokenSessionRule,
-	"GET /api/token/search":            accessTokenScopeRule("api_key:read"),
-	"GET /api/token/auto-groups":       accessTokenScopeRule("api_key:read"),
-	"GET /api/token/:id":               accessTokenScopeRule("api_key:read"),
-	"POST /api/token/:id/key":          accessTokenScopeRule("api_key:reveal"),
-	"POST /api/token/":                 accessTokenScopeRule("api_key:write"),
-	"PUT /api/token/":                  accessTokenScopeRule("api_key:write"),
-	"DELETE /api/token/:id":            accessTokenScopeRule("api_key:write"),
-	"POST /api/token/batch":            accessTokenScopeRule("api_key:write"),
-	"POST /api/token/batch/keys":       accessTokenScopeRule("api_key:reveal"),
+	"GET /api/token/":            accessTokenScopeRule("api_key:read"),
+	"GET /api/token/search":      accessTokenScopeRule("api_key:read"),
+	"GET /api/token/auto-groups": accessTokenScopeRule("api_key:read"),
+	"GET /api/token/:id":         accessTokenScopeRule("api_key:read"),
+	"POST /api/token/:id/key":    accessTokenScopeRule("api_key:reveal"),
+	"POST /api/token/":           accessTokenScopeRule("api_key:write"),
+	"PUT /api/token/":            accessTokenScopeRule("api_key:write"),
+	"DELETE /api/token/:id":      accessTokenScopeRule("api_key:write"),
+	"POST /api/token/batch":      accessTokenScopeRule("api_key:write"),
+	"POST /api/token/batch/keys": accessTokenScopeRule("api_key:reveal"),
 
 	// router/api-router.go: /api/redemption
 	"GET /api/redemption/":                           accessTokenScopeRule("redemption:read"),
@@ -327,25 +323,34 @@ var accessTokenRouteRules = map[string]accessTokenRouteRule{
 }
 
 var (
-	permissionRouteRulesMu sync.RWMutex
-	permissionRouteRules   = map[string]accessTokenRouteRule{}
+	declaredRouteRulesMu sync.RWMutex
+	declaredRouteRules   = map[string]accessTokenRouteRule{}
 )
 
 // DeclareAccessTokenPermissionRoute records that the Casbin permission guarding
 // a route is also the token scope it requires. It runs while routes are
 // registered and panics on conflicting declarations.
 func DeclareAccessTokenPermissionRoute(method, fullPath string, permission authz.Permission) {
+	declareAccessTokenRoute(method, fullPath, accessTokenScopeRule(service.AccessTokenScopeOf(permission)))
+}
+
+// DeclareAccessTokenSessionRoute makes a registered dashboard route require a
+// browser session, including when the console only exposes model services.
+func DeclareAccessTokenSessionRoute(method, fullPath string) {
+	declareAccessTokenRoute(method, fullPath, accessTokenSessionRule)
+}
+
+func declareAccessTokenRoute(method, fullPath string, rule accessTokenRouteRule) {
 	key := method + " " + fullPath
-	rule := accessTokenScopeRule(service.AccessTokenScopeOf(permission))
 	if _, ok := accessTokenRouteRules[key]; ok {
 		panic(fmt.Sprintf("access token route %s is declared twice", key))
 	}
-	permissionRouteRulesMu.Lock()
-	defer permissionRouteRulesMu.Unlock()
-	if existing, ok := permissionRouteRules[key]; ok && existing != rule {
-		panic(fmt.Sprintf("access token route %s is declared with %s and %s", key, existing.scope, rule.scope))
+	declaredRouteRulesMu.Lock()
+	defer declaredRouteRulesMu.Unlock()
+	if existing, ok := declaredRouteRules[key]; ok && existing != rule {
+		panic(fmt.Sprintf("access token route %s has conflicting declarations", key))
 	}
-	permissionRouteRules[key] = rule
+	declaredRouteRules[key] = rule
 }
 
 // AccessTokenRouteRule returns the rule for "METHOD /full/path".
@@ -353,9 +358,9 @@ func AccessTokenRouteRule(key string) (accessTokenRouteRule, bool) {
 	if rule, ok := accessTokenRouteRules[key]; ok {
 		return rule, true
 	}
-	permissionRouteRulesMu.RLock()
-	defer permissionRouteRulesMu.RUnlock()
-	rule, ok := permissionRouteRules[key]
+	declaredRouteRulesMu.RLock()
+	defer declaredRouteRulesMu.RUnlock()
+	rule, ok := declaredRouteRules[key]
 	return rule, ok
 }
 
@@ -376,9 +381,9 @@ func enforceUserConsoleRoute(c *gin.Context) bool {
 
 // AccessTokenRouteRuleKeys lists every declared route key, sorted.
 func AccessTokenRouteRuleKeys() []string {
-	permissionRouteRulesMu.RLock()
-	keys := slices.Collect(maps.Keys(permissionRouteRules))
-	permissionRouteRulesMu.RUnlock()
+	declaredRouteRulesMu.RLock()
+	keys := slices.Collect(maps.Keys(declaredRouteRules))
+	declaredRouteRulesMu.RUnlock()
 	keys = slices.AppendSeq(keys, maps.Keys(accessTokenRouteRules))
 	slices.Sort(keys)
 	return keys

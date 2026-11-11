@@ -83,7 +83,7 @@ func newAccessTokenScopeTestEngine(t *testing.T) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	// A permission route that is also in the static table panics here.
+	// A registration declaration duplicated in the static table panics here.
 	require.NotPanics(t, func() {
 		SetApiRouter(engine)
 		SetDashboardRouter(engine)
@@ -140,6 +140,12 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 		require.True(t, ok, key)
 		assert.Equal(t, "scope", rule.Kind(), key)
 		assert.Equal(t, service.AccessTokenScopeOf(permission), rule.Scope(), key)
+	}
+	for _, key := range []string{"GET /api/token/context", "GET /api/token/member-candidates", "POST /api/user/self/playground"} {
+		rule, ok := middleware.AccessTokenRouteRule(key)
+		require.True(t, ok, key)
+		assert.Equal(t, "session", rule.Kind(), key)
+		assert.Empty(t, rule.Scope(), key)
 	}
 }
 
