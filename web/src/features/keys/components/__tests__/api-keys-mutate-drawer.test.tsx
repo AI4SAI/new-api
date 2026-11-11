@@ -26,6 +26,10 @@ import {
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test } from 'vitest'
 
+import {
+  API_KEY_FORM_DEFAULT_VALUES,
+  transformFormDataToPayload,
+} from '../../lib/api-key-form'
 import type { ApiKey, ManagedAccountContext } from '../../types'
 
 const { createInstance } = await import('i18next')
@@ -150,7 +154,8 @@ async function renderCreateDrawer(recovery = false): Promise<void> {
 function drawerContent(
   queryClient: InstanceType<typeof QueryClient>,
   row?: ApiKey,
-  account?: ManagedAccountContext
+  account?: ManagedAccountContext,
+  open = true
 ) {
   return (
     <QueryClientProvider client={queryClient}>
@@ -160,7 +165,7 @@ function drawerContent(
           account={account}
         >
           <ApiKeysMutateDrawer
-            open
+            open={open}
             onOpenChange={() => undefined}
             currentRow={row}
           />
@@ -572,4 +577,64 @@ test('organization creation requires a chosen member and sends the selected subj
     allow_user_quota_query: false,
   })
   expect(created[0]).not.toHaveProperty('assignee')
+  const drawer = renderedDrawer
+  drawer.view.rerender(drawerContent(queryClient, undefined, account, false))
+  await waitFor(() =>
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  )
+  drawer.view.rerender(drawerContent(queryClient, undefined, account))
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  )
+  expect(screen.getByLabelText('Name')).toHaveValue('')
+  expect(screen.getByRole('combobox', { name: 'Member' })).toHaveValue('')
+  await user.type(screen.getByLabelText('Name'), 'Another key')
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(created).toHaveLength(1)
+  expect(screen.getByRole('combobox', { name: 'Member' })).toHaveAttribute(
+    'aria-invalid',
+    'true'
+  )
+})
+
+test('reopening an unresolved organization creation retains its selected member and original idempotency key', async () => {
+  installApiFixtures([])
+  const values = {
+    ...API_KEY_FORM_DEFAULT_VALUES,
+    name: 'Pending assigned key',
+    assignee: assignedMember,
+  }
+  const request = {
+    id: '44444444-4444-4444-8444-444444444444',
+    payload: {
+      ...transformFormDataToPayload(values),
+      allow_user_quota_query: false,
+    },
+  }
+  sessionStorage.setItem(
+    'newapi:pending-key-creation:personal',
+    JSON.stringify({ values, next: 0, requests: [request] })
+  )
+  const submissions: Array<{ payload: unknown; id?: string }> = []
+  apiClient.post = async (_url, payload, options) => {
+    submissions.push({ payload, id: options?.headers?.['Idempotency-Key'] })
+    return { data: { success: true, data: {} } }
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  renderedDrawer = {
+    queryClient,
+    view: render(
+      drawerContent(queryClient, undefined, {
+        ...memberAccount,
+        resource_scope: { kind: 'all', subject_ref: '' },
+        allowed_actions: ['model.keys.create', 'model.members.read'],
+      })
+    ),
+  }
+  const retry = await screen.findByRole('button', { name: /^Retry$/ })
+  expect(screen.getByRole('combobox', { name: 'Member' })).toHaveValue('Alice')
+  await userEvent.click(retry)
+  await waitFor(() => expect(submissions).toEqual([request]))
 })

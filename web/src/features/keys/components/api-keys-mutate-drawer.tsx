@@ -581,9 +581,7 @@ export function ApiKeysMutateDrawer({
                             workspaceKey={workspaceKey}
                             scopeKey={scopeKey}
                             value={field.value ?? null}
-                            onChange={(member) =>
-                              field.onChange(member ?? undefined)
-                            }
+                            onChange={field.onChange}
                           />
                         </FormControl>
                         <FormMessage />

@@ -44,7 +44,9 @@ export function getApiKeyFormSchema(
   return z
     .object({
       name: z.string().min(1, t('Please enter a name')),
-      assignee: memberCandidatesSchema.shape.items.element.optional(),
+      assignee: memberCandidatesSchema.shape.items.element
+        .nullable()
+        .optional(),
       remain_quota_dollars: z.number().optional(),
       expired_time: z.date().optional(),
       unlimited_quota: z.boolean(),
@@ -122,6 +124,7 @@ export type ApiKeyFormValues = z.infer<ReturnType<typeof getApiKeyFormSchema>>
 
 export const API_KEY_FORM_DEFAULT_VALUES: ApiKeyFormValues = {
   name: '',
+  assignee: null,
   remain_quota_dollars: 10,
   expired_time: undefined,
   unlimited_quota: true,
