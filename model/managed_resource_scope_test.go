@@ -316,6 +316,74 @@ func TestManagedResourceScopeSeparateLogsAndWriters(t *testing.T) {
 	}
 }
 
+func TestManagedUserLogOrderingMatchesExport(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			logDB, kind := managedScopeTestDatabase(t, dialect, "LOG")
+			oldLogDB, oldLogType := LOG_DB, common.LogDatabaseType()
+			LOG_DB = logDB
+			common.SetLogDatabaseType(kind)
+			initCol()
+			t.Cleanup(func() {
+				LOG_DB = oldLogDB
+				common.SetLogDatabaseType(oldLogType)
+				initCol()
+			})
+			require.NoError(t, logDB.AutoMigrate(&Log{}))
+			owner := 170000009
+			entries := []Log{
+				{UserId: owner, ManagedSubjectRef: "member-a", CreatedAt: 400, TokenName: "newest"},
+				{UserId: owner, ManagedSubjectRef: "member-a", CreatedAt: 300, TokenName: "same-second-first"},
+				{UserId: owner, ManagedSubjectRef: "member-a", CreatedAt: 200, TokenName: "middle"},
+				{UserId: owner, ManagedSubjectRef: "member-a", CreatedAt: 300, TokenName: "same-second-second"},
+				{UserId: owner, ManagedSubjectRef: "member-b", CreatedAt: 500, TokenName: "other-member"},
+				{UserId: owner + 1, ManagedSubjectRef: "member-a", CreatedAt: 600, TokenName: "other-owner"},
+				{UserId: owner, ManagedSubjectRef: "member-a", CreatedAt: 100, TokenName: "backfilled-history"},
+			}
+			ids := make([]int, 0, len(entries))
+			t.Cleanup(func() { require.NoError(t, logDB.Where("id IN ?", ids).Delete(&Log{}).Error) })
+			for i := range entries {
+				entries[i].Type = LogTypeConsume
+				require.NoError(t, logDB.Create(&entries[i]).Error)
+				ids = append(ids, entries[i].Id)
+			}
+			scope := ManagedResourceScope{OwnerID: owner, SubjectRef: "member-a", Restricted: true}
+			for _, test := range []struct {
+				name     string
+				filter   LogFilter
+				expected []string
+			}{
+				{"personal", LogFilter{}, []string{"other-member", "newest", "same-second-second", "same-second-first", "middle", "backfilled-history"}},
+				{"member", LogFilter{ResourceScope: &scope, TokenVisibility: map[int]TokenLogVisibility{}}, []string{"newest", "same-second-second", "same-second-first", "middle", "backfilled-history"}},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					var listed []string
+					for offset := 0; offset < len(test.expected); offset += 2 {
+						page, total, err := GetUserLogs(owner, test.filter, offset, 2)
+						require.NoError(t, err)
+						require.EqualValues(t, len(test.expected), total)
+						require.Len(t, page, min(2, len(test.expected)-offset))
+						for i, row := range page {
+							assert.Equal(t, offset+i+1, row.Id, "list IDs retain their display positions")
+							listed = append(listed, row.TokenName)
+						}
+					}
+					assert.Equal(t, test.expected, listed, "later insertion must not move older usage ahead of newer usage")
+					var exported []string
+					require.NoError(t, StreamUserLogs(context.Background(), owner, test.filter, func(row *Log) error {
+						assert.Equal(t, len(exported)+1, row.Id)
+						exported = append(exported, row.TokenName)
+						return nil
+					}))
+					// The CSV consumer appends stream rows in their received order.
+					assert.Equal(t, test.expected, exported)
+					assert.Equal(t, listed, exported, "all list pages and the CSV source must have identical order")
+				})
+			}
+		})
+	}
+}
+
 func TestManagedSubjectSchemaUpgrade(t *testing.T) {
 	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
 		t.Run(dialect, func(t *testing.T) {

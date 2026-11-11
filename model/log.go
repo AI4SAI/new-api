@@ -694,7 +694,7 @@ func GetUserLogs(userId int, filter LogFilter, startIdx int, num int) (logs []*L
 		common.SysError(common.LogText("failed to count user logs: %s", err.Error()))
 		return nil, 0, common.NewMessage("Failed to query logs")
 	}
-	order := "logs.id desc"
+	order := "logs.created_at desc, logs.id desc"
 	if common.UsingLogDatabase(common.DatabaseTypeClickHouse) {
 		order = clickHouseLogOrder("logs.")
 	}
@@ -745,7 +745,7 @@ func StreamUserLogs(ctx context.Context, userId int, filter LogFilter, fn func(*
 		return err
 	}
 	count := 0
-	return streamLogs(tx, "logs.id desc", func(log *Log) error {
+	return streamLogs(tx, "logs.created_at desc, logs.id desc", func(log *Log) error {
 		count++
 		log.Id = count
 		formatUserLog(log, filter.TokenVisibility)
