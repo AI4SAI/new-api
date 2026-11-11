@@ -33,6 +33,10 @@ export function isConsoleRouteAllowed(
   if (!isModelServiceOnly(user)) return true
   const path = href.split(/[?#]/, 1)[0].replace(/\/+$/, '')
   return (
+    path === '/dashboard' ||
+    path === '/dashboard/overview' ||
+    path === '/dashboard/models' ||
+    path === '/dashboard/flow' ||
     path === '/keys' ||
     path === '/pricing' ||
     /^\/pricing\/[^/]+$/.test(path) ||

@@ -37,7 +37,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { motion, useReducedMotion } from 'motion/react'
-import { useId, useMemo, useRef, useState } from 'react'
+import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -48,12 +48,17 @@ import {
 } from '@/components/page-transition'
 import { Button } from '@/components/ui/button'
 import { IconBadge, type IconBadgeTone } from '@/components/ui/icon-badge'
-import { fetchTokenKey, getApiKeys } from '@/features/keys/api'
+import {
+  fetchTokenKey,
+  getApiKeys,
+  modelAccountRequest,
+} from '@/features/keys/api'
 import type { ApiKey } from '@/features/keys/types'
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard'
 import { getUserModels } from '@/lib/api'
 import { handleServerError } from '@/lib/handle-server-error'
 import { MOTION_TRANSITION } from '@/lib/motion'
+import { isModelServiceOnly } from '@/lib/nav-modules'
 import { ROLE } from '@/lib/roles'
 import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
@@ -63,6 +68,7 @@ import {
   useApiInfo,
   useDashboardContentVisibility,
 } from '../../hooks/use-status-data'
+import type { DashboardScopeProps } from '../../types'
 import { AnnouncementsPanel } from './announcements-panel'
 import { ApiInfoPanel } from './api-info-panel'
 import { FAQPanel } from './faq-panel'
@@ -161,7 +167,7 @@ function normalizeEndpoint(sourceUrl?: string): string {
 }
 
 function getPreferredKey(keys: ApiKey[]): ApiKey | null {
-  return keys.find((item) => item.status === 1) ?? keys[0] ?? null
+  return keys.find((item) => item.status === 1 && !item.managed) ?? null
 }
 
 function formatDisplayKey(key?: string): string {
@@ -279,12 +285,19 @@ function StartStepItem(props: {
 }
 
 function RequestPreview(props: {
+  workspaceKey?: string
   example: RequestExample
   signals: HeroSignal[]
 }) {
   const { t } = useTranslation()
   const shouldReduceMotion = useReducedMotion()
   const [isCopying, setIsCopying] = useState(false)
+  const requestAbort = useRef(new AbortController())
+  useEffect(() => {
+    const controller = new AbortController()
+    requestAbort.current = controller
+    return () => controller.abort()
+  }, [])
   const { copyToClipboard } = useCopyToClipboard({ notify: false })
   const previewCurl = buildCurlCommand({
     endpoint: props.example.endpoint,
@@ -297,7 +310,12 @@ function RequestPreview(props: {
 
     setIsCopying(true)
     try {
-      const result = await fetchTokenKey(props.example.keyId)
+      const result = await fetchTokenKey(
+        props.example.keyId,
+        props.workspaceKey,
+        requestAbort.current.signal
+      )
+      if (requestAbort.current.signal.aborted) return
       const key = result.success && result.data?.key ? result.data.key : ''
       if (!key) {
         handleServerError(result, t('Failed to copy to clipboard'))
@@ -316,7 +334,9 @@ function RequestPreview(props: {
         toast.error(t('Failed to copy to clipboard'))
       }
     } catch (error) {
-      handleServerError(error, t('Failed to copy to clipboard'))
+      if (!requestAbort.current.signal.aborted) {
+        handleServerError(error, t('Failed to copy to clipboard'))
+      }
     } finally {
       setIsCopying(false)
     }
@@ -460,7 +480,7 @@ function CompactQuickAction(props: { action: QuickAction }) {
   )
 }
 
-export function OverviewDashboard() {
+export function OverviewDashboard(props: DashboardScopeProps = {}) {
   const { t } = useTranslation()
   const setupGuideId = useId()
   const setupGuideToggleRef = useRef<HTMLButtonElement>(null)
@@ -479,24 +499,41 @@ export function OverviewDashboard() {
   const requestCount = Number(user?.request_count ?? 0)
   const remainQuota = Number(user?.quota ?? 0)
   const usedQuota = Number(user?.used_quota ?? 0)
-  const isAdmin = Boolean(user?.role && user.role >= ROLE.ADMIN)
+  const isAdmin =
+    !props.workspaceKey && Boolean(user?.role && user.role >= ROLE.ADMIN)
+  const restrictAccountActions =
+    Boolean(props.workspaceKey) || isModelServiceOnly(user)
+  const canReadKeys =
+    !props.workspaceKey ||
+    !!props.account?.allowed_actions.includes('model.keys.read')
+  const canRevealKeys =
+    !props.workspaceKey ||
+    !!props.account?.allowed_actions.includes('model.keys.reveal')
 
   const apiKeysQuery = useQuery({
-    queryKey: ['dashboard', 'overview', 'api-keys'],
-    queryFn: async () => {
-      const result = requireServerSuccess(await getApiKeys({ p: 1, size: 10 }))
+    queryKey: ['dashboard', props.scopeKey, 'overview', 'api-keys'],
+    queryFn: async ({ signal }) => {
+      const result = requireServerSuccess(
+        await getApiKeys({ p: 1, size: 10 }, props.workspaceKey, signal)
+      )
       return result.success ? (result.data?.items ?? []) : []
     },
-    staleTime: 60 * 1000,
+    enabled: canReadKeys,
+    staleTime: props.workspaceKey ? 0 : 60 * 1000,
+    gcTime: props.workspaceKey ? 0 : 5 * 60 * 1000,
   })
 
   const modelsQuery = useQuery({
-    queryKey: ['dashboard', 'overview', 'user-models'],
-    queryFn: async () => {
-      const result = requireServerSuccess(await getUserModels())
+    queryKey: ['dashboard', props.scopeKey, 'overview', 'user-models'],
+    queryFn: async ({ signal }) => {
+      const result = requireServerSuccess(
+        await getUserModels(modelAccountRequest(props.workspaceKey, signal))
+      )
       return result.success ? (result.data ?? []) : []
     },
-    staleTime: 5 * 60 * 1000,
+    enabled: canReadKeys,
+    staleTime: props.workspaceKey ? 0 : 5 * 60 * 1000,
+    gcTime: props.workspaceKey ? 0 : 5 * 60 * 1000,
   })
 
   const preferredKey = useMemo(
@@ -505,30 +542,38 @@ export function OverviewDashboard() {
   )
 
   const startSteps = useMemo<StartStep[]>(
-    () => [
-      {
-        title: t('Create API Key'),
-        description: t('Create a key for your app or service'),
-        to: '/keys',
-        icon: KeyRound,
-        completed: Boolean(preferredKey),
-      },
-      {
-        title: t('Add credits'),
-        description: t('Keep enough balance before production traffic'),
-        to: '/wallet',
-        icon: CreditCard,
-        completed: remainQuota > 0 || usedQuota > 0,
-      },
-      {
-        title: t('Send a request'),
-        description: t('Verify routing with Playground or your client'),
-        to: '/playground',
-        icon: TerminalSquare,
-        completed: requestCount > 0,
-      },
-    ],
-    [preferredKey, remainQuota, requestCount, t, usedQuota]
+    () =>
+      [
+        {
+          title: t('Create API Key'),
+          description: t('Create a key for your app or service'),
+          to: '/keys' as const,
+          icon: KeyRound,
+          completed: Boolean(preferredKey),
+        },
+        {
+          title: t('Add credits'),
+          description: t('Keep enough balance before production traffic'),
+          to: '/wallet' as const,
+          icon: CreditCard,
+          completed: remainQuota > 0 || usedQuota > 0,
+        },
+        {
+          title: t('Send a request'),
+          description: t('Verify routing with Playground or your client'),
+          to: '/playground' as const,
+          icon: TerminalSquare,
+          completed: requestCount > 0,
+        },
+      ].filter((step) => !restrictAccountActions || step.to === '/keys'),
+    [
+      preferredKey,
+      remainQuota,
+      requestCount,
+      t,
+      usedQuota,
+      restrictAccountActions,
+    ]
   )
 
   const quickActions = useMemo<QuickAction[]>(
@@ -583,19 +628,29 @@ export function OverviewDashboard() {
       },
       {
         label: t('Model selected'),
-        value: modelsQuery.data?.[0] ?? t('Loading'),
+        value:
+          modelsQuery.data?.[0] ??
+          t(modelsQuery.isPending ? 'Loading' : 'No available models'),
         icon: Timer,
         tone: 'chart-4',
       },
     ],
-    [apiInfoItems.length, modelsQuery.data, preferredKey, t]
+    [
+      apiInfoItems.length,
+      modelsQuery.data,
+      modelsQuery.isPending,
+      preferredKey,
+      t,
+    ]
   )
 
   const requestExample = useMemo<RequestExample>(() => {
     const endpoint = normalizeEndpoint(apiInfoItems[0]?.url)
     const model = modelsQuery.data?.[0] ?? 'gpt-4o-mini'
     const keyName = preferredKey?.name ?? t('No API key yet')
-    const ready = Boolean(preferredKey?.id && model)
+    const ready = Boolean(
+      preferredKey?.id && modelsQuery.data?.length && canRevealKeys
+    )
 
     return {
       endpoint,
@@ -607,7 +662,7 @@ export function OverviewDashboard() {
         : 'sk-...',
       ready,
     }
-  }, [apiInfoItems, modelsQuery.data, preferredKey, t])
+  }, [apiInfoItems, modelsQuery.data, preferredKey, canRevealKeys, t])
 
   const completedStepCount = startSteps.filter((step) => step.completed).length
   const setupComplete = completedStepCount === startSteps.length
@@ -629,7 +684,11 @@ export function OverviewDashboard() {
 
   return (
     <SectionPageLayout>
-      <SectionPageLayout.Title>{t('Overview')}</SectionPageLayout.Title>
+      <SectionPageLayout.Title>
+        {props.account
+          ? `${props.account.account_label} · ${t('Overview')}`
+          : t('Overview')}
+      </SectionPageLayout.Title>
       <SectionPageLayout.Actions>
         {setupStatusReady && setupComplete && (
           <Button
@@ -667,11 +726,13 @@ export function OverviewDashboard() {
                             <h3 className='text-xl font-semibold tracking-tight sm:text-2xl'>
                               {t('Build on your API gateway in minutes')}
                             </h3>
-                            <p className='text-muted-foreground max-w-xl text-sm leading-relaxed'>
-                              {t(
-                                'A focused home for keys, balance, routing, and service health.'
-                              )}
-                            </p>
+                            {!restrictAccountActions && (
+                              <p className='text-muted-foreground max-w-xl text-sm leading-relaxed'>
+                                {t(
+                                  'A focused home for keys, balance, routing, and service health.'
+                                )}
+                              </p>
+                            )}
                           </div>
                           <div className='flex flex-wrap items-center gap-2'>
                             <Button
@@ -704,6 +765,7 @@ export function OverviewDashboard() {
                       </div>
 
                       <RequestPreview
+                        workspaceKey={props.workspaceKey}
                         example={requestExample}
                         signals={heroSignals}
                       />
@@ -787,7 +849,7 @@ export function OverviewDashboard() {
             </CardStaggerContainer>
           )}
 
-          <SummaryCards />
+          <SummaryCards {...props} />
 
           {showContentPanels && (
             <CardStaggerContainer

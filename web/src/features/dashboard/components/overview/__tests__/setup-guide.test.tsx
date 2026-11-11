@@ -22,15 +22,21 @@ import {
   createRootRoute,
   createRouter,
   RouterProvider,
+  useSearch,
 } from '@tanstack/react-router'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { ManagedAccountBoundary } from '@/features/keys/components/managed-account-boundary'
+import type { ManagedAccountContext } from '@/features/keys/types'
 import { api } from '@/lib/api'
+import { modelWorkspaceSearchSchema } from '@/lib/model-workspace'
 import { useAuthStore } from '@/stores/auth-store'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
+import { getUserQuotaDates, getFlowQuotaDates } from '../../../api'
+import { LogStatCards } from '../../models/log-stat-cards'
 import { OverviewDashboard } from '../overview-dashboard'
 
 const storageKey = 'dashboard_overview_setup_guide_expanded'
@@ -93,17 +99,45 @@ afterEach(() => {
   window.localStorage.clear()
 })
 
-async function renderOverview() {
+function ScopedOverview() {
+  const workspaceKey = useSearch({ strict: false }).workspace_key
+  return (
+    <ManagedAccountBoundary
+      workspaceKey={workspaceKey}
+      action='model.usage.read'
+    >
+      {(account, scopeKey) => (
+        <OverviewDashboard
+          workspaceKey={workspaceKey}
+          account={account}
+          scopeKey={scopeKey}
+        />
+      )}
+    </ManagedAccountBoundary>
+  )
+}
+
+async function renderOverview(workspaceKey?: string) {
   const router = createRouter({
-    routeTree: createRootRoute({ component: OverviewDashboard }),
-    history: createMemoryHistory({ initialEntries: ['/'] }),
+    routeTree: createRootRoute({
+      component: workspaceKey ? ScopedOverview : OverviewDashboard,
+      validateSearch: modelWorkspaceSearchSchema,
+    }),
+    history: createMemoryHistory({
+      initialEntries: [
+        workspaceKey
+          ? `/?workspace_key=${encodeURIComponent(workspaceKey)}`
+          : '/',
+      ],
+    }),
   })
   await router.load()
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <RouterProvider router={router} />
     </QueryClientProvider>
   )
+  return { ...view, router }
 }
 
 describe('overview setup guide', () => {
@@ -238,4 +272,314 @@ describe('overview setup guide', () => {
       screen.queryByRole('button', { name: 'Setup guide' })
     ).not.toBeInTheDocument()
   })
+})
+
+const orgA = 'org:11111111-1111-4111-8111-111111111111'
+const orgB = 'org:22222222-2222-4222-8222-222222222222'
+const subject = '33333333-3333-4333-8333-333333333333'
+function account(workspaceKey: string): ManagedAccountContext {
+  return {
+    workspace_key: workspaceKey,
+    account_label: workspaceKey === orgA ? 'Team A' : 'Team B',
+    account_kind: 'org',
+    native_owner_id: workspaceKey === orgA ? 10 : 20,
+    resource_scope: { kind: 'subject', subject_ref: subject },
+    allowed_actions: [
+      'model.keys.read',
+      'model.keys.reveal',
+      'model.keys.create',
+      'model.usage.read',
+    ],
+    allowed_update_fields: ['name'],
+    allowed_statuses: [2],
+  }
+}
+
+it('uses scoped usage and an external key for an organization overview without personal wallet or Playground guidance', async () => {
+  const user = userEvent.setup()
+  useAuthStore.getState().auth.setUser({
+    id: 1,
+    username: 'member',
+    role: 1,
+    quota: 999999999,
+    used_quota: 888888888,
+    request_count: 123456,
+    permissions: { model_service_only: true },
+  })
+  const fallback = vi.mocked(api.get).getMockImplementation()
+  if (!fallback) throw new Error('Missing API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/status') return fallback(url, config)
+    expect(config?.headers).toMatchObject({ 'X-SAI-Workspace-Key': orgA })
+    if (url === '/api/token/context') {
+      return { data: { success: true, data: account(orgA) } }
+    }
+    if (url.startsWith('/api/token/?')) {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                id: 99,
+                name: 'Automatic Pilot',
+                managed: true,
+                key: '',
+                status: 1,
+              },
+              { id: 11, name: 'Member device', key: 'masked', status: 1 },
+            ],
+          },
+        },
+      }
+    }
+    if (url === '/api/user/models') {
+      return { data: { success: true, data: ['scope-model'] } }
+    }
+    if (url === '/api/data/self') {
+      return {
+        data: {
+          success: true,
+          data: [
+            {
+              model_name: 'scope-model',
+              created_at: Math.floor(Date.now() / 1000),
+              quota: 500000,
+              count: 3,
+              token_used: 4321,
+            },
+          ],
+        },
+      }
+    }
+    throw new Error(`Unexpected scoped URL ${url}`)
+  })
+  const post = vi.spyOn(api, 'post').mockResolvedValue({
+    data: { success: true, data: { key: 'synthetic-external-key' } },
+  })
+  await renderOverview(orgA)
+  await screen.findByRole('heading', { name: 'Team A · Overview' })
+  await screen.findByText('4,321')
+  expect(screen.queryByText('Historical Usage')).not.toBeInTheDocument()
+  expect(screen.queryByText('Credit remaining')).not.toBeInTheDocument()
+  expect(screen.queryByText('123,456')).not.toBeInTheDocument()
+  await user.click(await screen.findByRole('button', { name: 'Setup guide' }))
+  expect(
+    screen.queryByRole('link', { name: /Add credits|Send a request|Wallet/ })
+  ).not.toBeInTheDocument()
+  expect(screen.getByText('Member device')).toBeVisible()
+  expect(screen.queryByText('Automatic Pilot')).not.toBeInTheDocument()
+  await user.click(
+    screen.getByRole('button', { name: 'Copy ready-to-run curl' })
+  )
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/token/11/key',
+      undefined,
+      expect.objectContaining({
+        headers: { 'X-SAI-Workspace-Key': orgA },
+        signal: expect.any(AbortSignal),
+      })
+    )
+  )
+  expect(
+    vi
+      .mocked(api.get)
+      .mock.calls.filter(([url]) => url === '/api/token/context')
+  ).toHaveLength(1)
+})
+
+it('late usage from another organization cannot replace the newly selected account', async () => {
+  let finishA!: (value: unknown) => void
+  const lateA = new Promise((resolve) => {
+    finishA = resolve
+  })
+  const fallback = vi.mocked(api.get).getMockImplementation()
+  if (!fallback) throw new Error('Missing API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    const key = String(config?.headers?.['X-SAI-Workspace-Key'] ?? '')
+    if (url === '/api/status') return fallback(url, config)
+    if (url === '/api/token/context') {
+      return { data: { success: true, data: account(key) } }
+    }
+    if (url === '/api/user/models') {
+      return { data: { success: true, data: ['scope-model'] } }
+    }
+    if (url.startsWith('/api/token/?')) {
+      return { data: { success: true, data: { items: [] } } }
+    }
+    if (url === '/api/data/self') {
+      if (key === orgA) return lateA
+      return {
+        data: {
+          success: true,
+          data: [{ created_at: 1, quota: 0, count: 7, token_used: 7654 }],
+        },
+      }
+    }
+    throw new Error(`Unexpected scoped URL ${url}`)
+  })
+  const view = await renderOverview(orgA)
+  await screen.findByRole('heading', { name: 'Team A · Overview' })
+  await act(() =>
+    view.router.navigate({ to: '/', search: { workspace_key: orgB } })
+  )
+  await screen.findByText('7,654')
+  await act(async () =>
+    finishA({
+      data: {
+        success: true,
+        data: [{ created_at: 1, quota: 0, count: 99, token_used: 987654 }],
+      },
+    })
+  )
+  expect(
+    screen.getByRole('heading', { name: 'Team B · Overview' })
+  ).toBeVisible()
+  expect(screen.queryByText('987,654')).not.toBeInTheDocument()
+})
+
+it('organization data requests always use the scoped self endpoints even for a Native administrator', async () => {
+  vi.mocked(api.get).mockResolvedValue({ data: { success: true, data: [] } })
+  const params = { start_timestamp: 1, end_timestamp: 2 }
+  await getUserQuotaDates(params, true, orgA)
+  await getFlowQuotaDates(params, true, orgA)
+  expect(vi.mocked(api.get).mock.calls.map(([url]) => url)).toEqual([
+    '/api/data/self',
+    '/api/data/flow/self',
+  ])
+  for (const [, config] of vi.mocked(api.get).mock.calls) {
+    expect(config?.headers).toMatchObject({ 'X-SAI-Workspace-Key': orgA })
+  }
+})
+
+it('an overview containing only automatically managed keys never offers a secret request example', async () => {
+  const fallback = vi.mocked(api.get).getMockImplementation()
+  if (!fallback) throw new Error('Missing API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/token/context') {
+      return { data: { success: true, data: account(orgA) } }
+    }
+    if (url.startsWith('/api/token/?')) {
+      return {
+        data: {
+          success: true,
+          data: {
+            items: [
+              {
+                id: 99,
+                name: 'Automatic Pilot',
+                managed: true,
+                key: '',
+                status: 1,
+              },
+            ],
+          },
+        },
+      }
+    }
+    return fallback(url, config)
+  })
+  const post = vi.spyOn(api, 'post')
+  await renderOverview(orgA)
+  await screen.findByRole('button', { name: 'Hide setup guide' })
+  expect(
+    screen.queryByRole('button', { name: 'Copy ready-to-run curl' })
+  ).not.toBeInTheDocument()
+  expect(post).not.toHaveBeenCalled()
+})
+
+it('a secret response from a closed organization preview cannot be copied after switching accounts', async () => {
+  const user = userEvent.setup()
+  const write = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+  const fallback = vi.mocked(api.get).getMockImplementation()
+  if (!fallback) throw new Error('Missing API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    const key = String(config?.headers?.['X-SAI-Workspace-Key'] ?? '')
+    if (url === '/api/token/context') {
+      return { data: { success: true, data: account(key) } }
+    }
+    return fallback(url, config)
+  })
+  let finish!: (value: unknown) => void
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  const post = vi.spyOn(api, 'post').mockImplementation(() => pending)
+  const view = await renderOverview(orgA)
+  await user.click(await screen.findByRole('button', { name: 'Setup guide' }))
+  await user.click(
+    screen.getByRole('button', { name: 'Copy ready-to-run curl' })
+  )
+  await waitFor(() => expect(post).toHaveBeenCalled())
+  await act(() =>
+    view.router.navigate({ to: '/', search: { workspace_key: orgB } })
+  )
+  await screen.findByRole('heading', { name: 'Team B · Overview' })
+  await act(async () =>
+    finish({ data: { success: true, data: { key: 'synthetic-stale-key' } } })
+  )
+  expect(write).not.toHaveBeenCalled()
+})
+
+it.each([false, true])(
+  'organization cache cards distinguish confirmed zero from unavailable totals (known=%s)',
+  async (known) => {
+    vi.mocked(api.get).mockResolvedValue({
+      data: {
+        success: true,
+        data: [
+          {
+            created_at: 1,
+            quota: 0,
+            count: 3,
+            token_used: 100,
+            ...(known
+              ? { cache_read_tokens: 0, cache_creation_tokens: 0 }
+              : {}),
+          },
+        ],
+      },
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <LogStatCards workspaceKey={orgA} scopeKey='scope-a' />
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(
+        screen.getByRole('group', { name: 'Total Count' })
+      ).toHaveTextContent('3')
+    )
+    for (const name of ['Cache Read', 'Cache Write']) {
+      if (known) {
+        expect(screen.getByRole('group', { name })).toHaveTextContent('0')
+      } else {
+        expect(screen.queryByRole('group', { name })).not.toBeInTheDocument()
+      }
+    }
+  }
+)
+
+it('does not reveal a key for a request example before an authorized model is available', async () => {
+  const user = userEvent.setup()
+  const fallback = vi.mocked(api.get).getMockImplementation()
+  if (!fallback) throw new Error('Missing API fixture')
+  vi.mocked(api.get).mockImplementation(async (url, config) => {
+    if (url === '/api/token/context') {
+      return { data: { success: true, data: account(orgA) } }
+    }
+    if (url === '/api/user/models') {
+      return { data: { success: true, data: [] } }
+    }
+    return fallback(url, config)
+  })
+  const post = vi.spyOn(api, 'post')
+  await renderOverview(orgA)
+  await user.click(await screen.findByRole('button', { name: 'Setup guide' }))
+  expect(screen.getByText('No available models')).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Copy ready-to-run curl' })
+  ).not.toBeInTheDocument()
+  expect(post).not.toHaveBeenCalled()
 })

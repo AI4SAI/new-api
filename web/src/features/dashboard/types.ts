@@ -16,7 +16,14 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { ManagedAccountContext } from '@/features/keys/types'
 import type { TimeGranularity } from '@/lib/time'
+
+export interface DashboardScopeProps {
+  workspaceKey?: string
+  scopeKey?: string
+  account?: ManagedAccountContext
+}
 
 // ============================================================================
 // Quota & Usage Data Types

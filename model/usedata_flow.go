@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/QuantumNous/new-api/common"
@@ -33,6 +34,23 @@ func GetFlowQuotaData(startTime int64, endTime int64, username string, userID in
 	}
 }
 
+func (scope ManagedResourceScope) GetFlowQuotaData(ctx context.Context, startTime, endTime int64) ([]*FlowQuotaData, error) {
+	query, err := scope.quotaLogQuery(ctx, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]*FlowQuotaData, 0)
+	groupColumn := "logs." + logGroupCol
+	err = query.Select("logs.token_id, " + groupColumn + " AS use_group, logs.model_name, COUNT(*) AS count, COALESCE(SUM(logs.quota), 0) AS quota," +
+		" COALESCE(SUM(logs.prompt_tokens), 0) + COALESCE(SUM(logs.completion_tokens), 0) AS token_used").
+		Group("logs.token_id, " + groupColumn + ", logs.model_name").
+		Order("quota DESC, token_id, use_group, model_name").Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+	return rows, fillFlowTokenNames(ctx, rows, scope)
+}
+
 func flowQuotaBaseQuery(startTime int64, endTime int64) *gorm.DB {
 	query := DB.Table("quota_data").
 		Where("use_group <> ''").
@@ -51,7 +69,7 @@ func getSelfFlowQuotaData(startTime int64, endTime int64, userID int) ([]*FlowQu
 	if err != nil {
 		return nil, err
 	}
-	return rows, fillFlowTokenNames(rows)
+	return rows, fillFlowTokenNames(context.Background(), rows)
 }
 
 func getAdminFlowQuotaData(startTime int64, endTime int64, username string) ([]*FlowQuotaData, error) {
@@ -85,13 +103,13 @@ func getRootFlowQuotaData(startTime int64, endTime int64, username string) ([]*F
 	if err != nil {
 		return nil, err
 	}
-	if err := fillFlowTokenNames(rows); err != nil {
+	if err := fillFlowTokenNames(context.Background(), rows); err != nil {
 		return rows, err
 	}
 	return rows, fillFlowChannelNames(rows)
 }
 
-func fillFlowTokenNames(rows []*FlowQuotaData) error {
+func fillFlowTokenNames(ctx context.Context, rows []*FlowQuotaData, scopes ...ManagedResourceScope) error {
 	tokenIDSet := make(map[int]struct{})
 	tokenIDs := make([]int, 0)
 	for _, row := range rows {
@@ -112,7 +130,15 @@ func fillFlowTokenNames(rows []*FlowQuotaData) error {
 		Id   int    `gorm:"column:id"`
 		Name string `gorm:"column:name"`
 	}
-	if err := DB.Model(&Token{}).Select("id, name").Where("id IN ?", tokenIDs).Find(&tokens).Error; err != nil {
+	query := DB.WithContext(ctx).Model(&Token{}).Select("id, name").Where("id IN ?", tokenIDs)
+	if len(scopes) == 1 {
+		var err error
+		query, err = scopes[0].apply(query, "")
+		if err != nil {
+			return err
+		}
+	}
+	if err := query.Find(&tokens).Error; err != nil {
 		return err
 	}
 	tokenNameByID := make(map[int]string, len(tokens))

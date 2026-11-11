@@ -6,6 +6,7 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/service"
 
 	"github.com/gin-gonic/gin"
 )
@@ -61,6 +62,23 @@ func GetQuotaDatesByUser(c *gin.Context) {
 }
 
 func GetUserQuotaDates(c *gin.Context) {
+	if service.ManagementAccount(c) != nil {
+		startTimestamp, endTimestamp, ok := parseFlowQuotaTimeRange(c)
+		if !ok {
+			return
+		}
+		if _, err := limitLogTimeRange(startTimestamp, endTimestamp); err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		dates, err := service.ManagementResourceScope(c).GetQuotaData(c.Request.Context(), startTimestamp, min(endTimestamp, common.GetTimestamp()))
+		if err != nil {
+			common.ApiError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": dates})
+		return
+	}
 	userId := c.GetInt("id")
 	startTimestamp, _ := strconv.ParseInt(c.Query("start_timestamp"), 10, 64)
 	endTimestamp, _ := strconv.ParseInt(c.Query("end_timestamp"), 10, 64)
@@ -111,7 +129,13 @@ func GetUserFlowQuotaDates(c *gin.Context) {
 		common.ApiError(c, err)
 		return
 	}
-	dates, err := model.GetFlowQuotaData(startTimestamp, endTimestamp, "", userId, common.RoleCommonUser)
+	var dates []*model.FlowQuotaData
+	var err error
+	if service.ManagementAccount(c) != nil {
+		dates, err = service.ManagementResourceScope(c).GetFlowQuotaData(c.Request.Context(), startTimestamp, min(endTimestamp, common.GetTimestamp()))
+	} else {
+		dates, err = model.GetFlowQuotaData(startTimestamp, endTimestamp, "", userId, common.RoleCommonUser)
+	}
 	if err != nil {
 		common.ApiError(c, err)
 		return

@@ -39,6 +39,8 @@ import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
 
 interface LogStatCardsProps {
+  workspaceKey?: string
+  scopeKey?: string
   filters?: DashboardFilters
   onDataUpdate?: (data: QuotaDataItem[], loading: boolean) => void
 }
@@ -62,10 +64,14 @@ export function LogStatCards(props: LogStatCardsProps) {
   const { i18n } = useTranslation()
   const statCardsConfig = useModelStatCardsConfig()
   const user = useAuthStore((state) => state.auth.user)
-  const isAdmin = !!(user?.role && user.role >= 10)
-  const [stats, setStats] = useState<ReturnType<
-    typeof calculateDashboardStats
-  > | null>(null)
+  const isAdmin = !props.workspaceKey && !!(user?.role && user.role >= 10)
+  const [stats, setStats] = useState<
+    | (ReturnType<typeof calculateDashboardStats> & {
+        cacheReadAvailable: boolean
+        cacheCreationAvailable: boolean
+      })
+    | null
+  >(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
 
@@ -89,11 +95,24 @@ export function LogStatCards(props: LogStatCardsProps) {
     const timeDiff = (timeRange.end_timestamp - timeRange.start_timestamp) / 60
     setTimeRangeMinutes(timeDiff)
 
-    void getUserQuotaDates(buildQueryParams(timeRange, filters), isAdmin)
+    void getUserQuotaDates(
+      buildQueryParams(timeRange, filters),
+      isAdmin,
+      props.workspaceKey,
+      abortController.signal
+    )
       .then((res) => {
         if (abortController.signal.aborted) return
         const data = res?.data || []
-        setStats(calculateDashboardStats(data))
+        setStats({
+          ...calculateDashboardStats(data),
+          cacheReadAvailable: data.every(
+            (row) => typeof row.cache_read_tokens === 'number'
+          ),
+          cacheCreationAvailable: data.every(
+            (row) => typeof row.cache_creation_tokens === 'number'
+          ),
+        })
         onDataUpdate?.(data, false)
       })
       .catch(() => {
@@ -111,7 +130,7 @@ export function LogStatCards(props: LogStatCardsProps) {
     return () => {
       abortController.abort()
     }
-  }, [filters, isAdmin, onDataUpdate])
+  }, [filters, isAdmin, onDataUpdate, props.workspaceKey, props.scopeKey])
 
   const adaptedStats = {
     rpm: stats?.totalCount ?? 0,
@@ -121,31 +140,48 @@ export function LogStatCards(props: LogStatCardsProps) {
     cacheCreation: stats?.totalCacheCreationTokens ?? 0,
   }
 
-  const items = statCardsConfig.map((config) => {
-    const rawValue = config.getValue(adaptedStats, timeRangeMinutes)
-    const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
-    const formatted =
-      config.key === 'quota'
-        ? {
-            displayValue: formatQuota(rawValue),
-            fullValue: formatQuota(rawValue),
-          }
-        : formatStatNumber(rawValue, locale)
+  const items = statCardsConfig
+    .filter((config) => {
+      if (!props.workspaceKey || !stats) return true
+      if (config.key === 'cacheRead') return stats.cacheReadAvailable
+      if (config.key === 'cacheCreation') return stats.cacheCreationAvailable
+      return true
+    })
+    .map((config) => {
+      const rawValue = config.getValue(adaptedStats, timeRangeMinutes)
+      const available =
+        (config.key !== 'cacheRead' || stats?.cacheReadAvailable) &&
+        (config.key !== 'cacheCreation' || stats?.cacheCreationAvailable)
+      const locale = toIntlLocale(i18n.resolvedLanguage || i18n.language)
+      const formatted =
+        config.key === 'quota'
+          ? {
+              displayValue: formatQuota(rawValue),
+              fullValue: formatQuota(rawValue),
+            }
+          : formatStatNumber(rawValue, locale)
 
-    return {
-      key: config.key,
-      title: config.title,
-      value: formatted.displayValue,
-      fullValue: formatted.fullValue,
-      desc: config.description,
-      icon: config.icon,
-      iconTone: config.iconTone,
-    }
-  })
+      return {
+        key: config.key,
+        title: config.title,
+        value: available ? formatted.displayValue : '--',
+        fullValue: available ? formatted.fullValue : '--',
+        desc: config.description,
+        icon: config.icon,
+        iconTone: config.iconTone,
+      }
+    })
 
   return (
     <div className='overflow-hidden rounded-lg border'>
-      <div className='divide-border/60 grid min-w-0 grid-cols-2 divide-x sm:grid-cols-3 lg:grid-cols-7'>
+      <div
+        className={cn(
+          'divide-border/60 grid min-w-0 grid-cols-2 divide-x sm:grid-cols-3',
+          items.length === 5 && 'lg:grid-cols-5',
+          items.length === 6 && 'lg:grid-cols-6',
+          items.length === 7 && 'lg:grid-cols-7'
+        )}
+      >
         {items.map((it, idx) => {
           const Icon = it.icon
           let valueContent

@@ -108,6 +108,10 @@ describe('model service console navigation', () => {
       '/keys?workspace_key=org%3Aexample',
       '/pricing/deepseek-flash',
       '/usage-logs/common',
+      '/dashboard',
+      '/dashboard/overview?workspace_key=org%3Aexample',
+      '/dashboard/models',
+      '/dashboard/flow',
     ]) {
       expect(resolveLoginRedirect(user, target, origin)).toBe(target)
       expect(isConsoleRouteAllowed(user, target)).toBe(true)
@@ -119,7 +123,8 @@ describe('model service console navigation', () => {
       '/profile',
       '/wallet?show_history=true',
       '/security',
-      '/dashboard',
+      '/dashboard/users',
+      '/dashboard/new-feature',
       '/console/personal',
       '/keys-other',
       '/usage-logs/audit',

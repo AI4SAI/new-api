@@ -16,7 +16,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { modelAccountRequest } from '@/features/keys/api'
 import { api } from '@/lib/api'
+import { requireServerSuccess } from '@/lib/server-error-message'
 
 import type {
   FlowQuotaDataItem,
@@ -41,14 +43,16 @@ export async function getUserQuotaDates(
     default_time?: string
     username?: string
   },
-  isAdmin = false
+  isAdmin = false,
+  workspaceKey?: string,
+  signal?: AbortSignal
 ) {
-  const endpoint = isAdmin ? '/api/data' : '/api/data/self'
+  const endpoint = isAdmin && !workspaceKey ? '/api/data' : '/api/data/self'
   const res = await api.get<{ success: boolean; data: QuotaDataItem[] }>(
     endpoint,
-    { params }
+    { ...modelAccountRequest(workspaceKey, signal), params }
   )
-  return res.data
+  return requireServerSuccess(res.data)
 }
 
 // ----------------------------------------------------------------------------
@@ -73,15 +77,18 @@ export async function getFlowQuotaDates(
     default_time?: string
     username?: string
   },
-  isAdmin = false
+  isAdmin = false,
+  workspaceKey?: string,
+  signal?: AbortSignal
 ) {
-  const endpoint = isAdmin ? '/api/data/flow' : '/api/data/flow/self'
+  const endpoint =
+    isAdmin && !workspaceKey ? '/api/data/flow' : '/api/data/flow/self'
   const res = await api.get<{
     success: boolean
     data?: FlowQuotaDataItem[]
     message?: string
-  }>(endpoint, { params })
-  return res.data
+  }>(endpoint, { ...modelAccountRequest(workspaceKey, signal), params })
+  return requireServerSuccess(res.data)
 }
 
 // Get uptime monitoring status for all services

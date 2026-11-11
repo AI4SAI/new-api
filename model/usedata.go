@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -40,6 +41,37 @@ type QuotaDataLogParams struct {
 	TokenID             int
 	ChannelID           int
 	NodeName            string
+}
+
+// QuotaDataPoint is the existing dashboard projection over authorized logs.
+// Cache writes are not projected: historical logs do not have a normalized
+// column for that value. A missing normalized cache-read total stays absent.
+type QuotaDataPoint struct {
+	ModelName       string `json:"model_name"`
+	CreatedAt       int64  `json:"created_at"`
+	TokenUsed       int64  `json:"token_used"`
+	Count           int64  `json:"count"`
+	Quota           int64  `json:"quota"`
+	CacheReadTokens *int64 `json:"cache_read_tokens,omitempty"`
+}
+
+func (scope ManagedResourceScope) quotaLogQuery(ctx context.Context, startTime, endTime int64) (*gorm.DB, error) {
+	return (LogFilter{Type: LogTypeConsume, StartTimestamp: startTime, EndTimestamp: endTime,
+		ResourceScope: &scope, Context: ctx}).apply(LOG_DB.Model(&Log{}))
+}
+
+func (scope ManagedResourceScope) GetQuotaData(ctx context.Context, startTime, endTime int64) ([]*QuotaDataPoint, error) {
+	query, err := scope.quotaLogQuery(ctx, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	const hour = "(logs.created_at - logs.created_at % 3600)"
+	fields := hour + " AS created_at, logs.model_name, COUNT(*) AS count, COALESCE(SUM(logs.quota), 0) AS quota," +
+		" COALESCE(SUM(logs.prompt_tokens), 0) + COALESCE(SUM(logs.completion_tokens), 0) AS token_used"
+	fields += fmt.Sprintf(", CASE WHEN COUNT(logs.metered_cache_read_tokens) = COUNT(*) AND COALESCE(SUM(logs.metered_cache_read_tokens), 0) <= %d THEN COALESCE(SUM(logs.metered_cache_read_tokens), 0) ELSE NULL END AS cache_read_tokens", common.MaxWalletQuota)
+	rows := make([]*QuotaDataPoint, 0)
+	err = query.Select(fields).Group(hour + ", logs.model_name").Order("created_at, model_name").Scan(&rows).Error
+	return rows, err
 }
 
 func UpdateQuotaData() {

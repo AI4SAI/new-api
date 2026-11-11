@@ -23,14 +23,22 @@ import {
   DASHBOARD_SECTION_IDS,
   DASHBOARD_DEFAULT_SECTION,
 } from '@/features/dashboard/section-registry'
+import { ROLE } from '@/lib/roles'
+import { useAuthStore } from '@/stores/auth-store'
 
 export const Route = createFileRoute('/_authenticated/dashboard/$section')({
-  beforeLoad: ({ params }) => {
+  beforeLoad: ({ params, search }) => {
     const validSections = DASHBOARD_SECTION_IDS as unknown as string[]
-    if (!validSections.includes(params.section)) {
+    if (
+      !validSections.includes(params.section) ||
+      (params.section === 'users' &&
+        (search.workspace_key ||
+          (useAuthStore.getState().auth.user?.role ?? 0) < ROLE.ADMIN))
+    ) {
       throw redirect({
         to: '/dashboard/$section',
         params: { section: DASHBOARD_DEFAULT_SECTION },
+        search: { workspace_key: search.workspace_key },
       })
     }
   },

@@ -31,6 +31,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { ManagedAccountBoundary } from '@/features/keys/components/managed-account-boundary'
 import { ROLE } from '@/lib/roles'
 import { cn } from '@/lib/utils'
 import { useAuthStore } from '@/stores/auth-store'
@@ -52,6 +53,7 @@ import {
   DASHBOARD_SECTION_IDS,
 } from './section-registry'
 import type {
+  DashboardScopeProps,
   DashboardChartPreferences,
   DashboardFilters,
   QuotaDataItem,
@@ -197,6 +199,24 @@ const SECTION_META: Record<DashboardSectionId, { titleKey: string }> = {
 }
 
 export function Dashboard() {
+  const workspaceKey = route.useSearch().workspace_key
+  return (
+    <ManagedAccountBoundary
+      workspaceKey={workspaceKey}
+      action='model.usage.read'
+    >
+      {(account, scopeKey) => (
+        <DashboardContent
+          account={account}
+          workspaceKey={workspaceKey}
+          scopeKey={scopeKey}
+        />
+      )}
+    </ManagedAccountBoundary>
+  )
+}
+
+function DashboardContent(props: DashboardScopeProps) {
   const { t } = useTranslation()
   const navigate = useNavigate()
   const params = route.useParams()
@@ -249,7 +269,8 @@ export function Dashboard() {
   )
 
   const meta = SECTION_META[activeSection] ?? SECTION_META.overview
-  const isAdmin = Boolean(userRole && userRole >= ROLE.ADMIN)
+  const isAdmin =
+    !props.workspaceKey && Boolean(userRole && userRole >= ROLE.ADMIN)
   const visibleSections = useMemo(
     () =>
       DASHBOARD_SECTION_IDS.filter(
@@ -262,9 +283,10 @@ export function Dashboard() {
       void navigate({
         to: '/dashboard/$section',
         params: { section: section as DashboardSectionId },
+        search: { workspace_key: props.workspaceKey },
       })
     },
-    [navigate]
+    [navigate, props.workspaceKey]
   )
   const showSectionTabs =
     activeSection !== 'overview' && visibleSections.length > 1
@@ -277,6 +299,7 @@ export function Dashboard() {
         />
         <ModelsFilter
           preferences={chartPreferences}
+          allowUserFilter={isAdmin}
           currentFilters={modelFilters}
           onFilterChange={handleFilterChange}
           onReset={handleResetFilters}
@@ -312,6 +335,7 @@ export function Dashboard() {
         </Tooltip>
         <ModelsFilter
           preferences={chartPreferences}
+          allowUserFilter={isAdmin}
           currentFilters={modelFilters}
           onFilterChange={handleFilterChange}
           onReset={handleResetFilters}
@@ -323,12 +347,16 @@ export function Dashboard() {
   const sectionActions = modelActions ?? flowActions
 
   if (activeSection === 'overview') {
-    return <OverviewDashboard />
+    return <OverviewDashboard {...props} />
   }
 
   return (
     <SectionPageLayout>
-      <SectionPageLayout.Title>{t(meta.titleKey)}</SectionPageLayout.Title>
+      <SectionPageLayout.Title>
+        {props.account
+          ? `${props.account.account_label} · ${t(meta.titleKey)}`
+          : t(meta.titleKey)}
+      </SectionPageLayout.Title>
       <SectionPageLayout.Content>
         <div className='space-y-3 sm:space-y-4'>
           <div className='flex flex-wrap items-center justify-between gap-1.5 sm:gap-2'>
@@ -356,6 +384,8 @@ export function Dashboard() {
               <FadeIn>
                 <Suspense fallback={<LogStatCardsFallback />}>
                   <LazyLogStatCards
+                    workspaceKey={props.workspaceKey}
+                    scopeKey={props.scopeKey}
                     filters={modelFilters}
                     onDataUpdate={handleDataUpdate}
                   />
@@ -396,7 +426,7 @@ export function Dashboard() {
               </FadeIn>
             </>
           )}
-          {activeSection === 'users' && (
+          {activeSection === 'users' && isAdmin && (
             <FadeIn>
               <Suspense fallback={<ModelChartsFallback />}>
                 <LazyUserCharts
@@ -410,6 +440,8 @@ export function Dashboard() {
             <FadeIn>
               <Suspense fallback={<ModelChartsFallback />}>
                 <LazyFlowCharts
+                  workspaceKey={props.workspaceKey}
+                  scopeKey={props.scopeKey}
                   filters={modelFilters}
                   sensitiveVisible={flowSensitiveVisible}
                 />

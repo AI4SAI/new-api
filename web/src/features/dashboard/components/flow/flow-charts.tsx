@@ -97,6 +97,8 @@ import { useAuthStore } from '@/stores/auth-store'
 import { FlowNodeFilterControl } from './flow-node-filter'
 
 interface FlowChartsProps {
+  workspaceKey?: string
+  scopeKey?: string
   filters?: DashboardFilters
   // When false, sensitive node labels are masked in the rendered Sankey.
   sensitiveVisible?: boolean
@@ -260,8 +262,10 @@ export function FlowCharts(props: FlowChartsProps) {
   const textColor = useThemeColor('--foreground')
   const chartInstanceRef = useRef<IVChart | null>(null)
   const user = useAuthStore((state) => state.auth.user)
-  const isRoot = Boolean(user?.role && user.role >= ROLE.SUPER_ADMIN)
-  const isAdmin = Boolean(user?.role && user.role >= ROLE.ADMIN)
+  const isRoot =
+    !props.workspaceKey && Boolean(user?.role && user.role >= ROLE.SUPER_ADMIN)
+  const isAdmin =
+    !props.workspaceKey && Boolean(user?.role && user.role >= ROLE.ADMIN)
   let flowRole: FlowRole = 'user'
   if (isRoot) {
     flowRole = 'root'
@@ -338,9 +342,16 @@ export function FlowCharts(props: FlowChartsProps) {
     isError,
     isLoading,
   } = useQuery({
-    queryKey: ['dashboard', 'flow', flowQueryParams, flowRole],
-    queryFn: async () =>
-      requireServerSuccess(await getFlowQuotaDates(flowQueryParams, isAdmin)),
+    queryKey: ['dashboard', props.scopeKey, 'flow', flowQueryParams, flowRole],
+    queryFn: async ({ signal }) =>
+      requireServerSuccess(
+        await getFlowQuotaDates(
+          flowQueryParams,
+          isAdmin,
+          props.workspaceKey,
+          signal
+        )
+      ),
     select: (res) =>
       requireSuccessfulFlowRows(res, t('Please try again later.')),
     staleTime: 60_000,

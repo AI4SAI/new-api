@@ -21,6 +21,13 @@ func ManagedAccountAuthorization(operation string) gin.HandlerFunc {
 			return
 		}
 		if account := service.ManagementAccount(c); account != nil && operation == "model.usage.read" {
+			// These registered routes project only aggregate fields from scoped
+			// logs. They do not disclose log content or consume its token map.
+			switch c.FullPath() {
+			case "/api/data/self", "/api/data/flow/self":
+				c.Next()
+				return
+			}
 			visibility, err := service.ManagementResourceScope(c).UserTokenLogVisibility()
 			if err != nil {
 				common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Managed account access is unavailable"))
