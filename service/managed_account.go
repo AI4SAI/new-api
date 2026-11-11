@@ -267,6 +267,9 @@ func RegisterModelKey(c *gin.Context, token *model.Token) error {
 	if err != nil || subject.String() != receipt.SubjectRef || assignee != "" && assignee != receipt.SubjectRef {
 		return errors.New("key billing subject confirmation unavailable")
 	}
+	if account := ManagementAccount(c); account != nil && account.ResourceScope.Kind == "subject" && receipt.SubjectRef != account.ActorRef {
+		return ErrManagedAccountDenied
+	}
 	token.ManagedSubjectRef = receipt.SubjectRef
 	return nil
 }
@@ -492,7 +495,7 @@ func verifyManagementCapability(raw string, request ManagementRequest) (*Managed
 				return nil, ErrManagedAccountDenied
 			}
 		case "subject":
-			if account.ResourceScope.SubjectRef != account.ActorRef || slices.Contains(account.AllowedActions, "model.keys.create") || slices.Contains(account.AllowedActions, "model.members.read") {
+			if account.ResourceScope.SubjectRef != account.ActorRef || slices.Contains(account.AllowedActions, "model.members.read") {
 				return nil, ErrManagedAccountDenied
 			}
 		default:
@@ -521,9 +524,15 @@ func verifyManagementCapability(raw string, request ManagementRequest) (*Managed
 			seen[key] = true
 		}
 		if request.Operation == "model.keys.create" {
-			assignee, err := uuid.Parse(request.AssigneeRef)
-			if err != nil || assignee.String() != request.AssigneeRef {
-				return nil, ErrManagedAccountDenied
+			if account.ResourceScope.Kind == "subject" {
+				if request.AssigneeRef != "" {
+					return nil, ErrManagedAccountDenied
+				}
+			} else {
+				assignee, err := uuid.Parse(request.AssigneeRef)
+				if err != nil || assignee.String() != request.AssigneeRef {
+					return nil, ErrManagedAccountDenied
+				}
 			}
 		} else if request.AssigneeRef != "" {
 			return nil, ErrManagedAccountDenied

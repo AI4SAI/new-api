@@ -408,6 +408,13 @@ it.each([false, true])(
     })
     expect(screen.getByText('pilot-recorded-name')).toBeVisible()
     expect(screen.getByText('Current member')).toBeVisible()
+    expect(screen.getByText('pilot-recorded-name')).toHaveClass('font-medium')
+    expect(
+      screen
+        .getByText('pilot-recorded-name')
+        .compareDocumentPosition(screen.getByText('Current member')) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
     expect(screen.getByText(/Climate study/)).toBeVisible()
     expect(screen.queryByText('member-user')).not.toBeInTheDocument()
     expect(
@@ -798,6 +805,13 @@ it.each([
     await renderKeysPage(1, { name: 'Original device name', attribution })
     expect(screen.getByText(label)).toBeVisible()
     expect(screen.getByText('Original device name')).toBeVisible()
+    expect(screen.getByText('Original device name')).toHaveClass('font-medium')
+    expect(
+      screen
+        .getByText('Original device name')
+        .compareDocumentPosition(screen.getByText(label)) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
     expect(screen.queryByText('Previous creator')).not.toBeInTheDocument()
     expect(screen.queryByText('Previous workspace')).not.toBeInTheDocument()
     expect(screen.queryByText('Managed automatically')).not.toBeInTheDocument()

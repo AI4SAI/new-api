@@ -57,7 +57,6 @@ import {
   Sheet,
   SheetClose,
   SheetContent,
-  SheetDescription,
   SheetFooter,
   SheetHeader,
   SheetTitle,
@@ -136,6 +135,11 @@ export function ApiKeysMutateDrawer({
   const canSubmit = canPerform(
     isUpdate ? 'model.keys.update' : 'model.keys.create'
   )
+  const requiresAssignee =
+    !isUpdate &&
+    Boolean(workspaceKey) &&
+    account?.resource_scope.kind === 'all' &&
+    canPerform('model.members.read')
   const creationStorageKey = `newapi:pending-key-creation:${scopeKey}`
   const [creation, setCreation] = useState<KeyCreation | null>(() => {
     const saved = sessionStorage.getItem(creationStorageKey)
@@ -369,13 +373,16 @@ export function ApiKeysMutateDrawer({
     ) {
       return
     }
-    if (!isUpdate && workspaceKey && !data.assignee) {
+    if (requiresAssignee && !data.assignee) {
       form.setError('assignee', { message: t('Select a member') })
       return
     }
     setIsSubmitting(true)
     try {
-      const basePayload = transformFormDataToPayload(data, isUpdate)
+      const basePayload = transformFormDataToPayload(
+        { ...data, assignee: requiresAssignee ? data.assignee : null },
+        isUpdate
+      )
       if (workspaceKey) basePayload.allow_user_quota_query = false
       if (isUpdate && basePayload.quota_delta) {
         if (!Number.isSafeInteger(quotaRevision)) {
@@ -519,16 +526,12 @@ export function ApiKeysMutateDrawer({
     >
       <SheetContent
         className={sideDrawerContentClassName('max-w-none sm:!max-w-[620px]')}
+        aria-describedby={undefined}
       >
         <SheetHeader className={sideDrawerHeaderClassName()}>
           <SheetTitle>
             {isUpdate ? t('Update API Key') : t('Create API Key')}
           </SheetTitle>
-          <SheetDescription>
-            {isUpdate
-              ? t('Update the API key by providing necessary info.')
-              : t('Add a new API key by providing necessary info.')}
-          </SheetDescription>
         </SheetHeader>
         <Form {...form}>
           <form
@@ -547,7 +550,6 @@ export function ApiKeysMutateDrawer({
             <SideDrawerSection>
               <SideDrawerSectionHeader
                 title={t('Basic Information')}
-                description={t('Set API key basic information')}
                 icon={<KeyRound className='size-4' />}
                 iconTone='info'
               />
@@ -567,28 +569,26 @@ export function ApiKeysMutateDrawer({
                 />
               )}
 
-              {!isUpdate &&
-                workspaceKey &&
-                canPerform('model.members.read') && (
-                  <FormField
-                    control={form.control}
-                    name='assignee'
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>{t('Member')}</FormLabel>
-                        <FormControl>
-                          <MemberCandidateSelect
-                            workspaceKey={workspaceKey}
-                            scopeKey={scopeKey}
-                            value={field.value ?? null}
-                            onChange={field.onChange}
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                )}
+              {requiresAssignee && workspaceKey && (
+                <FormField
+                  control={form.control}
+                  name='assignee'
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>{t('Member')}</FormLabel>
+                      <FormControl>
+                        <MemberCandidateSelect
+                          workspaceKey={workspaceKey}
+                          scopeKey={scopeKey}
+                          value={field.value ?? null}
+                          onChange={field.onChange}
+                        />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              )}
 
               {canEditField('group') && (
                 <FormField
@@ -790,7 +790,6 @@ export function ApiKeysMutateDrawer({
               <SideDrawerSection>
                 <SideDrawerSectionHeader
                   title={t('Quota Settings')}
-                  description={t('Set quota amount and limits')}
                   icon={<WalletCards className='size-4' />}
                   iconTone='success'
                 />
@@ -815,13 +814,6 @@ export function ApiKeysMutateDrawer({
                               }
                             />
                           </FormControl>
-                          <FormDescription>
-                            {tokensOnly
-                              ? t('Enter the quota amount in tokens')
-                              : t('Enter the quota amount in {{currency}}', {
-                                  currency: currencyLabel,
-                                })}
-                          </FormDescription>
                           <FormMessage />
                         </FormItem>
                       )}
@@ -838,9 +830,6 @@ export function ApiKeysMutateDrawer({
                           <FormLabel className='text-sm'>
                             {t('Unlimited Quota')}
                           </FormLabel>
-                          <FormDescription className='text-xs'>
-                            {t('Enable unlimited quota for this API key')}
-                          </FormDescription>
                         </div>
                         <FormControl>
                           <Switch
@@ -871,7 +860,6 @@ export function ApiKeysMutateDrawer({
                     <SideDrawerSectionHeader
                       className='flex-1'
                       title={t('Advanced Settings')}
-                      description={t('Set API key access restrictions')}
                       icon={<Settings2 className='size-4' />}
                     />
                     <ChevronDown

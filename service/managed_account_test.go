@@ -62,7 +62,9 @@ func TestManagedAccountCapabilityBindsEveryRequest(t *testing.T) {
 		grant := map[string]any{}
 		require.NoError(t, common.Unmarshal(raw, &grant))
 		require.Contains(t, grant, "assignee_ref", "the real v2 request must send the default field that Core signs")
-		require.Equal(t, "", grant["assignee_ref"])
+		if request.Operation != "model.keys.create" {
+			require.Equal(t, "", grant["assignee_ref"])
+		}
 		grant["actor_ref"], grant["native_owner_id"], grant["account_label"], grant["account_kind"] = "11111111-1111-4111-8111-111111111111", 41, "Research lab", "org"
 		grant["resource_scope"] = map[string]any{"kind": "all", "subject_ref": ""}
 		grant["allowed_actions"] = []string{request.Operation}
@@ -184,8 +186,17 @@ func TestManagedAccountCapabilityBindsEveryRequest(t *testing.T) {
 	require.NoError(t, AuthorizeManagedAccount(c, "model.keys.read"))
 	require.Equal(t, "22222222-2222-4222-8222-222222222222", ManagementResourceScope(c).SubjectRef)
 	require.True(t, ManagementResourceScope(c).Restricted, "an administrator selector narrows the all grant")
+	method, target, body = http.MethodPost, "/api/token/", `{"name":"my device"}`
+	mutate = member
+	require.NoError(t, AuthorizeManagedAccount(request(), "model.keys.create"))
+	body = `{"name":"my device","assignee_ref":"22222222-2222-4222-8222-222222222222"}`
+	require.ErrorIs(t, AuthorizeManagedAccount(request(), "model.keys.create"), ErrManagedAccountDenied)
+	mutate = nil
+	require.NoError(t, AuthorizeManagedAccount(request(), "model.keys.create"), "an administrator can explicitly assign a member")
+	body = `{"name":"missing member"}`
+	require.ErrorIs(t, AuthorizeManagedAccount(request(), "model.keys.create"), ErrManagedAccountDenied)
 
-	target = "/api/log/self/export"
+	method, target, body = http.MethodGet, "/api/log/self/export", ""
 	mutate = member
 	c = request()
 	require.NoError(t, AuthorizeManagedAccount(c, "model.usage.read"))

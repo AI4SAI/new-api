@@ -72,7 +72,7 @@ func managedControllerAccount(subject string) *service.ManagedAccount {
 	if subject != "" {
 		account.ActorRef = subject
 		account.ResourceScope = service.ManagedResourceGrant{Kind: "subject", SubjectRef: subject}
-		account.AllowedActions = []string{"model.keys.read", "model.keys.update", "model.keys.delete", "model.keys.reveal", "model.usage.read"}
+		account.AllowedActions = []string{"model.keys.read", "model.keys.create", "model.keys.update", "model.keys.delete", "model.keys.reveal", "model.usage.read"}
 		account.AllowedUpdateFields, account.AllowedStatuses = []string{"name"}, []int{2}
 	}
 	return account
@@ -434,6 +434,75 @@ func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.
 	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
 	GetTokenKey(c)
 	require.True(t, decodeAPIResponse(t, w).Success)
+}
+
+func TestManagedMemberCreatesOwnKeysInOrganization(t *testing.T) {
+	for _, database := range []struct {
+		name, env string
+		kind      common.DatabaseType
+	}{{"sqlite", "", common.DatabaseTypeSQLite}, {"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL}, {"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL}} {
+		t.Run(database.name, func(t *testing.T) {
+			dsn := os.Getenv(database.env)
+			if database.env != "" && dsn == "" {
+				t.Skip(database.env + " is not configured")
+			}
+			db, _ := newAuditTestDatabase(t, database.name, dsn)
+			useLogExportDatabases(t, db, db, database.kind, database.kind)
+			migrateTokenControllerTestDB(t, db)
+			account := managedControllerAccount(managedMemberA)
+			receiptSubject, calls := managedMemberA, 0
+			startManagedControllerAuthority(t, account, func(w http.ResponseWriter, r *http.Request) {
+				require.True(t, strings.HasSuffix(r.URL.Path, "/register-key"))
+				calls++
+				var receipt map[string]any
+				require.NoError(t, common.DecodeJson(r.Body, &receipt))
+				require.Empty(t, receipt["assignee_ref"], "Core derives the assignee from the authenticated member")
+				require.EqualValues(t, 41, receipt["native_owner_id"])
+				require.EqualValues(t, 7, receipt["native_actor_id"])
+				receipt["managed_subject_ref"] = receiptSubject
+				data, err := common.Marshal(receipt)
+				require.NoError(t, err)
+				_, _ = w.Write(data)
+			})
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("id", 7)
+				c.Set("session_id", "fixture-session")
+			})
+			router.POST("/api/token/", middleware.ManagedAccountAuthorization("model.keys.create"), AddToken)
+			create := func(ref, assignee string) *httptest.ResponseRecorder {
+				c, w := newAuthenticatedContext(t, "POST", "/api/token/", map[string]any{
+					"name": "my device", "unlimited_quota": true, "expired_time": -1, "assignee_ref": assignee,
+				}, 7)
+				c.Request.Header.Set(service.ManagedWorkspaceHeader, "org:fixture")
+				c.Request.Header.Set("Idempotency-Key", ref)
+				router.ServeHTTP(w, c.Request)
+				return w
+			}
+			ref := "11111111-1111-4111-8111-111111111111"
+			for range 2 {
+				require.True(t, decodeAPIResponse(t, create(ref, "")).Success)
+			}
+			require.Equal(t, 1, calls, "a retried creation returns the same confirmed key")
+			var created model.Token
+			require.NoError(t, db.Where("billing_context_ref = ?", ref).First(&created).Error)
+			require.Equal(t, 41, created.UserId)
+			require.Equal(t, 7, created.ManagementCreatorID)
+			require.Equal(t, managedMemberA, created.ManagedSubjectRef)
+			require.True(t, created.BillingContextConfirmed)
+			require.Equal(t, common.TokenStatusEnabled, created.Status)
+			require.Equal(t, http.StatusForbidden, create(ref, managedMemberB).Code)
+			require.Equal(t, 1, calls, "an explicit foreign assignee is rejected before registration")
+			receiptSubject = managedMemberB
+			otherRef := "22222222-2222-4222-8222-222222222222"
+			require.False(t, decodeAPIResponse(t, create(otherRef, "")).Success)
+			var pending model.Token
+			require.NoError(t, db.Where("billing_context_ref = ?", otherRef).First(&pending).Error)
+			require.False(t, pending.BillingContextConfirmed)
+			require.Empty(t, pending.ManagedSubjectRef)
+			require.Equal(t, common.TokenStatusDisabled, pending.Status)
+		})
+	}
 }
 
 func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {

@@ -526,7 +526,55 @@ test('member rename reads and submits only the editable name and retains a faile
   ).toBe(true)
 })
 
-test('organization creation requires a chosen member and sends the selected subject with the original key form', async () => {
+test('an organization member creates their own key without an assignee field or member lookup', async () => {
+  const created: Array<Record<string, unknown>> = []
+  installApiFixtures(created)
+  const getFixture = apiClient.get
+  const reads: string[] = []
+  apiClient.get = async (url, ...args) => {
+    reads.push(url)
+    return getFixture(url, ...args)
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  renderedDrawer = {
+    queryClient,
+    view: render(
+      drawerContent(queryClient, undefined, {
+        ...memberAccount,
+        allowed_actions: [
+          ...memberAccount.allowed_actions,
+          'model.keys.create',
+        ],
+      })
+    ),
+  }
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  )
+  expect(
+    screen.queryByRole('combobox', { name: 'Member' })
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText('Add a new API key by providing necessary info.')
+  ).not.toBeInTheDocument()
+  expect(
+    screen.queryByText('Set API key basic information')
+  ).not.toBeInTheDocument()
+  await userEvent.type(screen.getByLabelText('Name'), 'My device')
+  await userEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(created).toHaveLength(1))
+  expect(created[0]).toMatchObject({
+    name: 'My device',
+    allow_user_quota_query: false,
+  })
+  expect(created[0]).not.toHaveProperty('assignee_ref')
+  expect(created[0]).not.toHaveProperty('managed_subject_ref')
+  expect(reads.some((url) => url.includes('/member-candidates'))).toBe(false)
+})
+
+test('administrator creation requires a chosen member and sends the selected subject with the original key form', async () => {
   const user = userEvent.setup()
   const created: Array<Record<string, unknown>> = []
   installApiFixtures(created)

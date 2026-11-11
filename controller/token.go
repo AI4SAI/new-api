@@ -455,6 +455,7 @@ func AddToken(c *gin.Context) {
 	}
 	token := request.Token
 	account := service.ManagementAccount(c)
+	ownerID := service.ManagementResourceScope(c).OwnerID
 	if account == nil && request.AssigneeRef != "" || account != nil && request.AssigneeRef != account.AssigneeRef {
 		managedTokenError(c, service.ErrManagedAccountDenied)
 		return
@@ -505,7 +506,7 @@ func AddToken(c *gin.Context) {
 	}
 	// 检查用户令牌数量是否已达上限
 	maxTokens := operation_setting.GetMaxUserTokens()
-	count, err := model.CountUserTokens(service.ManagementOwnerID(c), !c.GetBool("access_token_managed"))
+	count, err := model.CountUserTokens(ownerID, !c.GetBool("access_token_managed"))
 	if err != nil {
 		common.ApiError(c, err)
 		return
@@ -515,7 +516,7 @@ func AddToken(c *gin.Context) {
 		if token.ManagedBindingRef != "" {
 			ref = token.ManagedBindingRef
 		}
-		if _, err := model.GetTokenByBillingContext(service.ManagementOwnerID(c), ref); err != nil {
+		if _, err := model.GetTokenByBillingContext(ownerID, ref); err != nil {
 			common.ApiErrorT(c, "Maximum number of tokens reached ({{max}})", map[string]any{"max": maxTokens})
 			return
 		}
@@ -535,7 +536,7 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	cleanToken := model.Token{
-		UserId:             service.ManagementOwnerID(c),
+		UserId:             ownerID,
 		Name:               token.Name,
 		Key:                key,
 		CreatedTime:        common.GetTimestamp(),

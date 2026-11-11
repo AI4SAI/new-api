@@ -49,9 +49,9 @@ export function ApiKeyNameCell({ apiKey }: { apiKey: ApiKey }) {
   const attribution = apiKey.attribution
   return (
     <div className='min-w-0 space-y-1 break-words'>
-      <span className='font-medium'>{formatKeyAssignee(attribution, t)}</span>
-      <div className='text-muted-foreground text-xs'>
-        <span>{apiKey.name}</span>
+      <span className='font-medium'>{apiKey.name}</span>
+      <div className='text-muted-foreground text-xs font-normal'>
+        <span>{formatKeyAssignee(attribution, t)}</span>
         {attribution?.state === 'ready' && (
           <> · {attribution.workspace.label}</>
         )}
