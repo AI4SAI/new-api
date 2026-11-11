@@ -18,8 +18,8 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
-	"github.com/tidwall/gjson"
 )
 
 // DeepSeekToolsHelper relays the DeepSeek Search and Fetch APIs like
@@ -125,13 +125,13 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 	// call settles at the routing name's request price; any other response
 	// releases the reservation.
 	var billable bool
-	content := gjson.GetBytes(responseBody, "content")
-	if httpResp.StatusCode == http.StatusOK && utf8.Valid(responseBody) && gjson.ValidBytes(responseBody) {
+	content := ojson.GetBytes(responseBody, "content")
+	if httpResp.StatusCode == http.StatusOK && utf8.Valid(responseBody) && ojson.ValidBytes(responseBody) {
 		switch info.RelayMode {
 		case relayconstant.RelayModeToolsFetch:
-			billable = content.Type == gjson.String && utf8.ValidString(content.Str) && content.Str != ""
+			billable = content.Type == ojson.String && utf8.ValidString(content.Str) && content.Str != ""
 		default:
-			results := gjson.GetBytes(responseBody, "results")
+			results := ojson.GetBytes(responseBody, "results")
 			billable = results.IsArray() && len(results.Array()) > 0
 		}
 	}
@@ -159,7 +159,7 @@ func DeepSeekToolsHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIErr
 			if count >= 1 && count <= 50 {
 				info.SearchRequest = &relaycommon.DirectSearchLog{Query: requestFields.Query, Count: count,
 					NeedContent: requestFields.NeedContent,
-					ResultCount: len(gjson.GetBytes(responseBody, "results").Array()), Outcome: "success"}
+					ResultCount: len(ojson.GetBytes(responseBody, "results").Array()), Outcome: "success"}
 			}
 		}
 	}

@@ -18,6 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+  type AnyRouter,
+} from '@tanstack/react-router'
+import {
   act,
   cleanup,
   fireEvent,
@@ -27,7 +34,7 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { createRef } from 'react'
+import { createContext, useContext, type ReactNode, createRef } from 'react'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
 import { evaluateBillingExpression } from '@/features/pricing/lib/billing-expression/runtime'
@@ -47,6 +54,27 @@ import {
 } from '@/stores/system-config-store'
 
 import { previewModelPricing } from '../api'
+
+const routeContent = createContext<ReactNode>(null)
+let router: AnyRouter
+function RoutedContent() {
+  return useContext(routeContent)
+}
+function TestRouter(props: { children: ReactNode }) {
+  return (
+    <routeContent.Provider value={props.children}>
+      <RouterProvider router={router} />
+    </routeContent.Provider>
+  )
+}
+
+beforeEach(async () => {
+  router = createRouter({
+    routeTree: createRootRoute({ component: RoutedContent }),
+    history: createMemoryHistory(),
+  })
+  await router.load()
+})
 
 const clients: QueryClient[] = []
 
@@ -106,18 +134,20 @@ function renderEditor(
   const dirty = vi.fn()
   const view = (entry: Partial<ModelRatioData>) => (
     <QueryClientProvider client={client}>
-      <ModelPricingEditorPanel
-        ref={ref}
-        editData={{
-          name: 'currency-model',
-          billingMode: 'per-token',
-          ratio: '1',
-          completionRatio: '2',
-          ...entry,
-        }}
-        usageSchema={usageSchema}
-        onDirtyChange={dirty}
-      />
+      <TestRouter>
+        <ModelPricingEditorPanel
+          ref={ref}
+          editData={{
+            name: 'currency-model',
+            billingMode: 'per-token',
+            ratio: '1',
+            completionRatio: '2',
+            ...entry,
+          }}
+          usageSchema={usageSchema}
+          onDirtyChange={dirty}
+        />
+      </TestRouter>
     </QueryClientProvider>
   )
   const result = render(view(data))
@@ -260,6 +290,12 @@ it.each([
     mode: 'claude_ttl',
     expression: 'tier("base", p * 2 + c * 4 + cr * 1 + cc * 3 + cc1h * 4.8)',
   },
+  {
+    name: 'custom-gpt',
+    ratio: 1.5,
+    mode: 'openai_ttl',
+    expression: 'tier("base", p * 2 + c * 4 + cr * 1 + cc * 3 + cc12h * 6)',
+  },
 ])(
   'keeps configured cache prices visible on both sides for $name',
   async (fixture) => {
@@ -299,6 +335,7 @@ it.each([
           ? 'Cache write price'
           : 'Cache create price'
       if (fixture.mode === 'claude_ttl') label = 'Cache Creation (5m)'
+      if (fixture.mode === 'openai_ttl') label = 'Cache Creation (30m)'
       expect(
         within(panel).getByText(label).nextElementSibling
       ).toHaveTextContent(`$${fixture.ratio * 2} / 1M token`)
@@ -309,6 +346,15 @@ it.each([
       } else {
         expect(
           within(panel).queryByText('Cache create (1h) price')
+        ).not.toBeInTheDocument()
+      }
+      if (fixture.mode === 'openai_ttl') {
+        expect(
+          within(panel).getByText('Cache create (12h) price').nextElementSibling
+        ).toHaveTextContent('$6 / 1M token')
+      } else {
+        expect(
+          within(panel).queryByText('Cache create (12h) price')
         ).not.toBeInTheDocument()
       }
     }

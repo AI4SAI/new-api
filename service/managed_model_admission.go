@@ -57,7 +57,7 @@ func PrepareManagedModelRequest(c *gin.Context, modelName, kind string) *types.N
 	if !allowed || modelName == "" || (webProduct != "" && (modelName != webProduct || product != webProduct)) ||
 		(webProduct == "" && (product == "deepseek-search" || product == "deepseek-fetch" ||
 			modelName == "deepseek-search" || modelName == "deepseek-fetch")) {
-		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.protocol_unavailable")), types.ErrorCodeInvalidRequest,
+		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgModelProtocolUnavailable)), types.ErrorCodeInvalidRequest,
 			http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	c.Set("model_billing_product", product)
@@ -91,11 +91,11 @@ func AdmitManagedModel(c *gin.Context, modelName, kind string) *types.NewAPIErro
 	started := common.GetContextKeyTime(c, constant.ContextKeyRequestStartTime)
 	if c.GetInt("id") <= 0 || refErr != nil || parsed.String() != ref || c.GetInt64("model_execution_revision") <= 0 ||
 		epochErr != nil || policy <= 0 || strconv.FormatInt(policy, 10) != epoch || started.IsZero() {
-		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.admission_unavailable")),
+		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgModelAdmissionUnavailable)),
 			types.ErrorCodeInvalidRequest, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
 	}
 	if c.GetInt64("model_execution_until") <= time.Now().Unix() {
-		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.admission_denied")),
+		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgModelAdmissionDenied)),
 			types.ErrorCodeInvalidRequest, http.StatusForbidden, types.ErrOptionWithSkipRetry())
 	}
 	c.Set("model_billing_policy_epoch", epoch)
@@ -113,7 +113,7 @@ func ManagedResponsesBody(c *gin.Context, body io.Reader) *types.NewAPIError {
 		Background bool `json:"background"`
 	}
 	if common.DecodeJson(body, &request) != nil || request.Background {
-		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.background_unavailable")),
+		return types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgModelBackgroundUnavailable)),
 			types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 	}
 	return nil

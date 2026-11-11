@@ -91,6 +91,12 @@ func PrepareResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, req *d
 		}
 	}
 
+	if finalizer, ok := adaptor.(relaychannel.ResponsesRequestFinalizer); ok {
+		jsonData, err = finalizer.FinalizeResponsesRequest(info, jsonData)
+		if err != nil {
+			return nil, nil, nil, newConvertRequestFailedError(c, info, err)
+		}
+	}
 	if denied := service.ManagedResponsesBody(c, bytes.NewReader(jsonData)); denied != nil {
 		return nil, nil, nil, denied
 	}

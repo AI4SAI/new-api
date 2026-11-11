@@ -17,12 +17,41 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+  type AnyRouter,
+} from '@tanstack/react-router'
 import { render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, test } from 'vitest'
+import { createContext, useContext, type ReactNode } from 'react'
+import { beforeEach, afterEach, describe, expect, test } from 'vitest'
 
 import type { UsageLog } from '../../data/schema'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
+
+const routeContent = createContext<ReactNode>(null)
+let router: AnyRouter
+function RoutedContent() {
+  return useContext(routeContent)
+}
+function TestRouter(props: { children: ReactNode }) {
+  return (
+    <routeContent.Provider value={props.children}>
+      <RouterProvider router={router} />
+    </routeContent.Provider>
+  )
+}
+
+beforeEach(async () => {
+  router = createRouter({
+    routeTree: createRootRoute({ component: RoutedContent }),
+    history: createMemoryHistory(),
+  })
+  await router.load()
+})
 
 const queryClients: QueryClient[] = []
 
@@ -62,17 +91,19 @@ function renderDetails(isAdmin: boolean): void {
 
   render(
     <QueryClientProvider client={queryClient}>
-      <DetailsDialog
-        log={makeLog({
-          admin_info: {
-            reject_reason: 'blocked by channel policy',
-          },
-        })}
-        isAdmin={isAdmin}
-        isRoot={false}
-        open
-        onOpenChange={() => undefined}
-      />
+      <TestRouter>
+        <DetailsDialog
+          log={makeLog({
+            admin_info: {
+              reject_reason: 'blocked by channel policy',
+            },
+          })}
+          isAdmin={isAdmin}
+          isRoot={false}
+          open
+          onOpenChange={() => undefined}
+        />
+      </TestRouter>
     </QueryClientProvider>
   )
 }

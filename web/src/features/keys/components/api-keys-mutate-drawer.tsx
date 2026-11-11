@@ -274,6 +274,9 @@ export function ApiKeysMutateDrawer({
   // Load existing data when updating
   useEffect(() => {
     if (!open) {
+      form.reset(
+        getApiKeyFormDefaultValues(defaultUseAutoGroup && backendHasAuto)
+      )
       setInitializedTarget(null)
       setNeedsReview(null)
       return
@@ -307,7 +310,7 @@ export function ApiKeysMutateDrawer({
         ...creation.values,
         expired_time: creation.values.expired_time
           ? new Date(String(creation.values.expired_time))
-          : undefined,
+          : null,
       })
       setNeedsReview('unknown')
       setInitializedTarget(target)
@@ -490,7 +493,7 @@ export function ApiKeysMutateDrawer({
 
   const handleSetExpiry = (months: number, days: number, hours: number) => {
     if (months === 0 && days === 0 && hours === 0) {
-      form.setValue('expired_time', undefined)
+      form.setValue('expired_time', null)
       return
     }
 
@@ -515,15 +518,7 @@ export function ApiKeysMutateDrawer({
   const unlimitedQuota = form.watch('unlimited_quota')
 
   return (
-    <Sheet
-      open={open}
-      onOpenChange={(v) => {
-        onOpenChange(v)
-        if (!v) {
-          form.reset()
-        }
-      }}
-    >
+    <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         className={sideDrawerContentClassName('max-w-none sm:!max-w-[620px]')}
         aria-describedby={undefined}
@@ -702,8 +697,8 @@ export function ApiKeysMutateDrawer({
                       <div className='grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center'>
                         <FormControl>
                           <DateTimePicker
-                            value={field.value}
-                            onChange={field.onChange}
+                            value={field.value ?? undefined}
+                            onChange={(date) => field.onChange(date ?? null)}
                             placeholder={t('Never expires')}
                             className='min-w-0 [&_input[type=time]]:w-24 sm:[&_input[type=time]]:w-32'
                           />

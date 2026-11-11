@@ -35,11 +35,18 @@ const (
 	MsgDistributorNoAvailableChannelTaskPlugin = "distributor.no_available_channel_task_plugin"
 	MsgDistributorInvalidParseModel            = "distributor.invalid_request_parse_model"
 
+	MsgModelAdmissionUnavailable  = "model.admission_unavailable"
+	MsgModelAdmissionDenied       = "model.admission_denied"
+	MsgModelBackgroundUnavailable = "model.background_unavailable"
+	MsgModelProtocolUnavailable   = "model.protocol_unavailable"
+
 	MsgQuotaUserInsufficient             = "quota.user_insufficient"
 	MsgQuotaPreConsumeInsufficient       = "quota.pre_consume_insufficient"
 	MsgQuotaSubscriptionInsufficient     = "quota.subscription_insufficient"
 	MsgRelayModelPriceNotConfigured      = "relay.model_price_not_configured"
 	MsgRelayModelPriceNotConfiguredAdmin = "relay.model_price_not_configured_admin"
+	MsgRelayTaskUsagePriceUnsupported    = "relay.task_usage_price_unsupported"
+	MsgRelaySharedTaskPriceNeedsOverride = "relay.shared_task_price_needs_override"
 	MsgRelayTaskChannelDisabled          = "relay.task_channel_disabled"
 	MsgRelayGroupSaturated               = "relay.group_saturated"
 	MsgRelayGroupUpstreamSaturated       = "relay.group_upstream_saturated"

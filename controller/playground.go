@@ -96,7 +96,7 @@ func Playground(c *gin.Context) {
 	if service.ManagedModelMode(c) {
 		ref := c.GetString("playground_billing_context_ref")
 		if ref == "" {
-			newAPIError = types.NewErrorWithStatusCode(errors.New(i18n.T(c, "model.admission_unavailable")),
+			newAPIError = types.NewErrorWithStatusCode(errors.New(i18n.T(c, i18n.MsgModelAdmissionUnavailable)),
 				types.ErrorCodeQueryDataError, http.StatusServiceUnavailable, types.ErrOptionWithSkipRetry())
 			return
 		}

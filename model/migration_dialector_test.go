@@ -1,6 +1,7 @@
 package model
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,6 +126,59 @@ func TestMigrationSchemaStability(t *testing.T) {
 					{MigrationIdentityFields: MigrationIdentityFields{Name: "other-3", Reference: "other-3", Provider: "oidc", Subject: "subject"}},
 				} {
 					assert.Error(t, db.Table(table).Create(&duplicate).Error)
+				}
+			})
+
+			t.Run("quota_cache_tokens", func(t *testing.T) {
+				for _, upgrade := range []bool{false, true} {
+					t.Run(fmt.Sprintf("upgrade=%v", upgrade), func(t *testing.T) {
+						const table = "migration_quota_cache_tokens_test"
+						quotaDB := db.Table(table).Session(&gorm.Session{})
+						t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
+						require.NoError(t, quotaDB.AutoMigrate(&QuotaData{}))
+						if upgrade {
+							// The deployed shape differs only by these two new columns.
+							require.NoError(t, quotaDB.Migrator().DropColumn(&QuotaData{}, "CacheReadTokens"))
+							require.NoError(t, quotaDB.Migrator().DropColumn(&QuotaData{}, "CacheCreationTokens"))
+						}
+						original := []QuotaData{
+							{Id: 1, UserID: 71, Username: "retained-user", ModelName: "retained-model", CreatedAt: 1700000000,
+								UseGroup: "default", TokenID: 81, ChannelID: 91, NodeName: "retained-node", TokenUsed: 420, Count: 7, Quota: 321},
+							{Id: 2, UserID: 71, Username: "retained-user", ModelName: "retained-model", CreatedAt: 1700003600,
+								UseGroup: "default", TokenID: 82, ChannelID: 92, NodeName: "retained-node", TokenUsed: 84, Count: 2, Quota: 63},
+						}
+						require.NoError(t, quotaDB.Omit("CacheReadTokens", "CacheCreationTokens").Create(&original).Error)
+						for round := range 2 {
+							recorder.reset()
+							require.NoError(t, quotaDB.AutoMigrate(&QuotaData{}))
+							if round == 1 {
+								assert.Empty(t, recorder.schemaMutations(), "the second startup must not repeat DDL")
+							}
+							var stored []QuotaData
+							require.NoError(t, quotaDB.Order("id").Find(&stored).Error)
+							assert.Equal(t, original, stored, "all existing dimensions and aggregate values must survive migration %d", round+1)
+							var nullCounters int64
+							require.NoError(t, quotaDB.Where("cache_read_tokens IS NULL OR cache_creation_tokens IS NULL").Count(&nullCounters).Error)
+							assert.Zero(t, nullCounters, "new columns must initialize existing rows to zero")
+						}
+						wide := QuotaData{Id: 3, CacheReadTokens: 1 << 33, CacheCreationTokens: 1 << 34}
+						require.NoError(t, quotaDB.Create(&wide).Error)
+						var loaded QuotaData
+						require.NoError(t, quotaDB.Where("id = ?", wide.Id).Take(&loaded).Error)
+						assert.Equal(t, wide.CacheReadTokens, loaded.CacheReadTokens)
+						assert.Equal(t, wide.CacheCreationTokens, loaded.CacheCreationTokens)
+						// An old writer omits the new counters and still gets SQL defaults.
+						require.NoError(t, quotaDB.Create(map[string]any{"id": 4, "count": 1, "quota": 29, "token_used": 11}).Error)
+						var defaults struct {
+							CacheReadTokens     *int64
+							CacheCreationTokens *int64
+						}
+						require.NoError(t, quotaDB.Where("id = ?", 4).Take(&defaults).Error)
+						require.NotNil(t, defaults.CacheReadTokens)
+						require.NotNil(t, defaults.CacheCreationTokens)
+						assert.Zero(t, *defaults.CacheReadTokens)
+						assert.Zero(t, *defaults.CacheCreationTokens)
+					})
 				}
 			})
 

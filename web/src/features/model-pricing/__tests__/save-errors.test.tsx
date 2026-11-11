@@ -17,11 +17,19 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClientProvider, type QueryClient } from '@tanstack/react-query'
+import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+  type AnyRouter,
+} from '@tanstack/react-router'
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { AxiosError, type AxiosAdapter } from 'axios'
+import { createContext, useContext, type ReactNode } from 'react'
 import { toast } from 'sonner'
-import { afterEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 
 import { api } from '@/lib/http-client'
 import { createAppQueryClient } from '@/lib/query-client'
@@ -31,6 +39,27 @@ import { usePricingPreferencesStore } from '@/stores/pricing-preferences-store'
 import type { ModelPricingConfig } from '../api'
 import { ModelPricingPanel } from '../model-pricing-panel'
 import { pricingOptions } from '../pricing'
+
+const routeContent = createContext<ReactNode>(null)
+let router: AnyRouter
+function RoutedContent() {
+  return useContext(routeContent)
+}
+function TestRouter(props: { children: ReactNode }) {
+  return (
+    <routeContent.Provider value={props.children}>
+      <RouterProvider router={router} />
+    </routeContent.Provider>
+  )
+}
+
+beforeEach(async () => {
+  router = createRouter({
+    routeTree: createRootRoute({ component: RoutedContent }),
+    history: createMemoryHistory(),
+  })
+  await router.load()
+})
 
 const originalAdapter = api.defaults.adapter
 let client: QueryClient | undefined
@@ -121,7 +150,9 @@ it.each([200, 400])(
     client = createAppQueryClient()
     render(
       <QueryClientProvider client={client}>
-        <ModelPricingPanel modelName='example' />
+        <TestRouter>
+          <ModelPricingPanel modelName='example' />
+        </TestRouter>
       </QueryClientProvider>
     )
     const user = userEvent.setup()

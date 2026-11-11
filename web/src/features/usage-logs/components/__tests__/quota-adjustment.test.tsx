@@ -18,12 +18,20 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+  type AnyRouter,
+} from '@tanstack/react-router'
+import {
   flexRender,
   getCoreRowModel,
   useReactTable,
 } from '@tanstack/react-table'
 import { act, render, screen, within } from '@testing-library/react'
 import { createInstance } from 'i18next'
+import { createContext, useContext, type ReactNode } from 'react'
 import { I18nextProvider } from 'react-i18next'
 import {
   afterAll,
@@ -47,6 +55,27 @@ import { renderAuditContent } from '../../lib/format'
 import type { LogOtherData } from '../../types'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
 import { DetailsDialog } from '../dialogs/details-dialog'
+
+const routeContent = createContext<ReactNode>(null)
+let router: AnyRouter
+function RoutedContent() {
+  return useContext(routeContent)
+}
+function TestRouter(props: { children: ReactNode }) {
+  return (
+    <routeContent.Provider value={props.children}>
+      <RouterProvider router={router} />
+    </routeContent.Provider>
+  )
+}
+
+beforeEach(async () => {
+  router = createRouter({
+    routeTree: createRootRoute({ component: RoutedContent }),
+    history: createMemoryHistory(),
+  })
+  await router.load()
+})
 
 // Provider icons are unused by quota logs; their browser-only dependencies
 // cannot be loaded by Vitest's Node ESM resolver.
@@ -184,7 +213,9 @@ describe('quota adjustment log localization', () => {
       render(
         <I18nextProvider i18n={i18n}>
           <QueryClientProvider client={queryClient}>
-            <QuotaLogPreview log={log} />
+            <TestRouter>
+              <QuotaLogPreview log={log} />
+            </TestRouter>
           </QueryClientProvider>
         </I18nextProvider>
       )

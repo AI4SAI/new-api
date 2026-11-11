@@ -5,14 +5,43 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 )
+
+func (token Token) cacheMAC() (string, error) {
+	key := getTokenCacheKey(token.Key)
+	token.Key = ""
+	token.RemainQuota = 0
+	token.UsedQuota = 0
+	token.AccessedTime = 0
+	// The atomic budget path owns this revision and retains it during repairs,
+	// just as reservation/settlement paths own the quota counters.
+	token.QuotaRevision = 0
+	if token.AllowIps != nil && *token.AllowIps == "" {
+		token.AllowIps = nil
+	}
+	if token.BillingContextRef != nil && *token.BillingContextRef == "" {
+		token.BillingContextRef = nil
+	}
+	return authCacheMAC(key, struct {
+		Token                   Token
+		AutoGroups              string
+		MetadataRevision        int64
+		BillingContextConfirmed bool
+		CacheSchemaVersion      int
+		CacheExpiresAt          int64
+	}{token, token.AutoGroups, token.MetadataRevision, token.BillingContextConfirmed,
+		token.CacheSchemaVersion, token.CacheExpiresAt})
+}
 
 func getTokenCacheKey(key string) string {
 	return fmt.Sprintf("token:%s", common.GenerateHMAC(key))
 }
 
+// Keep the deployed key names for mixed-version fills and settlements.
+// common.RDB uses standalone Redis, without Cluster cross-slot support.
 func getTokenCacheFenceKey(key string) string {
 	return fmt.Sprintf("token:fence:%s", common.GenerateHMAC(key))
 }
@@ -116,10 +145,11 @@ end
 return 1`, []string{getTokenCacheKey(key), getTokenCacheFenceKey(key)}, tokenCacheFenceSeconds).Err()
 }
 
-// cacheInitToken publishes a database snapshot only when no mutation fence is
-// active and the hash is cold. Existing hashes retain quota reservations while
-// invalidated metadata is refreshed. Return 0 for a fence, 1 for initialization,
-// and 2 for a retained quota hash.
+// cacheInitToken publishes database metadata after checking the pending and
+// committed metadata floors. Repairs preserve outstanding quota reservations
+// and unresolved budget changes. Malformed counters are replaced from the
+// snapshot, as they cannot be used by the atomic quota paths.
+// Returns 0 when fenced, 1 after initialization, or 2 for an existing hash.
 func cacheInitToken(token Token) (int, error) {
 	if !common.RedisEnabled {
 		return 0, nil
@@ -131,6 +161,23 @@ func cacheInitToken(token Token) (int, error) {
 	billingRef := ""
 	if token.BillingContextRef != nil {
 		billingRef = *token.BillingContextRef
+	}
+	cacheKey := getTokenCacheKey(token.Key)
+	var existing Token
+	readErr := common.RedisHGetObj(cacheKey, &existing)
+	if readErr != nil {
+		// Decoding stops at the first unreadable field, before CacheMAC.
+		existing.CacheMAC, _ = common.RDB.HGet(context.Background(), cacheKey, "CacheMAC").Result()
+	}
+	existing.Key = token.Key
+	existingMAC, macErr := existing.cacheMAC()
+	repair := readErr != nil || macErr != nil || !validAuthCacheMAC(existingMAC, existing.CacheMAC, existing.CacheExpiresAt)
+	token.MetadataRevision = max(token.MetadataRevision, 1)
+	token.CacheSchemaVersion = 5
+	token.CacheExpiresAt = time.Now().Add(time.Duration(tokenCacheTTLSeconds()) * time.Second).UnixMilli()
+	mac, err := token.cacheMAC()
+	if err != nil {
+		return 0, err
 	}
 	const script = `
 local metadata = tonumber(ARGV[24])
@@ -145,33 +192,41 @@ if redis.call('EXISTS', KEYS[1]) == 1
   and tonumber(redis.call('HGET', KEYS[1], 'QuotaRevision') or '0') ~= tonumber(ARGV[21]) then
   if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') == -1 then return -1 end
 end
-if redis.call('EXISTS', KEYS[1]) == 1 then
+local exists = redis.call('EXISTS', KEYS[1])
+if exists == 1 then
   redis.call('HSETNX', KEYS[1], 'QuotaRevision', ARGV[21])
-  if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') ~= 5 or cached < metadata then
-    redis.call('HSET', KEYS[1], 'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[7],
-      'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
-      'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13], 'AutoGroups', ARGV[14],
-      'AllowUserQuotaQuery', ARGV[17], 'ManagedBindingRef', ARGV[19], 'ManagementCreatorID', ARGV[20],
-      'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24],
-      'ManagedSubjectRef', ARGV[25], 'CacheSchemaVersion', 5)
+  if cached == metadata then
+    local schema = tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0')
+    if (schema == 5 and ARGV[28] ~= 'true') or (redis.call('HGET', KEYS[1], 'CacheMAC') or '') ~= ARGV[29] then
+      redis.call('EXPIRE', KEYS[1], ARGV[18])
+      return 2
+    end
   end
-  redis.call('EXPIRE', KEYS[1], ARGV[18])
-  return 2
 end
+redis.call('HDEL', KEYS[1], 'DeletedAt')
 redis.call('HSET', KEYS[1],
   'Id', ARGV[1], 'UserId', ARGV[2], 'Status', ARGV[3], 'Name', ARGV[4],
-  'CreatedTime', ARGV[5], 'AccessedTime', ARGV[6], 'ExpiredTime', ARGV[7],
+  'CreatedTime', ARGV[5], 'ExpiredTime', ARGV[7],
   'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
-  'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
-  'AllowUserQuotaQuery', ARGV[17], 'ManagedBindingRef', ARGV[19], 'ManagementCreatorID', ARGV[20], 'QuotaRevision', ARGV[21],
+  'AutoGroups', ARGV[14], 'AllowUserQuotaQuery', ARGV[17],
+  'ManagedBindingRef', ARGV[19], 'ManagementCreatorID', ARGV[20],
   'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24],
-  'ManagedSubjectRef', ARGV[25], 'CacheSchemaVersion', 5)
+  'ManagedSubjectRef', ARGV[25], 'CacheSchemaVersion', 5,
+  'CacheExpiresAt', ARGV[26], 'CacheMAC', ARGV[27])
+for _, counter in ipairs({{'AccessedTime', ARGV[6]}, {'RemainQuota', ARGV[15]}, {'UsedQuota', ARGV[16]}, {'QuotaRevision', ARGV[21]}}) do
+  if not string.match(redis.call('HGET', KEYS[1], counter[1]) or '', '^-?%d+$') then
+    redis.call('HSET', KEYS[1], counter[1], counter[2])
+  end
+end
 redis.call('EXPIRE', KEYS[1], ARGV[18])
+if exists == 1 then
+  return 2
+end
 return 1`
 
 	result, err := common.RDB.Eval(context.Background(), script, []string{
-		getTokenCacheKey(token.Key), getTokenCacheFenceKey(token.Key), getTokenMetadataVersionKey(token.Key),
+		cacheKey, getTokenCacheFenceKey(token.Key), getTokenMetadataVersionKey(token.Key),
 	},
 		token.Id, token.UserId, token.Status, token.Name,
 		token.CreatedTime, token.AccessedTime, token.ExpiredTime,
@@ -182,8 +237,9 @@ return 1`
 		tokenCacheTTLSeconds(),
 		token.ManagedBindingRef, token.ManagementCreatorID, token.QuotaRevision,
 		billingRef, strconv.FormatBool(token.BillingContextConfirmed),
-		max(token.MetadataRevision, 1),
+		token.MetadataRevision,
 		token.ManagedSubjectRef,
+		token.CacheExpiresAt, mac, strconv.FormatBool(repair), existing.CacheMAC,
 	).Int()
 	if result == -1 && err == nil {
 		return result, ErrTokenQuotaUpdateUnknown
@@ -214,5 +270,9 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 		return nil, ErrTokenMetadataStale
 	}
 	token.Key = key
+	mac, err := token.cacheMAC()
+	if err != nil || !validAuthCacheMAC(mac, token.CacheMAC, token.CacheExpiresAt) {
+		return nil, fmt.Errorf("token cache integrity check failed")
+	}
 	return &token, nil
 }

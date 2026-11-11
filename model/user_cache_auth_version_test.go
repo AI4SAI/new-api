@@ -15,6 +15,106 @@ import (
 	"gorm.io/gorm"
 )
 
+// Old processes can still publish floors while streams and background work
+// finish. Seed their deployed keys directly to exercise the shared contract.
+func TestUserAuthCacheReadsLegacyFloors(t *testing.T) {
+	for _, tc := range []struct {
+		key string
+		err error
+	}{
+		{"auth:user:fence:4205", ErrUserAuthCachePending},
+		{"auth:user:version:4205", ErrUserAuthCachePending},
+		{"model:user:fence:4205", ErrModelExecutionCachePending},
+		{"model:user:version:4205", ErrModelExecutionCachePending},
+		{"quota:user:reclaim-pending:4205", ErrUserQuotaReclaimPending},
+		{"quota:user:reclaimed:4205", ErrUserQuotaReclaimPending},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			useUserCacheMiniRedis(t)
+			user := UserBase{Id: 4205, AuthVersion: 1, ModelExecutionRevision: 1,
+				ModelExecutionUntil: time.Now().Unix() + 600, Quota: 100}
+			require.NoError(t, writeUserCache(&user, true))
+			require.NoError(t, cacheDecrUserQuota(user.Id, 30))
+			require.NoError(t, common.RDB.Set(t.Context(), tc.key, 2, 0).Err())
+			cached, err := cacheGetUserBase(user.Id)
+			if errors.Is(tc.err, ErrUserAuthCachePending) {
+				require.ErrorIs(t, err, tc.err)
+			} else {
+				require.NoError(t, err)
+				assert.Zero(t, cached.ModelExecutionUntil)
+				assert.Equal(t, 70, cached.Quota)
+			}
+			require.ErrorIs(t, writeUserCache(&user, true), tc.err)
+			assert.Equal(t, "70", common.RDB.HGet(t.Context(), "user:4205", "Quota").Val())
+
+			fresh := user
+			expectedQuota := 70
+			switch tc.err {
+			case ErrUserAuthCachePending:
+				fresh.AuthVersion = 2
+			case ErrModelExecutionCachePending:
+				fresh.ModelExecutionRevision, fresh.ModelExecutionUntil = 2, 0
+			case ErrUserQuotaReclaimPending:
+				fresh.QuotaReclaimedTotal = 2
+				expectedQuota -= 2
+			}
+			require.NoError(t, writeUserCache(&fresh, true))
+			cached, err = cacheGetUserBase(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, expectedQuota, cached.Quota)
+			mac, expiry := cached.CacheMAC, cached.CacheExpiresAt
+			// The settlement delta used by old streams preserves signed metadata.
+			require.NoError(t, cacheIncrUserQuota(user.Id, 5))
+			cached, err = cacheGetUserBase(user.Id)
+			require.NoError(t, err)
+			assert.Equal(t, expectedQuota+5, cached.Quota)
+			assert.Equal(t, mac, cached.CacheMAC)
+			assert.Equal(t, expiry, cached.CacheExpiresAt)
+		})
+	}
+}
+
+func TestTokenCacheReadsLegacyFloors(t *testing.T) {
+	const tokenKey = "legacy-floor-token"
+	for _, prefix := range []string{"token:fence:", "token:metadata-version:"} {
+		t.Run(prefix, func(t *testing.T) {
+			useUserCacheMiniRedis(t)
+			token := Token{Id: 4206, UserId: 4205, Key: tokenKey, MetadataRevision: 1,
+				Status: common.TokenStatusEnabled, RemainQuota: 100}
+			_, err := cacheInitToken(token)
+			require.NoError(t, err)
+			result, err := cacheTryReserveTokenQuota(token.Id, token.Key, 70)
+			require.NoError(t, err)
+			require.Equal(t, cacheQuotaOK, result)
+			require.NoError(t, common.RDB.Set(t.Context(), prefix+common.GenerateHMAC(tokenKey), 2, 0).Err())
+			_, err = cacheGetTokenByKey(tokenKey)
+			require.ErrorIs(t, err, ErrTokenMetadataStale)
+			_, err = cacheInitToken(token)
+			require.ErrorIs(t, err, ErrTokenMetadataStale)
+			assert.Equal(t, "30", common.RDB.HGet(t.Context(), getTokenCacheKey(tokenKey), "RemainQuota").Val())
+
+			token.MetadataRevision, token.Status = 2, common.TokenStatusDisabled
+			_, err = cacheInitToken(token)
+			require.NoError(t, err)
+			cached, err := cacheGetTokenByKey(tokenKey)
+			require.NoError(t, err)
+			assert.Equal(t, common.TokenStatusDisabled, cached.Status)
+			assert.Equal(t, 30, cached.RemainQuota)
+			assert.Equal(t, 70, cached.UsedQuota)
+			mac, expiry := cached.CacheMAC, cached.CacheExpiresAt
+			result, err = cacheApplyTokenQuotaDelta(token.Id, token.Key, 5)
+			require.NoError(t, err)
+			require.Equal(t, cacheQuotaOK, result)
+			cached, err = cacheGetTokenByKey(tokenKey)
+			require.NoError(t, err)
+			assert.Equal(t, 35, cached.RemainQuota)
+			assert.Equal(t, 65, cached.UsedQuota)
+			assert.Equal(t, mac, cached.CacheMAC)
+			assert.Equal(t, expiry, cached.CacheExpiresAt)
+		})
+	}
+}
+
 func useUserCacheMiniRedis(t *testing.T) *miniredis.Miniredis {
 	t.Helper()
 	server := miniredis.RunT(t)
@@ -187,14 +287,14 @@ func TestPendingUserAuthFenceRejectsStaleCacheWrite(t *testing.T) {
 	assert.False(t, server.Exists(getUserCacheKey(userID)))
 }
 
-func TestUserAuthFieldUpdateRejectsVersionMismatch(t *testing.T) {
+func TestUserAuthCacheUpdateRejectsVersionMismatch(t *testing.T) {
 	useUserCacheMiniRedis(t)
 	const userID = 4202
 	require.NoError(t, writeUserCache(&UserBase{
 		Id: userID, Group: "current", Username: "cached", AuthVersion: 3,
 	}, true))
 
-	err := updateUserCacheFieldAtVersion(userID, "Group", "stale", 2)
+	err := writeUserCache(&UserBase{Id: userID, Group: "stale", AuthVersion: 2}, false)
 
 	assert.ErrorIs(t, err, ErrUserAuthCachePending)
 	group, err := common.RDB.HGet(t.Context(), getUserCacheKey(userID), "Group").Result()

@@ -18,6 +18,13 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
+  createMemoryHistory,
+  createRootRoute,
+  createRouter,
+  RouterProvider,
+  type AnyRouter,
+} from '@tanstack/react-router'
+import {
   cleanup,
   render,
   screen,
@@ -25,9 +32,9 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { useState } from 'react'
+import { createContext, useContext, type ReactNode, useState } from 'react'
 import { useForm } from 'react-hook-form'
-import { afterEach, expect, it, vi } from 'vitest'
+import { beforeEach, afterEach, expect, it, vi } from 'vitest'
 
 import { SettingsPageProvider } from '@/features/system-settings/components/settings-page-context'
 import { ModelPricingEditorPanel } from '@/features/system-settings/models/model-pricing-sheet'
@@ -38,6 +45,27 @@ import { usePricingPreferencesStore } from '@/stores/pricing-preferences-store'
 
 import { ModelPricingPanel } from '../model-pricing-panel'
 import type { PricingValues } from '../pricing'
+
+const routeContent = createContext<ReactNode>(null)
+let router: AnyRouter
+function RoutedContent() {
+  return useContext(routeContent)
+}
+function TestRouter(props: { children: ReactNode }) {
+  return (
+    <routeContent.Provider value={props.children}>
+      <RouterProvider router={router} />
+    </routeContent.Provider>
+  )
+}
+
+beforeEach(async () => {
+  router = createRouter({
+    routeTree: createRootRoute({ component: RoutedContent }),
+    history: createMemoryHistory(),
+  })
+  await router.load()
+})
 
 const clients: QueryClient[] = []
 const originalColumnVisibility = localStorage.getItem(
@@ -59,7 +87,7 @@ afterEach(() => {
   }
 })
 
-it.each(['none', 'standard', 'claude_ttl'] as const)(
+it.each(['none', 'standard', 'claude_ttl', 'openai_ttl'] as const)(
   'uses the %s cache profile consistently in current billing and draft previews',
   async (mode) => {
     const cacheWriteMode = mode
@@ -107,7 +135,9 @@ it.each(['none', 'standard', 'claude_ttl'] as const)(
     clients.push(client)
     render(
       <QueryClientProvider client={client}>
-        <ModelPricingPanel modelName='gpt-4o-custom' />
+        <TestRouter>
+          <ModelPricingPanel modelName='gpt-4o-custom' />
+        </TestRouter>
       </QueryClientProvider>
     )
     const billing = await screen.findByRole('region', {
@@ -134,11 +164,15 @@ it.each(['none', 'standard', 'claude_ttl'] as const)(
         expect(
           within(panel).queryByText('Cache create (1h) price')
         ).not.toBeInTheDocument()
-      } else {
         expect(
-          within(panel).getByText(
-            mode === 'claude_ttl' ? 'Cache Creation (5m)' : 'Cache write price'
-          ).nextElementSibling
+          within(panel).queryByText('Cache create (12h) price')
+        ).not.toBeInTheDocument()
+      } else {
+        let writeLabel = 'Cache write price'
+        if (mode === 'claude_ttl') writeLabel = 'Cache Creation (5m)'
+        if (mode === 'openai_ttl') writeLabel = 'Cache Creation (30m)'
+        expect(
+          within(panel).getByText(writeLabel).nextElementSibling
         ).toHaveTextContent('$5')
         if (mode === 'claude_ttl') {
           expect(
@@ -148,6 +182,16 @@ it.each(['none', 'standard', 'claude_ttl'] as const)(
         } else {
           expect(
             within(panel).queryByText('Cache create (1h) price')
+          ).not.toBeInTheDocument()
+        }
+        if (mode === 'openai_ttl') {
+          expect(
+            within(panel).getByText('Cache create (12h) price')
+              .nextElementSibling
+          ).toHaveTextContent('$10')
+        } else {
+          expect(
+            within(panel).queryByText('Cache create (12h) price')
           ).not.toBeInTheDocument()
         }
       }
@@ -188,17 +232,19 @@ function renderEditor(embedded = false) {
   clients.push(client)
   render(
     <QueryClientProvider client={client}>
-      <ModelPricingEditorPanel
-        embedded={embedded}
-        editData={{
-          name: 'example-model',
-          billingMode: 'per-token',
-          ratio: '3.25',
-          completionRatio: '2',
-          cacheRatio: '0.2',
-        }}
-        onSave={() => {}}
-      />
+      <TestRouter>
+        <ModelPricingEditorPanel
+          embedded={embedded}
+          editData={{
+            name: 'example-model',
+            billingMode: 'per-token',
+            ratio: '3.25',
+            completionRatio: '2',
+            cacheRatio: '0.2',
+          }}
+          onSave={() => {}}
+        />
+      </TestRouter>
     </QueryClientProvider>
   )
 }
@@ -331,7 +377,9 @@ it.each(['default', 'unset'] as const)(
     clients.push(client)
     render(
       <QueryClientProvider client={client}>
-        <PricingFormFixture variant={variant} onSave={save} />
+        <TestRouter>
+          <PricingFormFixture variant={variant} onSave={save} />
+        </TestRouter>
       </QueryClientProvider>
     )
     const workspace = screen.getByRole('region', { name: 'Model prices' })
@@ -383,10 +431,22 @@ it.each(['default', 'unset'] as const)(
     await user.clear(price)
     await user.type(price, '0.25')
     const region = screen.getByRole('region', { name: 'Edit model pricing' })
-    const button = screen.getByRole('button', { name: 'Save model prices' })
+    const editor = region.closest('form')
+    if (!editor) throw new Error('Pricing editor form not found')
+    // The page top bar has its own Save; this one is the editor's action bar.
+    const button = within(editor).getByRole('button', {
+      name: 'Save model prices',
+    })
     expect(region).not.toContainElement(button)
     expect(button.parentElement?.parentElement).toHaveClass('shrink-0')
     await user.click(button)
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Confirm price changes',
+    })
+    expect(save).not.toHaveBeenCalled()
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Confirm and save' })
+    )
     await waitFor(() => expect(save).toHaveBeenCalledOnce())
     expect(save).toHaveBeenCalledWith(
       expect.objectContaining({ ExposeRatioEnabled: variant === 'default' }),

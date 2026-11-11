@@ -48,7 +48,7 @@ export function getApiKeyFormSchema(
         .nullable()
         .optional(),
       remain_quota_dollars: z.number().optional(),
-      expired_time: z.date().optional(),
+      expired_time: z.date().nullable(),
       unlimited_quota: z.boolean(),
       model_limits: z.array(z.string()),
       allow_ips: z.string().optional(),
@@ -126,7 +126,7 @@ export const API_KEY_FORM_DEFAULT_VALUES: ApiKeyFormValues = {
   name: '',
   assignee: null,
   remain_quota_dollars: 10,
-  expired_time: undefined,
+  expired_time: null,
   unlimited_quota: true,
   model_limits: [],
   allow_ips: '',
@@ -210,9 +210,7 @@ export function transformApiKeyToFormDefaults(
     name: apiKey.name,
     remain_quota_dollars: 0,
     expired_time:
-      apiKey.expired_time > 0
-        ? new Date(apiKey.expired_time * 1000)
-        : undefined,
+      apiKey.expired_time > 0 ? new Date(apiKey.expired_time * 1000) : null,
     unlimited_quota: apiKey.unlimited_quota,
     model_limits: apiKey.model_limits
       ? apiKey.model_limits.split(',').filter(Boolean)

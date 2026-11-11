@@ -178,12 +178,18 @@ func TestManagedOIDCAccountPreservesIdentityAndFunds(t *testing.T) {
 	require.NoError(t, model.DB.Where("user_id = ?", user.Id).Find(&grants).Error)
 	require.Len(t, grants, 1)
 	assert.True(t, grants[0].Managed)
+	const subjectRef = "11111111-1111-4111-8111-111111111111"
 	registration := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var receipt map[string]any
 		require.NoError(t, common.DecodeJson(r.Body, &receipt))
 		require.Equal(t, "/v1/internal/models/register-key", r.URL.Path)
+		require.EqualValues(t, 2, receipt["schema_version"])
 		require.Equal(t, "33333333-3333-4333-8333-333333333333", receipt["billing_context_ref"])
-		data, err := common.Marshal(receipt)
+		data, err := common.Marshal(map[string]any{
+			"schema_version": 2, "gateway_instance_ref": receipt["gateway_instance_ref"],
+			"native_owner_id": receipt["native_owner_id"], "native_token_id": receipt["native_token_id"],
+			"billing_context_ref": receipt["billing_context_ref"], "managed_subject_ref": subjectRef,
+		})
 		require.NoError(t, err)
 		_, _ = w.Write(data)
 	}))
@@ -200,6 +206,8 @@ func TestManagedOIDCAccountPreservesIdentityAndFunds(t *testing.T) {
 	var nativeKey model.Token
 	require.NoError(t, model.DB.Where("user_id = ?", user.Id).First(&nativeKey).Error)
 	assert.Equal(t, "33333333-3333-4333-8333-333333333333", nativeKey.ManagedBindingRef)
+	assert.Equal(t, subjectRef, nativeKey.ManagedSubjectRef)
+	assert.True(t, nativeKey.BillingContextConfirmed)
 	_, err := model.DeleteUserAccessToken(user.Id, grants[0].Id)
 	assert.ErrorIs(t, err, model.ErrAccessTokenNotFound)
 	key = strings.Repeat("r", 48)
