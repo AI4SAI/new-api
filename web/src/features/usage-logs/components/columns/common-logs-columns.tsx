@@ -35,6 +35,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { formatKeyAssignee } from '@/features/keys/lib'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import {
   normalizeTierLabel,
@@ -653,7 +654,7 @@ export function useCommonLogsColumns(
                     <div>
                       {t('Member')}:{' '}
                       {sensitiveVisible
-                        ? log.attribution.actor.display_name
+                        ? formatKeyAssignee(log.attribution, t)
                         : '••••'}
                     </div>
                     <div>
@@ -664,7 +665,7 @@ export function useCommonLogsColumns(
                     </div>
                   </>
                 ) : (
-                  t('Attribution unavailable')
+                  formatKeyAssignee(log.attribution, t)
                 )}
               </div>
             )}

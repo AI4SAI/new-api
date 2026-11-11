@@ -34,6 +34,7 @@ import userEvent from '@testing-library/user-event'
 import { expect, it, vi } from 'vitest'
 
 import { usageLogSchema, type UsageLog } from '../../data/schema'
+import { getLogCsvHeader, getLogCsvRow } from '../../lib/export'
 import { useCommonLogsColumns } from '../columns/common-logs-columns'
 import { UsageLogsMobileList } from '../usage-logs-mobile-card'
 import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
@@ -427,5 +428,47 @@ it.each([false, true])(
         screen.getByRole('button', { name: 'Workspace: Research lab' })
       ).toBeVisible()
     }
+  }
+)
+
+it.each([
+  ['unknown', 'Assignee unknown', false],
+  ['unavailable', 'Attribution unavailable', false],
+  ['unknown', 'Assignee unknown', true],
+  ['unavailable', 'Attribution unavailable', true],
+] as const)(
+  'log attribution %s shows %s and agrees with CSV on desktop=%s',
+  async (state, label, desktopToken) => {
+    const item = usageLogSchema.parse({
+      ...log,
+      username: 'Previous creator',
+      attribution: {
+        state,
+        actor: { display_name: 'Previous creator', username: 'old-creator' },
+        workspace: {
+          kind: 'org',
+          code: 'old-org',
+          label: 'Previous workspace',
+        },
+      },
+    })
+    await renderLogs({ admin: false, desktopToken, logs: [item] })
+    if (desktopToken) {
+      expect(screen.getByText(label)).toBeVisible()
+    } else {
+      expect(
+        screen.getByRole('button', { name: `Member: ${label}` })
+      ).toBeVisible()
+      expect(
+        screen.queryByRole('button', { name: /^Workspace:/ })
+      ).not.toBeInTheDocument()
+    }
+    expect(
+      screen.queryByText(/Previous creator|Previous workspace/)
+    ).not.toBeInTheDocument()
+    const header = getLogCsvHeader(false, (key) => key)
+    const row = getLogCsvRow(item, false, (key) => key)
+    expect(row[header.indexOf('Member')]).toBe(label)
+    expect(row[header.indexOf('Workspace')]).toBe('')
   }
 )

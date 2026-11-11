@@ -19,7 +19,7 @@ For commercial licensing, please contact support@quantumnous.com
 import { createInstance } from 'i18next'
 import { describe, expect, test } from 'vitest'
 
-import type { UsageLog } from '../../data/schema'
+import { usageLogSchema, type UsageLog } from '../../data/schema'
 import { getLogCsvHeader, getLogCsvRow, toCsvLine } from '../export'
 
 const consumeLog: UsageLog = {
@@ -172,3 +172,33 @@ describe('usage log CSV export', () => {
     )
   })
 })
+
+test.each([
+  ['unknown', 'Assignee unknown'],
+  ['unavailable', 'Attribution unavailable'],
+] as const)(
+  'CSV attribution %s stays distinct without assigning a creator or recorded key name',
+  (state, label) => {
+    const log = usageLogSchema.parse({
+      ...consumeLog,
+      username: 'Previous creator',
+      token_name: 'Legacy device',
+      attribution: {
+        state,
+        actor: { display_name: 'Previous creator', username: 'old-creator' },
+        workspace: {
+          kind: 'org',
+          code: 'old-org',
+          label: 'Previous workspace',
+        },
+      },
+    })
+    const header = getLogCsvHeader(false, (key) => key)
+    const row = getLogCsvRow(log, false, (key) => key)
+    expect(row[header.indexOf('Member')]).toBe(label)
+    expect(row[header.indexOf('Workspace')]).toBe('')
+    expect(row[header.indexOf('Token')]).toBe('Legacy device')
+    expect(row).not.toContain('Previous creator')
+    expect(row).not.toContain('Previous workspace')
+  }
+)

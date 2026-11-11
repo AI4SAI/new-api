@@ -27,6 +27,7 @@ import { GroupBadge } from '@/components/group-badge'
 import { StatusBadge, type StatusVariant } from '@/components/status-badge'
 import { Avatar, AvatarFallback } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
+import { formatKeyAssignee } from '@/features/keys/lib'
 import { getUserAvatarFallback, getUserAvatarStyle } from '@/lib/avatar'
 import dayjs from '@/lib/dayjs'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
@@ -114,10 +115,7 @@ export function CommonLogMobileCard<TData>(props: {
     },
     member: {
       label: t('Member'),
-      value:
-        log.attribution?.state === 'ready'
-          ? log.attribution.actor.display_name
-          : t('Attribution unavailable'),
+      value: formatKeyAssignee(log.attribution, t),
       visible:
         displayable && props.cells.has('token_name') && !!log.attribution,
       sensitive: true,

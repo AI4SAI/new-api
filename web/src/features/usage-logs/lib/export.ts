@@ -16,6 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import { formatKeyAssignee } from '@/features/keys/lib'
 import { formatLogQuota, formatTimestampToDate } from '@/lib/format'
 
 import type { UsageLog } from '../data/schema'
@@ -75,12 +76,7 @@ export function getLogCsvRow(
       ? `#${log.channel} ${log.channel_name}`
       : `#${log.channel}`
   }
-  let member = ''
-  if (log.attribution?.state === 'ready') {
-    member = log.attribution.actor.display_name
-  } else if (log.attribution?.state === 'unavailable') {
-    member = t('Attribution unavailable')
-  }
+  const member = log.attribution ? formatKeyAssignee(log.attribution, t) : ''
   return [
     formatTimestampToDate(log.created_at),
     t(getLogTypeConfig(log.type).label),

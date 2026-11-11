@@ -16,6 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
+import type { ApiKey } from '../types'
+
+export function formatKeyAssignee(
+  attribution: ApiKey['attribution'],
+  t: (key: string) => string
+): string {
+  if (attribution?.state === 'ready') return attribution.actor.display_name
+  if (attribution?.state === 'unknown') return t('Assignee unknown')
+  return t('Attribution unavailable')
+}
+
 // ============================================================================
 // Form Utilities
 // ============================================================================

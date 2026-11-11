@@ -60,6 +60,7 @@ export const apiKeySchema = z.object({
   managed: z.boolean().optional(),
   attribution: z
     .discriminatedUnion('state', [
+      z.object({ state: z.literal('unknown') }),
       z.object({ state: z.literal('unavailable') }),
       z.object({
         state: z.literal('ready'),

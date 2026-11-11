@@ -56,6 +56,7 @@ import { Dialog } from '@/components/dialog'
 import { StatusBadge, type StatusBadgeProps } from '@/components/status-badge'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import { formatKeyAssignee } from '@/features/keys/lib'
 import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-pricing-breakdown'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { BILLING_PRICING_VARS } from '@/features/pricing/lib/billing-expr'
@@ -701,22 +702,16 @@ export function DetailsDialog(props: DetailsDialogProps) {
               mono
             />
           )}
-          {props.log.attribution?.state === 'ready' && (
-            <>
-              <DetailRow
-                label={t('Member')}
-                value={props.log.attribution.actor.display_name}
-              />
-              <DetailRow
-                label={t('Workspace')}
-                value={props.log.attribution.workspace.label}
-              />
-            </>
-          )}
-          {props.log.attribution?.state === 'unavailable' && (
+          {props.log.attribution && (
             <DetailRow
               label={t('Member')}
-              value={t('Attribution unavailable')}
+              value={formatKeyAssignee(props.log.attribution, t)}
+            />
+          )}
+          {props.log.attribution?.state === 'ready' && (
+            <DetailRow
+              label={t('Workspace')}
+              value={props.log.attribution.workspace.label}
             />
           )}
 

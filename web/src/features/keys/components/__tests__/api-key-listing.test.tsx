@@ -773,3 +773,38 @@ it('administrators keep create and re-enable controls and external key attributi
   await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
   expect(screen.getByRole('menuitem', { name: 'Copy Key' })).toBeVisible()
 })
+
+it.each([
+  ['unknown', 'Assignee unknown', false],
+  ['unavailable', 'Attribution unavailable', false],
+  ['unknown', 'Assignee unknown', true],
+  ['unavailable', 'Attribution unavailable', true],
+] as const)(
+  'external key attribution %s shows %s and stays manageable on mobile=%s',
+  async (state, label, mobile) => {
+    if (mobile) {
+      const matchMedia = window.matchMedia
+      vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query.includes('max-width'),
+      }))
+    }
+    const attribution = apiKeySchema.shape.attribution.parse({
+      state,
+      actor: { display_name: 'Previous creator', username: 'old-creator' },
+      workspace: { kind: 'org', code: 'old-org', label: 'Previous workspace' },
+    })
+    expect(attribution).toEqual({ state })
+    await renderKeysPage(1, { name: 'Original device name', attribution })
+    expect(screen.getByText(label)).toBeVisible()
+    expect(screen.getByText('Original device name')).toBeVisible()
+    expect(screen.queryByText('Previous creator')).not.toBeInTheDocument()
+    expect(screen.queryByText('Previous workspace')).not.toBeInTheDocument()
+    expect(screen.queryByText('Managed automatically')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
+    expect(screen.getByRole('menuitem', { name: 'Copy Key' })).toBeEnabled()
+    expect(screen.getByRole('menuitem', { name: /^Delete$/ })).toBeEnabled()
+  }
+)

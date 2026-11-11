@@ -245,6 +245,18 @@ func TestManagedContextAttributionReadsOneExactPage(t *testing.T) {
 				"attribution": ManagedKeyAttribution{State: "ready", Actor: &ManagedKeyActor{DisplayName: "Current member", Username: "member"},
 					Workspace: &ManagedKeyWorkspace{Kind: "project", Code: "proj-climate", Label: "Climate study"}}})
 		}
+		if strings.HasPrefix(mode, "unknown") {
+			for _, item := range items {
+				item["managed_subject_ref"] = ""
+				item["attribution"] = ManagedKeyAttribution{State: "unknown"}
+			}
+			if mode == "unknown-creator" {
+				items[0]["attribution"] = ManagedKeyAttribution{State: "unknown", Actor: &ManagedKeyActor{DisplayName: "Creator", Username: "creator"}}
+			}
+			if mode == "unknown-subject" {
+				items[0]["managed_subject_ref"] = subject
+			}
+		}
 		if mode == "mismatch" {
 			items[0]["billing_context_ref"] = "55555555-5555-4555-8555-555555555555"
 		}
@@ -278,6 +290,29 @@ func TestManagedContextAttributionReadsOneExactPage(t *testing.T) {
 	require.Equal(t, "Current member", rows[references[0].ContextRef].Actor.DisplayName)
 	require.Equal(t, "Climate study", rows[references[1].ContextRef].Workspace.Label)
 	require.NotNil(t, rows[references[2].ContextRef], "two token0 contexts remain distinct")
+	mode = "unknown"
+	_, err = ReadManagedContextAttributions(c, references)
+	require.ErrorIs(t, err, ErrManagedAccountDenied, "unknown assignment cannot authorize a member")
+	ManagementAccount(c).ResourceScope = ManagedResourceGrant{Kind: "all"}
+	rows, err = ReadManagedContextAttributions(c, references)
+	require.NoError(t, err)
+	for _, row := range rows {
+		require.Equal(t, "unknown", row.State)
+		require.Nil(t, row.Actor, "a legacy creator is not an assignee")
+		require.Nil(t, row.Workspace)
+	}
+	for _, invalid := range []string{"unknown-creator", "unknown-subject"} {
+		mode = invalid
+		_, err = ReadManagedContextAttributions(c, references)
+		require.ErrorIs(t, err, ErrManagedAccountDenied)
+	}
+	mode = "unknown"
+	selected, _ := gin.CreateTestContext(httptest.NewRecorder())
+	selected.Request = httptest.NewRequest("GET", "/api/token/?subject_ref="+subject, nil)
+	selected.Set("managed_account", ManagementAccount(c))
+	_, err = ReadManagedContextAttributions(selected, references)
+	require.ErrorIs(t, err, ErrManagedAccountDenied, "a member selector cannot include an unknown assignment")
+	ManagementAccount(c).ResourceScope = ManagedResourceGrant{Kind: "subject", SubjectRef: subject}
 	for _, invalid := range []string{"mismatch", "wrong-token", "wrong-subject", "duplicate", "v1"} {
 		t.Run(invalid, func(t *testing.T) {
 			mode = invalid

@@ -21,6 +21,8 @@ import { render, screen, within } from '@testing-library/react'
 import i18next from 'i18next'
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest'
 
+import { apiKeySchema } from '@/features/keys/types'
+
 import type { UsageLog } from '../../data/schema'
 import type { LogOtherData } from '../../types'
 import { DetailsDialog } from '../dialogs/details-dialog'
@@ -278,3 +280,25 @@ describe('usage facts billing details', () => {
     expect(screen.getByText('Total Cost')).toBeInTheDocument()
   })
 })
+
+test.each([
+  ['unknown', 'Assignee unknown'],
+  ['unavailable', 'Attribution unavailable'],
+] as const)(
+  'log detail attribution %s shows its status without a previous creator or workspace',
+  (state, label) => {
+    const attribution = apiKeySchema.shape.attribution.parse({
+      state,
+      actor: { display_name: 'Previous creator', username: 'old-creator' },
+      workspace: { kind: 'org', code: 'old-org', label: 'Previous workspace' },
+    })
+    const queryClient = renderDetails({}, 0, attribution)
+    expect(rowValue('Member')).toBe(label)
+    expect(rowValue('Token')).toBe('token')
+    expect(screen.queryByText('Workspace')).not.toBeInTheDocument()
+    expect(
+      screen.queryByText(/Previous creator|Previous workspace/)
+    ).not.toBeInTheDocument()
+    queryClient.clear()
+  }
+)

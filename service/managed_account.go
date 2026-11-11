@@ -349,6 +349,10 @@ func ReadManagedContextAttributions(c *gin.Context, references []ManagedContextR
 				(value.Workspace.Kind != "org" && value.Workspace.Kind != "project") || value.Workspace.Code == "" || value.Workspace.Label == "" {
 				return nil, ErrManagedAccountDenied
 			}
+		} else if value.State == "unknown" {
+			if scope.Restricted || item.SubjectRef != "" || value.Actor != nil || value.Workspace != nil {
+				return nil, ErrManagedAccountDenied
+			}
 		} else if value.State != "unavailable" || value.Actor != nil || value.Workspace != nil {
 			return nil, invalid
 		}
