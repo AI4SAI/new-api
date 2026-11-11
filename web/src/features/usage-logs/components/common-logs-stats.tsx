@@ -53,7 +53,8 @@ export function CommonLogsStats() {
   const { t } = useTranslation()
   const { isAdminView: isAdmin } = useLogsViewScope()
   const searchParams = route.useSearch()
-  const { sensitiveVisible, workspaceKey, scopeKey } = useUsageLogsContext()
+  const { sensitiveVisible, workspaceKey, scopeKey, memberFilter } =
+    useUsageLogsContext()
 
   const {
     data: stats,
@@ -66,7 +67,10 @@ export function CommonLogsStats() {
       const params = buildApiParams({
         page: 1,
         pageSize: 1,
-        searchParams,
+        searchParams: {
+          ...searchParams,
+          subject_ref: memberFilter?.subject_ref,
+        },
         columnFilters: [],
         isAdmin,
       })
@@ -79,7 +83,8 @@ export function CommonLogsStats() {
         ? result.data || DEFAULT_LOG_STATS
         : DEFAULT_LOG_STATS
     },
-    placeholderData: (previousData) => previousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[1] === scopeKey ? previousData : undefined,
   })
 
   if (isLoading) {

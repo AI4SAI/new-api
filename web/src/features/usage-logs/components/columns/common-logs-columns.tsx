@@ -615,7 +615,7 @@ export function useCommonLogsColumns(
         if (!isDisplayableLogType(log.type)) return null
 
         const tokenName = logTokenName(log, t)
-        if (!tokenName) return null
+        if (!tokenName && !log.attribution) return null
 
         const other = parseLogOther(log.other)
         const displayName = sensitiveVisible ? tokenName : '••••'
@@ -625,25 +625,27 @@ export function useCommonLogsColumns(
 
         return (
           <div className='flex max-w-[200px] flex-col gap-0.5'>
-            <TooltipProvider delay={300}>
-              <Tooltip>
-                <TooltipTrigger render={<div className='max-w-full' />}>
-                  <StatusBadge
-                    label={displayName}
-                    icon={KeyRound}
-                    copyText={sensitiveVisible ? tokenName : undefined}
-                    size='sm'
-                    showDot={false}
-                    className='border-border/60 bg-muted/30 text-foreground h-6 max-w-full gap-1.5 overflow-hidden rounded-md border px-2 py-0.5 [font-family:var(--font-body)]'
-                  />
-                </TooltipTrigger>
-                {sensitiveVisible && tokenName.length > 16 && (
-                  <TooltipContent side='top' className='max-w-xs break-all'>
-                    {tokenName}
-                  </TooltipContent>
-                )}
-              </Tooltip>
-            </TooltipProvider>
+            {tokenName && (
+              <TooltipProvider delay={300}>
+                <Tooltip>
+                  <TooltipTrigger render={<div className='max-w-full' />}>
+                    <StatusBadge
+                      label={displayName}
+                      icon={KeyRound}
+                      copyText={sensitiveVisible ? tokenName : undefined}
+                      size='sm'
+                      showDot={false}
+                      className='border-border/60 bg-muted/30 text-foreground h-6 max-w-full gap-1.5 overflow-hidden rounded-md border px-2 py-0.5 [font-family:var(--font-body)]'
+                    />
+                  </TooltipTrigger>
+                  {sensitiveVisible && tokenName.length > 16 && (
+                    <TooltipContent side='top' className='max-w-xs break-all'>
+                      {tokenName}
+                    </TooltipContent>
+                  )}
+                </Tooltip>
+              </TooltipProvider>
+            )}
             {log.attribution && (
               <div className='text-muted-foreground text-xs break-words'>
                 {log.attribution.state === 'ready' ? (

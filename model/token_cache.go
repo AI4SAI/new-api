@@ -147,12 +147,13 @@ if redis.call('EXISTS', KEYS[1]) == 1
 end
 if redis.call('EXISTS', KEYS[1]) == 1 then
   redis.call('HSETNX', KEYS[1], 'QuotaRevision', ARGV[21])
-  if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') ~= 4 or cached < metadata then
+  if tonumber(redis.call('HGET', KEYS[1], 'CacheSchemaVersion') or '0') ~= 5 or cached < metadata then
     redis.call('HSET', KEYS[1], 'Status', ARGV[3], 'Name', ARGV[4], 'ExpiredTime', ARGV[7],
       'UnlimitedQuota', ARGV[8], 'ModelLimitsEnabled', ARGV[9], 'ModelLimits', ARGV[10],
       'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13], 'AutoGroups', ARGV[14],
       'AllowUserQuotaQuery', ARGV[17], 'ManagedBindingRef', ARGV[19], 'ManagementCreatorID', ARGV[20],
-      'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24], 'CacheSchemaVersion', 4)
+      'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24],
+      'ManagedSubjectRef', ARGV[25], 'CacheSchemaVersion', 5)
   end
   redis.call('EXPIRE', KEYS[1], ARGV[18])
   return 2
@@ -164,7 +165,8 @@ redis.call('HSET', KEYS[1],
   'AllowIps', ARGV[11], 'Group', ARGV[12], 'CrossGroupRetry', ARGV[13],
   'AutoGroups', ARGV[14], 'RemainQuota', ARGV[15], 'UsedQuota', ARGV[16],
   'AllowUserQuotaQuery', ARGV[17], 'ManagedBindingRef', ARGV[19], 'ManagementCreatorID', ARGV[20], 'QuotaRevision', ARGV[21],
-  'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24], 'CacheSchemaVersion', 4)
+  'BillingContextRef', ARGV[22], 'BillingContextConfirmed', ARGV[23], 'MetadataRevision', ARGV[24],
+  'ManagedSubjectRef', ARGV[25], 'CacheSchemaVersion', 5)
 redis.call('EXPIRE', KEYS[1], ARGV[18])
 return 1`
 
@@ -181,6 +183,7 @@ return 1`
 		token.ManagedBindingRef, token.ManagementCreatorID, token.QuotaRevision,
 		billingRef, strconv.FormatBool(token.BillingContextConfirmed),
 		max(token.MetadataRevision, 1),
+		token.ManagedSubjectRef,
 	).Int()
 	if result == -1 && err == nil {
 		return result, ErrTokenQuotaUpdateUnknown
@@ -200,7 +203,7 @@ func cacheGetTokenByKey(key string) (*Token, error) {
 	if err := common.RedisHGetObj(getTokenCacheKey(key), &token); err != nil {
 		return nil, err
 	}
-	if token.Id <= 0 || token.CacheSchemaVersion != 4 || token.MetadataRevision <= 0 {
+	if token.Id <= 0 || token.CacheSchemaVersion != 5 || token.MetadataRevision <= 0 {
 		return nil, fmt.Errorf("token cache is incomplete")
 	}
 	floor, err := tokenMetadataFloor(key)

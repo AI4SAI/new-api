@@ -42,7 +42,9 @@ import { useApiKeys } from './api-keys-provider'
 
 export function ApiKeyNameCell({ apiKey }: { apiKey: ApiKey }) {
   const { t } = useTranslation()
-  if (!apiKey.managed) return <span className='font-medium'>{apiKey.name}</span>
+  if (!apiKey.managed && !apiKey.attribution) {
+    return <span className='font-medium'>{apiKey.name}</span>
+  }
   const attribution = apiKey.attribution
   return (
     <div className='min-w-0 space-y-1 break-words'>
@@ -69,6 +71,7 @@ export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
     loadingKeys,
     copiedKeyId,
     markKeyCopied,
+    canPerform,
   } = useApiKeys()
   const [popoverOpen, setPopoverOpen] = useState(false)
 
@@ -113,6 +116,10 @@ export function ApiKeyCell({ apiKey }: { apiKey: ApiKey }) {
         copyable={false}
       />
     )
+  }
+
+  if (!canPerform('model.keys.reveal')) {
+    return <span className='font-mono text-xs'>{maskedKey}</span>
   }
 
   return (

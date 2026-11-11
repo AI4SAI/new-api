@@ -30,6 +30,7 @@ import type { ManagedAccountContext } from '../types'
 
 export function ManagedAccountBoundary(props: {
   workspaceKey?: string
+  action?: string
   children: (
     account: ManagedAccountContext | undefined,
     scopeKey: string
@@ -38,13 +39,13 @@ export function ManagedAccountBoundary(props: {
   const { t } = useTranslation()
   const session = useAuthStore((state) => state.auth.session)
   const user = useAuthStore((state) => state.auth.user)
-  const scopeKey = JSON.stringify([
+  const identityKey = JSON.stringify([
     session?.sid,
     user?.id,
     props.workspaceKey ?? '',
   ])
   const context = useQuery({
-    queryKey: ['model-account-context', scopeKey],
+    queryKey: ['model-account-context', identityKey],
     queryFn: ({ signal }) => {
       if (!props.workspaceKey) {
         throw new Error('Model account context is missing')
@@ -74,6 +75,25 @@ export function ManagedAccountBoundary(props: {
       />
     )
   }
+  if (
+    props.workspaceKey &&
+    !context.data?.allowed_actions.includes(props.action ?? 'model.keys.read')
+  ) {
+    return (
+      <ErrorState
+        title={t('Access denied')}
+        onRetry={() => void context.refetch()}
+      />
+    )
+  }
+  const scopeKey = JSON.stringify([
+    identityKey,
+    context.data?.native_owner_id,
+    context.data?.resource_scope,
+    context.data?.allowed_actions,
+    context.data?.allowed_update_fields,
+    context.data?.allowed_statuses,
+  ])
   return (
     <Fragment key={scopeKey}>{props.children(context.data, scopeKey)}</Fragment>
   )

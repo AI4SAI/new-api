@@ -22,21 +22,31 @@ import { useApiKeys } from './api-keys-provider'
 import { CCSwitchDialog } from './dialogs/cc-switch-dialog'
 
 export function ApiKeysDialogs() {
-  const { open, setOpen, currentRow, resolvedKey, workspaceKey, scopeKey } =
-    useApiKeys()
+  const {
+    open,
+    setOpen,
+    currentRow,
+    resolvedKey,
+    workspaceKey,
+    scopeKey,
+    canPerform,
+  } = useApiKeys()
 
   return (
     <>
       <ApiKeysMutateDrawer
-        open={open === 'create' || open === 'update'}
+        open={
+          (open === 'create' && canPerform('model.keys.create')) ||
+          (open === 'update' && canPerform('model.keys.update'))
+        }
         onOpenChange={(isOpen) => !isOpen && setOpen(null)}
         currentRow={open === 'update' ? currentRow || undefined : undefined}
       />
-      <ApiKeysDeleteDialog />
+      {canPerform('model.keys.delete') && <ApiKeysDeleteDialog />}
       <CCSwitchDialog
         workspaceKey={workspaceKey}
         scopeKey={scopeKey}
-        open={open === 'cc-switch'}
+        open={open === 'cc-switch' && canPerform('model.keys.reveal')}
         onOpenChange={(isOpen) => !isOpen && setOpen(null)}
         tokenKey={resolvedKey}
       />

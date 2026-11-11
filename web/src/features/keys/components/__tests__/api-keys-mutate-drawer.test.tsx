@@ -23,9 +23,10 @@ import {
   screen,
   waitFor,
 } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, test } from 'vitest'
 
-import type { ApiKey } from '../../types'
+import type { ApiKey, ManagedAccountContext } from '../../types'
 
 const { createInstance } = await import('i18next')
 const { I18nextProvider, initReactI18next } = await import('react-i18next')
@@ -50,6 +51,7 @@ type ApiMethod = (
 type MockableApi = {
   get: ApiMethod
   post: ApiMethod
+  put: ApiMethod
 }
 type RenderedDrawer = {
   queryClient: InstanceType<typeof QueryClient>
@@ -59,6 +61,7 @@ type RenderedDrawer = {
 const apiClient = api as unknown as MockableApi
 const originalGet = apiClient.get
 const originalPost = apiClient.post
+const originalPut = apiClient.put
 let renderedDrawer: RenderedDrawer | null = null
 
 function installApiFixtures(createdPayloads: Array<Record<string, unknown>>) {
@@ -146,12 +149,16 @@ async function renderCreateDrawer(recovery = false): Promise<void> {
 
 function drawerContent(
   queryClient: InstanceType<typeof QueryClient>,
-  row?: ApiKey
+  row?: ApiKey,
+  account?: ManagedAccountContext
 ) {
   return (
     <QueryClientProvider client={queryClient}>
       <I18nextProvider i18n={i18n}>
-        <ApiKeysProvider>
+        <ApiKeysProvider
+          workspaceKey={account?.workspace_key}
+          account={account}
+        >
           <ApiKeysMutateDrawer
             open
             onOpenChange={() => undefined}
@@ -220,6 +227,7 @@ function selectComboboxOption(
 afterEach(() => {
   apiClient.get = originalGet
   apiClient.post = originalPost
+  apiClient.put = originalPut
   localStorage.clear()
   sessionStorage.clear()
   if (renderedDrawer) {
@@ -435,4 +443,133 @@ describe('API keys mutate drawer user quota query switch', () => {
     await waitFor(() => expect(createdPayloads).toHaveLength(1))
     expect(createdPayloads[0]?.allow_user_quota_query).toBe(false)
   })
+})
+
+const memberAccount: ManagedAccountContext = {
+  workspace_key: 'org:11111111-1111-4111-8111-111111111111',
+  native_owner_id: 20,
+  account_label: 'Team',
+  account_kind: 'org',
+  resource_scope: {
+    kind: 'subject',
+    subject_ref: '22222222-2222-4222-8222-222222222222',
+  },
+  allowed_actions: ['model.keys.read', 'model.keys.update'],
+  allowed_update_fields: ['name'],
+  allowed_statuses: [2],
+}
+
+const assignedMember = {
+  subject_ref: '33333333-3333-4333-8333-333333333333',
+  display_name: 'Alice',
+  username: 'alice',
+}
+
+test('member rename reads and submits only the editable name and retains a failed edit for retry', async () => {
+  const row = apiKeySchema.parse({
+    id: 7,
+    name: 'Original',
+    key: '',
+    status: 1,
+    remain_quota: 100,
+    used_quota: 0,
+    unlimited_quota: false,
+    expired_time: -1,
+    created_time: 1,
+    accessed_time: 1,
+    model_limits_enabled: false,
+    group: 'auto',
+    auto_groups: ['unavailable-group'],
+  })
+  const gets: string[] = []
+  apiClient.get = async (url) => {
+    gets.push(url)
+    if (url === '/api/status') return { data: { success: true, data: {} } }
+    if (url === '/api/token/7') return { data: { success: true, data: row } }
+    throw new Error(`Member must not need ${url} to rename a key`)
+  }
+  const updates: unknown[] = []
+  apiClient.put = async (_url, payload) => {
+    updates.push(payload)
+    return { data: { success: false, message: 'Access denied' } }
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  renderedDrawer = {
+    queryClient,
+    view: render(drawerContent(queryClient, row, memberAccount)),
+  }
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  )
+  expect(screen.queryByLabelText('Group')).not.toBeInTheDocument()
+  expect(screen.queryByText('Quota Settings')).not.toBeInTheDocument()
+  expect(screen.queryByText('Advanced Settings')).not.toBeInTheDocument()
+  expect(screen.queryByText('Expiration Time')).not.toBeInTheDocument()
+  fireEvent.change(screen.getByLabelText('Name'), {
+    target: { value: 'Renamed' },
+  })
+  fireEvent.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(updates).toEqual([{ id: 7, name: 'Renamed' }]))
+  expect(screen.getByLabelText('Name')).toHaveValue('Renamed')
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  )
+  expect(
+    gets.every((url) => ['/api/status', '/api/token/7'].includes(url))
+  ).toBe(true)
+})
+
+test('organization creation requires a chosen member and sends the selected subject with the original key form', async () => {
+  const user = userEvent.setup()
+  const created: Array<Record<string, unknown>> = []
+  installApiFixtures(created)
+  const getFixture = apiClient.get
+  apiClient.get = async (url, ...args) =>
+    url.startsWith('/api/token/member-candidates?')
+      ? {
+          data: {
+            success: true,
+            data: { items: [assignedMember], next_cursor: '' },
+          },
+        }
+      : getFixture(url, ...args)
+  const account: ManagedAccountContext = {
+    ...memberAccount,
+    resource_scope: { kind: 'all', subject_ref: '' },
+    allowed_actions: ['model.keys.create', 'model.members.read'],
+  }
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  renderedDrawer = {
+    queryClient,
+    view: render(drawerContent(queryClient, undefined, account)),
+  }
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled()
+  )
+  await user.type(screen.getByLabelText('Name'), 'Assigned key')
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  expect(created).toHaveLength(0)
+  expect(screen.getByRole('combobox', { name: 'Member' })).toHaveAttribute(
+    'aria-invalid',
+    'true'
+  )
+  await user.click(screen.getByRole('combobox', { name: 'Member' }))
+  await user.keyboard('{ArrowDown}')
+  await user.click(await screen.findByRole('option', { name: /Alice/ }))
+  expect(screen.getByRole('combobox', { name: 'Member' })).toHaveValue('Alice')
+  expect(
+    screen.queryByDisplayValue(assignedMember.subject_ref)
+  ).not.toBeInTheDocument()
+  await user.click(screen.getByRole('button', { name: 'Save changes' }))
+  await waitFor(() => expect(created).toHaveLength(1))
+  expect(created[0]).toMatchObject({
+    name: 'Assigned key',
+    assignee_ref: assignedMember.subject_ref,
+    allow_user_quota_query: false,
+  })
+  expect(created[0]).not.toHaveProperty('assignee')
 })

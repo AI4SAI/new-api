@@ -1,5 +1,8 @@
 {
   "translation": {
+    "All members": "すべてのメンバー",
+    "Select a member": "メンバーを選択",
+    "Load more": "さらに読み込む",
     "Member": "メンバー",
     "Workspace": "ワークスペース",
     "Attribution unavailable": "帰属情報を取得できません",

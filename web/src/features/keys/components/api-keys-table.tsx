@@ -52,7 +52,7 @@ import {
   API_KEY_STATUSES,
   ERROR_MESSAGES,
 } from '../constants'
-import type { ApiKey } from '../types'
+import type { ApiKey, MemberCandidate } from '../types'
 import { ApiKeyQuotaCell } from './api-key-quota-cell'
 import { ApiKeyActivityCell } from './api-key-timestamp-cell'
 import {
@@ -65,6 +65,7 @@ import { useApiKeysColumns } from './api-keys-columns'
 import { useApiKeys } from './api-keys-provider'
 import { DataTableBulkActions } from './data-table-bulk-actions'
 import { DataTableRowActions } from './data-table-row-actions'
+import { MemberCandidateSelect } from './member-candidate-select'
 
 const route = getRouteApi('/_authenticated/keys/')
 const API_KEYS_COLUMN_VISIBILITY_STORAGE_KEY = 'api-keys:column-visibility'
@@ -219,7 +220,9 @@ function ApiKeysMobileList({
 
 export function ApiKeysTable() {
   const { t } = useTranslation()
-  const { workspaceKey, scopeKey } = useApiKeys()
+  const { workspaceKey, scopeKey, canPerform } = useApiKeys()
+  const [memberFilter, setMemberFilter] = useState<MemberCandidate | null>(null)
+  const subjectRef = memberFilter?.subject_ref
   const [now, setNow] = useState(() => Date.now())
   const columns = useApiKeysColumns(now, workspaceKey, scopeKey)
 
@@ -271,6 +274,7 @@ export function ApiKeysTable() {
       pagination.pageSize,
       globalFilter,
       tokenFilter,
+      subjectRef,
     ],
     queryFn: async ({ signal }) => {
       const result = shouldSearch
@@ -278,6 +282,7 @@ export function ApiKeysTable() {
             {
               keyword: globalFilter,
               token: tokenFilter,
+              subject_ref: subjectRef,
               p: pagination.pageIndex + 1,
               size: pagination.pageSize,
             },
@@ -286,6 +291,7 @@ export function ApiKeysTable() {
           )
         : await getApiKeys(
             {
+              subject_ref: subjectRef,
               p: pagination.pageIndex + 1,
               size: pagination.pageSize,
             },
@@ -309,7 +315,8 @@ export function ApiKeysTable() {
         total: result.data?.total || 0,
       }
     },
-    placeholderData: (previousData) => previousData,
+    placeholderData: (previousData, previousQuery) =>
+      previousQuery?.queryKey[6] === subjectRef ? previousData : undefined,
   })
 
   const apiKeys = data?.items || []
@@ -317,7 +324,9 @@ export function ApiKeysTable() {
   const { table } = useDataTable({
     data: apiKeys,
     columns,
-    enableRowSelection: (row) => !row.original.managed,
+    enableRowSelection: (row) =>
+      !row.original.managed &&
+      (canPerform('model.keys.reveal') || canPerform('model.keys.delete')),
     columnFilters,
     columnVisibilityStorageKey: API_KEYS_COLUMN_VISIBILITY_STORAGE_KEY,
     globalFilter,
@@ -357,22 +366,43 @@ export function ApiKeysTable() {
       isLoading={isLoading}
       isFetching={isFetching}
       emptyTitle={t('No API Keys Found')}
-      emptyDescription={t(
-        'No API keys available. Create your first API key to get started.'
-      )}
+      emptyDescription={
+        canPerform('model.keys.create')
+          ? t(
+              'No API keys available. Create your first API key to get started.'
+            )
+          : undefined
+      }
       skeletonKeyPrefix='api-keys-skeleton'
       applyHeaderSize
       toolbarProps={{
         searchPlaceholder: t('Filter by name...'),
         searchDebounceMs: 500,
         additionalSearch: (
-          <Input
-            placeholder={t('Filter by API key...')}
-            aria-label={t('Filter by API key...')}
-            value={tokenFilterInput}
-            onChange={(e) => setTokenFilterInput(e.target.value)}
-            className='w-full sm:w-50 lg:w-60'
-          />
+          <>
+            <Input
+              placeholder={t('Filter by API key...')}
+              aria-label={t('Filter by API key...')}
+              value={tokenFilterInput}
+              onChange={(e) => setTokenFilterInput(e.target.value)}
+              className='w-full sm:w-50 lg:w-60'
+            />
+            {workspaceKey && canPerform('model.members.read') && (
+              <div className='w-full sm:w-50 lg:w-60'>
+                <MemberCandidateSelect
+                  workspaceKey={workspaceKey}
+                  scopeKey={scopeKey}
+                  value={memberFilter}
+                  allowClear
+                  onChange={(member) => {
+                    setMemberFilter(member)
+                    table.resetRowSelection()
+                    onPaginationChange({ ...pagination, pageIndex: 0 })
+                  }}
+                />
+              </div>
+            )}
+          </>
         ),
         filters: [
           {

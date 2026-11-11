@@ -92,7 +92,7 @@ interface UsageLogsTableProps {
 
 export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
   const { t } = useTranslation()
-  const { workspaceKey, scopeKey } = useUsageLogsContext()
+  const { workspaceKey, scopeKey, memberFilter } = useUsageLogsContext()
   const getColumnClassName = useCallback(
     () => (logCategory === 'common' ? 'py-2' : 'py-3.5'),
     [logCategory]
@@ -198,7 +198,10 @@ export function UsageLogsTable({ logCategory }: UsageLogsTableProps) {
         isAdmin,
         page: pagination.pageIndex + 1,
         pageSize: pagination.pageSize,
-        searchParams,
+        searchParams: {
+          ...searchParams,
+          subject_ref: memberFilter?.subject_ref,
+        },
         columnFilters,
       })
 

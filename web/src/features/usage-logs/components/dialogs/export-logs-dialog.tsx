@@ -18,7 +18,7 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { getRouteApi } from '@tanstack/react-router'
 import { Loader2 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 
@@ -37,7 +37,7 @@ import {
 } from '../../lib/export'
 import { buildApiParams, getDefaultTimeRange } from '../../lib/utils'
 import { CompactDateTimeRangePicker } from '../compact-date-time-range-picker'
-import { useLogsViewScope } from '../usage-logs-provider'
+import { useLogsViewScope, useUsageLogsContext } from '../usage-logs-provider'
 
 const route = getRouteApi('/_authenticated/usage-logs/$section')
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -52,11 +52,19 @@ export function ExportLogsDialog() {
   const { t } = useTranslation()
   const searchParams = route.useSearch()
   const { canManageScope, isAdminView } = useLogsViewScope()
+  const { memberFilter, scopeKey } = useUsageLogsContext()
   const { status } = useStatus()
   const [open, setOpen] = useState(false)
   const [range, setRange] = useState<{ start?: Date; end?: Date }>({})
   const [exportedCount, setExportedCount] = useState<number | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+
+  useEffect(
+    () => () => {
+      abortRef.current?.abort()
+    },
+    [scopeKey]
+  )
 
   if (!canManageScope && status?.log_export_enabled === false) return null
 
@@ -106,7 +114,10 @@ export function ExportLogsDialog() {
           ...buildApiParams({
             page: 1,
             pageSize: 1,
-            searchParams,
+            searchParams: {
+              ...searchParams,
+              subject_ref: memberFilter?.subject_ref,
+            },
             isAdmin: isAdminView,
           }),
           p: undefined,
@@ -124,6 +135,7 @@ export function ExportLogsDialog() {
           },
         }
       )
+      if (controller.signal.aborted) return
       downloadCsv(
         `usage-logs-${dayjs(range.start).format('YYYYMMDD')}-${dayjs(range.end).format('YYYYMMDD')}.csv`,
         lines
@@ -131,7 +143,9 @@ export function ExportLogsDialog() {
       toast.success(t('Exported {{count}} logs', { count }))
       setOpen(false)
     } catch (error) {
-      handleServerError(error, t('Failed to export logs'))
+      if (!controller.signal.aborted) {
+        handleServerError(error, t('Failed to export logs'))
+      }
     } finally {
       abortRef.current = null
       setExportedCount(null)

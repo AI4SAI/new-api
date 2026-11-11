@@ -18,12 +18,36 @@ For commercial licensing, please contact support@quantumnous.com
 */
 import { z } from 'zod'
 
-export interface ManagedAccountContext {
-  workspace_key: string
-  native_owner_id: number
-  account_label: string
-  account_kind: 'org' | 'project'
-}
+export const managedAccountContextSchema = z.object({
+  workspace_key: z.string(),
+  native_owner_id: z.number().int().positive().safe(),
+  account_label: z.string().min(1),
+  account_kind: z.enum(['org', 'project']),
+  resource_scope: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('all'), subject_ref: z.literal('') }),
+    z.object({ kind: z.literal('subject'), subject_ref: z.uuid() }),
+  ]),
+  allowed_actions: z.array(z.string()),
+  allowed_update_fields: z.array(z.string()),
+  allowed_statuses: z.array(z.number().int()),
+})
+
+export type ManagedAccountContext = z.infer<typeof managedAccountContextSchema>
+
+export const memberCandidatesSchema = z.object({
+  items: z.array(
+    z.object({
+      subject_ref: z.uuid(),
+      display_name: z.string(),
+      username: z.string(),
+    })
+  ),
+  next_cursor: z.string(),
+})
+
+export type MemberCandidate = z.infer<
+  typeof memberCandidatesSchema
+>['items'][number]
 
 // ============================================================================
 // API Key Schema & Types
@@ -85,6 +109,7 @@ export interface ApiResponse<T = unknown> {
 }
 
 export interface GetApiKeysParams {
+  subject_ref?: string
   p?: number
   size?: number
 }
@@ -101,6 +126,7 @@ export interface GetApiKeysResponse {
 }
 
 export interface SearchApiKeysParams {
+  subject_ref?: string
   keyword?: string
   token?: string
   p?: number
@@ -109,6 +135,7 @@ export interface SearchApiKeysParams {
 
 export interface ApiKeyFormData {
   name: string
+  assignee_ref?: string
   remain_quota?: number
   quota_delta?: number
   expected_quota_revision?: number

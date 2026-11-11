@@ -291,6 +291,7 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.GET("/", middleware.ManagedAccountAuthorization("model.keys.read"), controller.GetAllTokens)
 			tokenRoute.GET("/search", middleware.SearchRateLimit(), middleware.ManagedAccountAuthorization("model.keys.read"), controller.SearchTokens)
 			tokenRoute.GET("/context", middleware.ManagedAccountAuthorization("model.keys.read"), controller.GetManagedAccountContext)
+			tokenRoute.GET("/member-candidates", middleware.ManagedAccountAuthorization("model.members.read"), controller.GetManagedMemberCandidates)
 			tokenRoute.GET("/auto-groups", middleware.ManagedAccountAuthorization("model.keys.read"), controller.GetTokenAutoGroups)
 			tokenRoute.GET("/:id", middleware.ManagedAccountAuthorization("model.keys.read"), controller.GetToken)
 			tokenRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.ManagedAccountAuthorization("model.keys.reveal"), controller.GetTokenKey)

@@ -22,7 +22,11 @@ import { z } from 'zod'
 import { parseQuotaFromDollars } from '@/lib/format'
 
 import { DEFAULT_GROUP } from '../constants'
-import type { ApiKey, ApiKeyFormData } from '../types'
+import {
+  memberCandidatesSchema,
+  type ApiKey,
+  type ApiKeyFormData,
+} from '../types'
 
 // ============================================================================
 // Form Schema
@@ -31,7 +35,8 @@ import type { ApiKey, ApiKeyFormData } from '../types'
 export function getApiKeyFormSchema(
   t: TFunction,
   maxAutoGroups = 5,
-  updating = false
+  updating = false,
+  allowedFields?: string[]
 ) {
   const autoGroupLimit =
     Number.isInteger(maxAutoGroups) && maxAutoGroups > 0 ? maxAutoGroups : 5
@@ -39,6 +44,7 @@ export function getApiKeyFormSchema(
   return z
     .object({
       name: z.string().min(1, t('Please enter a name')),
+      assignee: memberCandidatesSchema.shape.items.element.optional(),
       remain_quota_dollars: z.number().optional(),
       expired_time: z.date().optional(),
       unlimited_quota: z.boolean(),
@@ -52,7 +58,10 @@ export function getApiKeyFormSchema(
       tokenCount: z.number().min(1).optional(),
     })
     .superRefine((data, ctx) => {
-      if (data.group === 'auto') {
+      if (
+        data.group === 'auto' &&
+        (!allowedFields || allowedFields.includes('auto_groups'))
+      ) {
         if (
           data.auto_groups_mode === 'custom' &&
           data.auto_groups.length === 0
@@ -85,7 +94,10 @@ export function getApiKeyFormSchema(
         }
       }
 
-      if (data.unlimited_quota) {
+      if (
+        data.unlimited_quota ||
+        (allowedFields && !allowedFields.includes('quota_delta'))
+      ) {
         return
       }
 
@@ -155,6 +167,9 @@ export function transformFormDataToPayload(
   }
   return {
     name: data.name,
+    ...(data.assignee && !updating
+      ? { assignee_ref: data.assignee.subject_ref }
+      : {}),
     ...quotaFields,
     expired_time: data.expired_time
       ? Math.floor(data.expired_time.getTime() / 1000)

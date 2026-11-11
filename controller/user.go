@@ -620,7 +620,7 @@ func generateDefaultSidebarConfig(userRole int) string {
 func GetUserModels(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		id = service.ManagementOwnerID(c)
+		id = service.ManagementResourceScope(c).OwnerID
 	}
 	user, err := model.GetUserCache(id)
 	if err != nil {

@@ -38,7 +38,7 @@ func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string
 
 func GetPricing(c *gin.Context) {
 	pricing := model.GetPricing()
-	userId := service.ManagementOwnerID(c)
+	userId := service.ManagementResourceScope(c).OwnerID
 	usableGroup := map[string]string{}
 	groupRatio := map[string]float64{}
 	maps.Copy(groupRatio, ratio_setting.GetGroupRatioCopy())

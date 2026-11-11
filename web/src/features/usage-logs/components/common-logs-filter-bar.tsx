@@ -40,6 +40,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { modelAccountRequest } from '@/features/keys/api'
+import { MemberCandidateSelect } from '@/features/keys/components/member-candidate-select'
 import { getGroups } from '@/features/users/api'
 import { useMediaQuery } from '@/hooks'
 import { getUserGroups } from '@/lib/api'
@@ -126,8 +127,15 @@ export function CommonLogsFilterBar<TData>(
   const queryClient = useQueryClient()
   const searchParams = route.useSearch()
   const { isAdminView: isAdmin } = useLogsViewScope()
-  const { sensitiveVisible, setSensitiveVisible, workspaceKey, scopeKey } =
-    useUsageLogsContext()
+  const {
+    sensitiveVisible,
+    setSensitiveVisible,
+    workspaceKey,
+    scopeKey,
+    account,
+    memberFilter,
+    setMemberFilter,
+  } = useUsageLogsContext()
   const fetchingLogs = useIsFetching({ queryKey: ['logs'] })
   const { data: adminGroups } = useQuery({
     queryKey: ['groups'],
@@ -248,6 +256,7 @@ export function CommonLogsFilterBar<TData>(
   )
 
   const handleReset = useCallback(() => {
+    setMemberFilter(null)
     const { start, end } = getDefaultTimeRange()
     const resetFilters: CommonLogFilters = { startTime: start, endTime: end }
     const resetSearch = {
@@ -272,7 +281,7 @@ export function CommonLogsFilterBar<TData>(
     })
     queryClient.invalidateQueries({ queryKey: ['logs'] })
     queryClient.invalidateQueries({ queryKey: ['usage-logs-stats'] })
-  }, [navigate, queryClient, workspaceKey])
+  }, [navigate, queryClient, workspaceKey, setMemberFilter])
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -290,7 +299,11 @@ export function CommonLogsFilterBar<TData>(
 
   const hasTypeFilter = logType !== LOG_TYPE_ALL_VALUE
   const hasAdditionalFilters =
-    !!filters.model || !!filters.group || hasTypeFilter || hasExpandedFilters
+    !!memberFilter ||
+    !!filters.model ||
+    !!filters.group ||
+    hasTypeFilter ||
+    hasExpandedFilters
 
   const expandedFilterCount = [
     filters.token,
@@ -452,6 +465,26 @@ export function CommonLogsFilterBar<TData>(
       </Select>
     </LogsFilterField>
   )
+  const memberFilterControl =
+    workspaceKey && account?.allowed_actions.includes('model.members.read') ? (
+      <LogsFilterField>
+        <MemberCandidateSelect
+          workspaceKey={workspaceKey}
+          scopeKey={scopeKey}
+          value={memberFilter}
+          allowClear
+          onChange={(member) => {
+            setMemberFilter(member)
+            void navigate({
+              to: '/usage-logs/$section',
+              params: { section: 'common' },
+              search: { ...searchParams, page: 1 },
+            })
+          }}
+        />
+      </LogsFilterField>
+    ) : null
+
   const advancedFilters = (
     <>
       <LogsFilterField>
@@ -514,6 +547,7 @@ export function CommonLogsFilterBar<TData>(
         <>
           {dateRangeFilter}
           {modelFilter}
+          {memberFilterControl}
           {groupFilter}
           {typeFilter}
         </>
@@ -523,14 +557,16 @@ export function CommonLogsFilterBar<TData>(
       mobileFilters={
         <>
           {modelFilter}
+          {memberFilterControl}
           {groupFilter}
           {typeFilter}
           {advancedFilters}
         </>
       }
       mobileFilterCount={
-        [filters.model, filters.group, hasTypeFilter].filter(Boolean).length +
-        expandedFilterCount
+        [filters.model, filters.group, hasTypeFilter, memberFilter].filter(
+          Boolean
+        ).length + expandedFilterCount
       }
       hasAdvancedActiveFilters={hasExpandedFilters}
       advancedFilterCount={expandedFilterCount}

@@ -25,6 +25,7 @@ import {
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 
 import { getPricing } from '@/features/pricing/api'
+import { getUserLogs, getUserLogStats } from '@/features/usage-logs/api'
 import { buildApiParams } from '@/features/usage-logs/lib/utils'
 import {
   modelWorkspaceSearch,
@@ -33,6 +34,7 @@ import {
 
 import {
   getApiKeys,
+  searchApiKeys,
   getManagedAccountContext,
   updateApiKeyStatus,
   fetchTokenKey,
@@ -108,6 +110,27 @@ describe('managed model account requests', () => {
       'Invalid model account context'
     )
   })
+
+  test.each([{}, { resource_scope: { kind: 'subject', subject_ref: '' } }])(
+    'a context without valid v2 scope and actions is rejected',
+    async (fields) => {
+      http.get.mockResolvedValue({
+        data: {
+          success: true,
+          data: {
+            workspace_key: 'org:requested',
+            native_owner_id: 2,
+            account_label: 'Team',
+            account_kind: 'org',
+            ...fields,
+          },
+        },
+      })
+      await expect(getManagedAccountContext('org:requested')).rejects.toThrow(
+        'Invalid model account context'
+      )
+    }
+  )
 
   test('denied or unavailable management never retries as personal', async () => {
     for (const status of [401, 403, 503]) {
@@ -203,4 +226,25 @@ test('pricing carries the same explicit organization context as key management',
     true,
     false,
   ])
+})
+
+test('member selectors narrow key search and the shared log and statistics query without changing the account', async () => {
+  const workspace = 'org:11111111-1111-4111-8111-111111111111'
+  const subject = '22222222-2222-4222-8222-222222222222'
+  await getApiKeys({ subject_ref: subject }, workspace)
+  await searchApiKeys({ keyword: 'Research', subject_ref: subject }, workspace)
+  const params = buildApiParams({
+    page: 1,
+    pageSize: 20,
+    isAdmin: false,
+    searchParams: { subject_ref: subject },
+  })
+  await getUserLogs(params, workspace)
+  await getUserLogStats(params, workspace)
+  for (const [url, config] of http.get.mock.calls) {
+    expect(
+      new URL(url, 'https://example.test').searchParams.get('subject_ref')
+    ).toBe(subject)
+    expect(config.headers).toEqual({ 'X-SAI-Workspace-Key': workspace })
+  }
 })

@@ -39,6 +39,7 @@ export function ApiKeys() {
           key={scopeKey}
           workspaceKey={workspaceKey}
           scopeKey={scopeKey}
+          account={account}
         >
           <SectionPageLayout
             fixedContent
@@ -50,20 +51,21 @@ export function ApiKeys() {
                 : t('API Keys')}
             </SectionPageLayout.Title>
             <SectionPageLayout.Actions>
-              {workspaceKey && (
-                <Button
-                  variant='outline'
-                  render={
-                    <Link
-                      to='/usage-logs/$section'
-                      params={{ section: 'common' }}
-                      search={{ workspace_key: workspaceKey }}
-                    />
-                  }
-                >
-                  {t('Usage')}
-                </Button>
-              )}
+              {workspaceKey &&
+                account?.allowed_actions.includes('model.usage.read') && (
+                  <Button
+                    variant='outline'
+                    render={
+                      <Link
+                        to='/usage-logs/$section'
+                        params={{ section: 'common' }}
+                        search={{ workspace_key: workspaceKey }}
+                      />
+                    }
+                  >
+                    {t('Usage')}
+                  </Button>
+                )}
               <ApiKeysPrimaryButtons />
             </SectionPageLayout.Actions>
             <SectionPageLayout.Content>

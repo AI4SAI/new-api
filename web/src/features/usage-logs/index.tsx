@@ -208,12 +208,16 @@ function UsageLogsContent() {
 export function UsageLogs() {
   const workspaceKey = route.useSearch().workspace_key
   return (
-    <ManagedAccountBoundary workspaceKey={workspaceKey}>
+    <ManagedAccountBoundary
+      workspaceKey={workspaceKey}
+      action='model.usage.read'
+    >
       {(account, scopeKey) => (
         <UsageLogsProvider
           key={scopeKey}
           workspaceKey={workspaceKey}
           accountLabel={account?.account_label}
+          account={account}
           scopeKey={scopeKey}
         >
           <UsageLogsContent />

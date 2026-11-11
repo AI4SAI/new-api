@@ -5,7 +5,6 @@ import (
 	"net/http"
 
 	"github.com/QuantumNous/new-api/common"
-	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
@@ -22,7 +21,7 @@ func ManagedAccountAuthorization(operation string) gin.HandlerFunc {
 			return
 		}
 		if account := service.ManagementAccount(c); account != nil && operation == "model.usage.read" {
-			visibility, err := model.UserTokenLogVisibility(account.OwnerID)
+			visibility, err := service.ManagementResourceScope(c).UserTokenLogVisibility()
 			if err != nil {
 				common.ApiErrorStatus(c, http.StatusServiceUnavailable, common.NewMessage("Managed account access is unavailable"))
 				c.Abort()

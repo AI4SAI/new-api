@@ -19,6 +19,10 @@ For commercial licensing, please contact support@quantumnous.com
 /* eslint-disable react-refresh/only-export-components */
 import { createContext, useContext, useState, type ReactNode } from 'react'
 
+import type {
+  ManagedAccountContext,
+  MemberCandidate,
+} from '@/features/keys/types'
 import { ROLE } from '@/lib/roles'
 import { useAuthStore } from '@/stores/auth-store'
 
@@ -38,6 +42,9 @@ export function resolveLogsViewAccess(
 interface UsageLogsContextValue {
   workspaceKey?: string
   accountLabel?: string
+  account?: ManagedAccountContext
+  memberFilter: MemberCandidate | null
+  setMemberFilter: (member: MemberCandidate | null) => void
   scopeKey: string
   selectedUserId: number | null
   setSelectedUserId: (userId: number | null) => void
@@ -62,12 +69,15 @@ export function UsageLogsProvider({
   workspaceKey,
   accountLabel,
   scopeKey = 'personal',
+  account,
 }: {
   children: ReactNode
   workspaceKey?: string
   accountLabel?: string
+  account?: ManagedAccountContext
   scopeKey?: string
 }) {
+  const [memberFilter, setMemberFilter] = useState<MemberCandidate | null>(null)
   const [selectedUserId, setSelectedUserId] = useState<number | null>(null)
   const [userInfoDialogOpen, setUserInfoDialogOpen] = useState(false)
   const [affinityTarget, setAffinityTarget] =
@@ -81,7 +91,10 @@ export function UsageLogsProvider({
       value={{
         workspaceKey,
         accountLabel,
-        scopeKey,
+        account,
+        memberFilter,
+        setMemberFilter,
+        scopeKey: JSON.stringify([scopeKey, memberFilter?.subject_ref]),
         selectedUserId,
         setSelectedUserId,
         userInfoDialogOpen,

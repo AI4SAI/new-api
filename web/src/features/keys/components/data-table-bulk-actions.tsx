@@ -16,7 +16,7 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { type Table } from '@tanstack/react-table'
+import type { Table } from '@tanstack/react-table'
 import { Copy, Trash2, Loader2 } from 'lucide-react'
 import { useState, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -31,7 +31,7 @@ import {
 } from '@/components/ui/tooltip'
 import { copyToClipboard } from '@/lib/copy-to-clipboard'
 
-import { type ApiKey } from '../types'
+import type { ApiKey } from '../types'
 import { ApiKeysMultiDeleteDialog } from './api-keys-multi-delete-dialog'
 import { useApiKeys } from './api-keys-provider'
 
@@ -43,7 +43,7 @@ export function DataTableBulkActions<TData>({
   table,
 }: DataTableBulkActionsProps<TData>) {
   const { t } = useTranslation()
-  const { resolveRealKeysBatch } = useApiKeys()
+  const { resolveRealKeysBatch, canPerform } = useApiKeys()
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isCopying, setIsCopying] = useState(false)
   const selectedRows = table.getFilteredSelectedRowModel().rows
@@ -83,56 +83,62 @@ export function DataTableBulkActions<TData>({
   return (
     <>
       <BulkActionsToolbar table={table} entityName='API key'>
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant='outline'
-                size='icon'
-                className='size-8'
-                onClick={handleBatchCopy}
-                disabled={isCopying}
-                aria-label={t('Copy selected keys')}
-              />
-            }
-          >
-            {isCopying ? (
-              <Loader2 className='size-4 animate-spin' />
-            ) : (
-              <Copy className='size-4' />
-            )}
-          </TooltipTrigger>
-          <TooltipContent>
-            <p>{t('Copy selected keys')}</p>
-          </TooltipContent>
-        </Tooltip>
+        {canPerform('model.keys.reveal') && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant='outline'
+                  size='icon'
+                  className='size-8'
+                  onClick={handleBatchCopy}
+                  disabled={isCopying}
+                  aria-label={t('Copy selected keys')}
+                />
+              }
+            >
+              {isCopying ? (
+                <Loader2 className='size-4 animate-spin' />
+              ) : (
+                <Copy className='size-4' />
+              )}
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>{t('Copy selected keys')}</p>
+            </TooltipContent>
+          </Tooltip>
+        )}
 
-        <Tooltip>
-          <TooltipTrigger
-            render={
-              <Button
-                variant='destructive'
-                size='icon'
-                onClick={() => setShowDeleteConfirm(true)}
-                className='size-8'
-                aria-label={t('Delete selected API keys')}
-              />
-            }
-          >
-            <Trash2 />
-            <span className='sr-only'>{t('Delete selected API keys')}</span>
-          </TooltipTrigger>
-          <TooltipContent>
-            <p>{t('Delete selected API keys')}</p>
-          </TooltipContent>
-        </Tooltip>
+        {canPerform('model.keys.delete') && (
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <Button
+                  variant='destructive'
+                  size='icon'
+                  onClick={() => setShowDeleteConfirm(true)}
+                  className='size-8'
+                  aria-label={t('Delete selected API keys')}
+                />
+              }
+            >
+              <Trash2 />
+              <span className='sr-only'>{t('Delete selected API keys')}</span>
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>{t('Delete selected API keys')}</p>
+            </TooltipContent>
+          </Tooltip>
+        )}
       </BulkActionsToolbar>
 
-      <ApiKeysMultiDeleteDialog
-        open={showDeleteConfirm}
-        onOpenChange={setShowDeleteConfirm}
-        table={table}
-      />
+      {canPerform('model.keys.delete') && (
+        <ApiKeysMultiDeleteDialog
+          open={showDeleteConfirm}
+          onOpenChange={setShowDeleteConfirm}
+          table={table}
+        />
+      )}
     </>
   )
 }

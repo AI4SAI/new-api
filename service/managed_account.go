@@ -12,14 +12,17 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 const ManagedWorkspaceHeader = "X-SAI-Workspace-Key"
@@ -41,14 +44,25 @@ type ManagementRequest struct {
 	Method        string `json:"request_method"`
 	Path          string `json:"request_path"`
 	SHA256        string `json:"request_sha256"`
+	AssigneeRef   string `json:"assignee_ref"`
+}
+
+type ManagedResourceGrant struct {
+	Kind       string `json:"kind"`
+	SubjectRef string `json:"subject_ref"`
 }
 
 type ManagedAccount struct {
 	ManagementRequest
-	ActorRef string `json:"actor_ref"`
-	OwnerID  int    `json:"native_owner_id"`
-	Label    string `json:"account_label"`
-	Kind     string `json:"account_kind"`
+	ActorRef            string               `json:"actor_ref"`
+	OwnerID             int                  `json:"native_owner_id"`
+	Label               string               `json:"account_label"`
+	Kind                string               `json:"account_kind"`
+	ResourceScope       ManagedResourceGrant `json:"resource_scope"`
+	AllowedActions      []string             `json:"allowed_actions"`
+	AllowedUpdateFields []string             `json:"allowed_update_fields"`
+	AllowedStatuses     []int                `json:"allowed_statuses"`
+	expiresAt           int64
 }
 
 var ErrManagedAccountDenied = errors.New("managed account access denied")
@@ -61,9 +75,57 @@ func ManagementAccount(c *gin.Context) *ManagedAccount {
 
 func ManagementOwnerID(c *gin.Context) int {
 	if account := ManagementAccount(c); account != nil {
+		// A caller which has not adopted the resource scope must not turn a
+		// member capability into owner-wide access.
+		if account.ResourceScope.Kind == "subject" {
+			return 0
+		}
 		return account.OwnerID
 	}
 	return c.GetInt("id")
+}
+
+// ManagementResourceScope is a server-owned restriction. Request selectors may
+// only narrow it; an invalid selector is an unusable restricted scope.
+func ManagementResourceScope(c *gin.Context) model.ManagedResourceScope {
+	scope := model.ManagedResourceScope{OwnerID: c.GetInt("id")}
+	account := ManagementAccount(c)
+	if account == nil {
+		return scope
+	}
+	scope.OwnerID = account.OwnerID
+	scope.StrictBatch = true
+	scope.Restricted = account.ResourceScope.Kind == "subject"
+	scope.SubjectRef = account.ResourceScope.SubjectRef
+	if selected, exists := c.GetQuery("subject_ref"); c.Request.Method == http.MethodGet && exists && selected != "" {
+		parsed, err := uuid.Parse(selected)
+		if err != nil || parsed.String() != selected || scope.Restricted && selected != scope.SubjectRef {
+			scope.Restricted, scope.SubjectRef = true, ""
+			return scope
+		}
+		scope.Restricted, scope.SubjectRef = true, selected
+	}
+	return scope
+}
+
+// A long export renews its short-lived authority before releasing another
+// page. A role or account change ends this export instead of widening it.
+func RefreshManagedExportAuthorization(c *gin.Context) error {
+	previous := ManagementAccount(c)
+	if previous == nil || previous.SchemaVersion != 2 || time.Now().Unix() < previous.expiresAt {
+		return nil
+	}
+	if previous.Operation != "model.usage.read" {
+		return ErrManagedAccountDenied
+	}
+	if err := AuthorizeManagedAccount(c, previous.Operation); err != nil {
+		return err
+	}
+	current := ManagementAccount(c)
+	if current == nil || current.OwnerID != previous.OwnerID || current.ActorRef != previous.ActorRef || current.ResourceScope != previous.ResourceScope {
+		return ErrManagedAccountDenied
+	}
+	return nil
 }
 
 // AuthorizeManagedAccount keeps the authenticated actor intact. Each operation
@@ -86,10 +148,19 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 	}
 	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 	digest := sha256.Sum256(append([]byte(c.Request.Method+"\n"+c.Request.URL.RequestURI()+"\n"), body...))
-	request := ManagementRequest{SchemaVersion: 1, Instance: os.Getenv("MODEL_BILLING_INSTANCE_REF"),
+	request := ManagementRequest{SchemaVersion: 2, Instance: os.Getenv("MODEL_BILLING_INSTANCE_REF"),
 		ActorID: c.GetInt("id"), SessionID: c.GetString("session_id"), WorkspaceKey: workspace,
 		Operation: operation, RequestID: common.GetUUID(), Method: c.Request.Method,
 		Path: c.Request.URL.Path, SHA256: hex.EncodeToString(digest[:])}
+	if operation == "model.keys.create" {
+		var intent struct {
+			AssigneeRef string `json:"assignee_ref"`
+		}
+		if common.Unmarshal(body, &intent) != nil {
+			return ErrManagedAccountDenied
+		}
+		request.AssigneeRef = intent.AssigneeRef
+	}
 	raw, err := managedAccountRPC(c, request, "", 65536)
 	if err != nil {
 		return err
@@ -99,7 +170,7 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 		Capability    string `json:"capability"`
 	}
 	var responseFields map[string]any
-	if common.Unmarshal(raw, &result) != nil || common.Unmarshal(raw, &responseFields) != nil || len(responseFields) != 2 || result.SchemaVersion != 1 || result.Capability == "" {
+	if common.Unmarshal(raw, &result) != nil || common.Unmarshal(raw, &responseFields) != nil || len(responseFields) != 2 || result.SchemaVersion != request.SchemaVersion || result.Capability == "" {
 		return errors.New("invalid managed account authorization")
 	}
 	account, err := verifyManagementCapability(result.Capability, request)
@@ -107,6 +178,9 @@ func AuthorizeManagedAccount(c *gin.Context, operation string) error {
 		return err
 	}
 	c.Set("managed_account", account)
+	if scope := ManagementResourceScope(c); scope.Restricted && scope.SubjectRef == "" {
+		return ErrManagedAccountDenied
+	}
 	c.Header("Cache-Control", "no-store")
 	return nil
 }
@@ -158,18 +232,20 @@ func RegisterModelKey(c *gin.Context, token *model.Token) error {
 	if token.BillingContextRef == nil {
 		return ErrManagedAccountDenied
 	}
-	workspace, actor, session := "", c.GetInt("id"), c.GetString("session_id")
+	workspace, actor, session, assignee := "", c.GetInt("id"), c.GetString("session_id"), ""
 	if account := ManagementAccount(c); account != nil {
 		workspace, actor, session = account.WorkspaceKey, account.ActorID, account.SessionID
+		assignee = account.AssigneeRef
 	}
 	if token.ManagedBindingRef != "" {
 		actor, session = 0, ""
 	}
 	raw, err := managedAccountRPC(c, map[string]any{
-		"schema_version": 1, "gateway_instance_ref": os.Getenv("MODEL_BILLING_INSTANCE_REF"),
+		"schema_version": 2, "gateway_instance_ref": os.Getenv("MODEL_BILLING_INSTANCE_REF"),
 		"native_actor_id": actor, "session_id": session, "workspace_key": workspace,
 		"native_owner_id": token.UserId, "native_token_id": token.Id, "billing_context_ref": *token.BillingContextRef,
 		"managed_binding_ref": token.ManagedBindingRef, "native_group": token.Group,
+		"assignee_ref": assignee,
 	}, "register-key", 4096)
 	if err != nil {
 		return err
@@ -180,18 +256,19 @@ func RegisterModelKey(c *gin.Context, token *model.Token) error {
 		OwnerID       int    `json:"native_owner_id"`
 		TokenID       int    `json:"native_token_id"`
 		BindingRef    string `json:"billing_context_ref"`
+		SubjectRef    string `json:"managed_subject_ref"`
 	}
-	if common.Unmarshal(raw, &receipt) != nil || receipt.SchemaVersion != 1 ||
+	if common.Unmarshal(raw, &receipt) != nil || receipt.SchemaVersion != 2 ||
 		receipt.Instance != os.Getenv("MODEL_BILLING_INSTANCE_REF") || receipt.OwnerID != token.UserId ||
 		receipt.TokenID != token.Id || receipt.BindingRef != *token.BillingContextRef {
 		return errors.New("key billing confirmation unavailable")
 	}
+	subject, err := uuid.Parse(receipt.SubjectRef)
+	if err != nil || subject.String() != receipt.SubjectRef || assignee != "" && assignee != receipt.SubjectRef {
+		return errors.New("key billing subject confirmation unavailable")
+	}
+	token.ManagedSubjectRef = receipt.SubjectRef
 	return nil
-}
-
-type ManagedKeyReference struct {
-	TokenID    int    `json:"native_token_id"`
-	BindingRef string `json:"managed_binding_ref"`
 }
 
 type ManagedKeyActor struct {
@@ -211,9 +288,14 @@ type ManagedKeyAttribution struct {
 	Workspace *ManagedKeyWorkspace `json:"workspace,omitempty"`
 }
 
-// ReadManagedKeyAttributions resolves only an already-authorized native page.
-// It does not persist profiles or turn display metadata into key authority.
-func ReadManagedKeyAttributions(c *gin.Context, references []ManagedKeyReference) (map[int]*ManagedKeyAttribution, error) {
+type ManagedContextReference struct {
+	TokenID    int    `json:"native_token_id"`
+	ContextRef string `json:"billing_context_ref"`
+}
+
+// ReadManagedContextAttributions keeps historical web calls and deleted keys
+// distinct by their immutable billing context, not their current display name.
+func ReadManagedContextAttributions(c *gin.Context, references []ManagedContextReference) (map[string]*ManagedKeyAttribution, error) {
 	account := ManagementAccount(c)
 	if account == nil || len(references) == 0 {
 		return nil, nil
@@ -221,15 +303,17 @@ func ReadManagedKeyAttributions(c *gin.Context, references []ManagedKeyReference
 	if len(references) > 100 || (account.Operation != "model.keys.read" && account.Operation != "model.usage.read") {
 		return nil, ErrManagedAccountDenied
 	}
-	expected := make(map[int]string, len(references))
+	expected := make(map[string]int, len(references))
 	for _, item := range references {
-		if _, duplicate := expected[item.TokenID]; duplicate || item.TokenID <= 0 {
+		ref, err := uuid.Parse(item.ContextRef)
+		_, duplicate := expected[item.ContextRef]
+		if err != nil || ref.String() != item.ContextRef || item.TokenID < 0 || duplicate {
 			return nil, ErrManagedAccountDenied
 		}
-		expected[item.TokenID] = item.BindingRef
+		expected[item.ContextRef] = item.TokenID
 	}
 	raw, err := managedAccountRPC(c, map[string]any{
-		"schema_version": 1, "gateway_instance_ref": account.Instance, "native_actor_id": account.ActorID,
+		"schema_version": 2, "gateway_instance_ref": account.Instance, "native_actor_id": account.ActorID,
 		"session_id": account.SessionID, "workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID,
 		"tokens": references,
 	}, "key-attributions", 262144)
@@ -241,32 +325,93 @@ func ReadManagedKeyAttributions(c *gin.Context, references []ManagedKeyReference
 		Instance      string `json:"gateway_instance_ref"`
 		OwnerID       int    `json:"native_owner_id"`
 		Items         []struct {
-			ManagedKeyReference
+			ManagedContextReference
+			SubjectRef  string                `json:"managed_subject_ref"`
 			Attribution ManagedKeyAttribution `json:"attribution"`
 		} `json:"items"`
 	}
 	invalid := errors.New("managed key attribution unavailable")
-	if common.Unmarshal(raw, &result) != nil || result.SchemaVersion != 1 || result.Instance != account.Instance || result.OwnerID != account.OwnerID || len(result.Items) != len(references) {
+	if common.Unmarshal(raw, &result) != nil || result.SchemaVersion != 2 || result.Instance != account.Instance || result.OwnerID != account.OwnerID || len(result.Items) != len(references) {
 		return nil, invalid
 	}
-	resolved := make(map[int]*ManagedKeyAttribution, len(references))
+	resolved := make(map[string]*ManagedKeyAttribution, len(references))
+	scope := ManagementResourceScope(c)
 	for _, item := range result.Items {
-		ref, known := expected[item.TokenID]
-		if !known || ref != item.BindingRef || resolved[item.TokenID] != nil {
+		tokenID, known := expected[item.ContextRef]
+		if !known || tokenID != item.TokenID || resolved[item.ContextRef] != nil {
 			return nil, invalid
 		}
 		value := item.Attribution
 		if value.State == "ready" {
-			if value.Actor == nil || value.Actor.DisplayName == "" || value.Actor.Username == "" || value.Workspace == nil ||
+			subject, err := uuid.Parse(item.SubjectRef)
+			if err != nil || subject.String() != item.SubjectRef || scope.Restricted && item.SubjectRef != scope.SubjectRef ||
+				value.Actor == nil || value.Actor.DisplayName == "" || value.Actor.Username == "" || value.Workspace == nil ||
 				(value.Workspace.Kind != "org" && value.Workspace.Kind != "project") || value.Workspace.Code == "" || value.Workspace.Label == "" {
-				return nil, invalid
+				return nil, ErrManagedAccountDenied
 			}
 		} else if value.State != "unavailable" || value.Actor != nil || value.Workspace != nil {
 			return nil, invalid
 		}
-		resolved[item.TokenID] = &value
+		resolved[item.ContextRef] = &value
 	}
 	return resolved, nil
+}
+
+type ManagedMemberCandidate struct {
+	SubjectRef  string `json:"subject_ref"`
+	DisplayName string `json:"display_name"`
+	Username    string `json:"username"`
+}
+
+type ManagedMemberCandidates struct {
+	SchemaVersion int                      `json:"schema_version"`
+	Instance      string                   `json:"gateway_instance_ref"`
+	OwnerID       int                      `json:"native_owner_id"`
+	Items         []ManagedMemberCandidate `json:"items"`
+	NextCursor    string                   `json:"next_cursor"`
+}
+
+func ReadManagedMemberCandidates(c *gin.Context, query, after string, limit int) (*ManagedMemberCandidates, error) {
+	account := ManagementAccount(c)
+	if account == nil || account.Operation != "model.members.read" || !slices.Contains(account.AllowedActions, "model.members.read") ||
+		!utf8.ValidString(query) || utf8.RuneCountInString(query) > 80 || limit < 1 || limit > 100 {
+		return nil, ErrManagedAccountDenied
+	}
+	if after != "" {
+		ref, err := uuid.Parse(after)
+		if err != nil || ref.String() != after {
+			return nil, ErrManagedAccountDenied
+		}
+	}
+	raw, err := managedAccountRPC(c, map[string]any{
+		"schema_version": 2, "gateway_instance_ref": account.Instance, "native_actor_id": account.ActorID,
+		"session_id": account.SessionID, "workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID,
+		"query": query, "after": after, "limit": limit,
+	}, "member-candidates", 262144)
+	if err != nil {
+		return nil, err
+	}
+	var result ManagedMemberCandidates
+	if common.Unmarshal(raw, &result) != nil || result.SchemaVersion != 2 || result.Instance != account.Instance || result.OwnerID != account.OwnerID || len(result.Items) > limit {
+		return nil, errors.New("managed member directory unavailable")
+	}
+	seen := make(map[string]bool, len(result.Items))
+	for _, item := range result.Items {
+		ref, err := uuid.Parse(item.SubjectRef)
+		if err != nil || ref.String() != item.SubjectRef || seen[item.SubjectRef] || item.DisplayName == "" || item.Username == "" {
+			return nil, errors.New("managed member directory unavailable")
+		}
+		seen[item.SubjectRef] = true
+	}
+	if result.NextCursor != "" {
+		ref, err := uuid.Parse(result.NextCursor)
+		// The authority can omit non-assignable principals after scanning a
+		// page. Its continuation cursor need not name a displayed member.
+		if err != nil || ref.String() != result.NextCursor || result.NextCursor <= after {
+			return nil, errors.New("managed member directory unavailable")
+		}
+	}
+	return &result, nil
 }
 
 func verifyManagementCapability(raw string, request ManagementRequest) (*ManagedAccount, error) {
@@ -312,7 +457,13 @@ func verifyManagementCapability(raw string, request ManagementRequest) (*Managed
 		return nil, ErrManagedAccountDenied
 	}
 	grantFields, ok := claims["grant"].(map[string]any)
-	if !ok || len(grantFields) != 14 {
+	expectedFields := 14
+	if request.SchemaVersion == 2 {
+		expectedFields = 19
+	} else if request.SchemaVersion != 1 {
+		return nil, ErrManagedAccountDenied
+	}
+	if !ok || len(grantFields) != expectedFields {
 		return nil, ErrManagedAccountDenied
 	}
 	grant, err := common.Marshal(claims["grant"])
@@ -324,6 +475,57 @@ func verifyManagementCapability(raw string, request ManagementRequest) (*Managed
 		account.ActorRef == "" || account.Label == "" || (account.Kind != "org" && account.Kind != "project") {
 		return nil, ErrManagedAccountDenied
 	}
+	if request.SchemaVersion == 2 {
+		actor, err := uuid.Parse(account.ActorRef)
+		scopeFields, scopeOK := grantFields["resource_scope"].(map[string]any)
+		if err != nil || actor.String() != account.ActorRef || !scopeOK || len(scopeFields) != 2 ||
+			!slices.Contains(account.AllowedActions, request.Operation) {
+			return nil, ErrManagedAccountDenied
+		}
+		switch account.ResourceScope.Kind {
+		case "all":
+			if account.ResourceScope.SubjectRef != "" {
+				return nil, ErrManagedAccountDenied
+			}
+		case "subject":
+			if account.ResourceScope.SubjectRef != account.ActorRef || slices.Contains(account.AllowedActions, "model.keys.create") || slices.Contains(account.AllowedActions, "model.members.read") {
+				return nil, ErrManagedAccountDenied
+			}
+		default:
+			return nil, ErrManagedAccountDenied
+		}
+		actions := []string{"model.keys.read", "model.keys.create", "model.keys.update", "model.keys.delete", "model.keys.reveal", "model.usage.read", "model.members.read"}
+		fields := []string{"name", "expired_time", "unlimited_quota", "model_limits_enabled", "model_limits", "allow_ips", "allow_user_quota_query", "group", "cross_group_retry", "auto_groups", "quota_delta"}
+		seen := make(map[string]bool)
+		for _, action := range account.AllowedActions {
+			if !slices.Contains(actions, action) || seen["action:"+action] {
+				return nil, ErrManagedAccountDenied
+			}
+			seen["action:"+action] = true
+		}
+		for _, field := range account.AllowedUpdateFields {
+			if !slices.Contains(fields, field) || seen["field:"+field] || account.ResourceScope.Kind == "subject" && field != "name" {
+				return nil, ErrManagedAccountDenied
+			}
+			seen["field:"+field] = true
+		}
+		for _, status := range account.AllowedStatuses {
+			key := "status:" + strconv.Itoa(status)
+			if status != 1 && status != 2 || seen[key] || account.ResourceScope.Kind == "subject" && status != 2 {
+				return nil, ErrManagedAccountDenied
+			}
+			seen[key] = true
+		}
+		if request.Operation == "model.keys.create" {
+			assignee, err := uuid.Parse(request.AssigneeRef)
+			if err != nil || assignee.String() != request.AssigneeRef {
+				return nil, ErrManagedAccountDenied
+			}
+		} else if request.AssigneeRef != "" {
+			return nil, ErrManagedAccountDenied
+		}
+	}
+	account.expiresAt = exp
 	return &account, nil
 }
 

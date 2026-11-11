@@ -32,15 +32,17 @@ import {
   within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { useEffect } from 'react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 
+import type { MemberCandidate } from '@/features/keys/types'
 import { ROLE } from '@/lib/roles'
 import { STATUS_QUERY_KEY } from '@/lib/status-query'
 import { useAuthStore } from '@/stores/auth-store'
 
 import { ExportLogsDialog } from '../dialogs/export-logs-dialog'
-import { UsageLogsProvider } from '../usage-logs-provider'
+import { UsageLogsProvider, useUsageLogsContext } from '../usage-logs-provider'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const createObjectURL = vi.fn((_blob: Blob) => 'blob:logs')
@@ -68,6 +70,7 @@ function renderExport(options: {
   role: number
   status?: Record<string, unknown>
   search: Record<string, string | number>
+  member?: MemberCandidate
 }) {
   useAuthStore.setState((state) => ({
     auth: {
@@ -87,9 +90,11 @@ function renderExport(options: {
     getParentRoute: () => auth,
     path: '/usage-logs/$section',
     component: () => (
-      <UsageLogsProvider>
+      <UsageLogsProvider
+        workspaceKey={String(options.search.workspace_key || '') || undefined}
+      >
         <h1>Common Logs</h1>
-        <ExportLogsDialog />
+        <ScopedExport member={options.member} />
       </UsageLogsProvider>
     ),
     validateSearch: (search: Record<string, unknown>) => search,
@@ -109,6 +114,14 @@ function renderExport(options: {
     </QueryClientProvider>
   )
   return router
+}
+
+function ScopedExport(props: { member?: MemberCandidate }) {
+  const { setMemberFilter } = useUsageLogsContext()
+  useEffect(() => {
+    setMemberFilter(props.member ?? null)
+  }, [props.member, setMemberFilter])
+  return <ExportLogsDialog />
 }
 
 function mockExportResponse(lines: unknown[]) {
@@ -274,4 +287,50 @@ it('treats a stream that ends without the success line as a failed export', asyn
     expect(error).toHaveBeenCalledWith('Failed to export logs')
   )
   expect(createObjectURL).not.toHaveBeenCalled()
+})
+
+it('organization member filters reach the export request with the same account header', async () => {
+  const member = {
+    subject_ref: '22222222-2222-4222-8222-222222222222',
+    display_name: 'Alice',
+    username: 'alice',
+  }
+  const workspace = 'org:11111111-1111-4111-8111-111111111111'
+  const fetchSpy = mockExportResponse([{ success: true, data: { count: 0 } }])
+  renderExport({
+    role: ROLE.USER,
+    search: { ...recentRange(), workspace_key: workspace },
+    member,
+  })
+  await userEvent.click(await screen.findByRole('button', { name: 'Export' }))
+  await userEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', { name: 'Export' })
+  )
+  await waitFor(() => expect(fetchSpy).toHaveBeenCalled())
+  const [url, options] = fetchSpy.mock.calls[0]
+  expect(
+    new URL(String(url), 'https://example.test').searchParams.get('subject_ref')
+  ).toBe(member.subject_ref)
+  expect(options?.headers).toMatchObject({ 'X-SAI-Workspace-Key': workspace })
+})
+
+it('leaving the export view aborts an in-flight request and does not download stale logs', async () => {
+  let finish: (response: Response) => void = () => undefined
+  const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+    () =>
+      new Promise<Response>((resolve) => {
+        finish = resolve
+      })
+  )
+  renderExport({ role: ROLE.USER, search: recentRange() })
+  await userEvent.click(await screen.findByRole('button', { name: 'Export' }))
+  await userEvent.click(
+    within(screen.getByRole('dialog')).getByRole('button', { name: 'Export' })
+  )
+  await waitFor(() => expect(fetchSpy).toHaveBeenCalled())
+  const signal = fetchSpy.mock.calls[0][1]?.signal
+  cleanup()
+  expect(signal?.aborted).toBe(true)
+  finish(new Response(JSON.stringify({ success: true, data: { count: 0 } })))
+  await waitFor(() => expect(createObjectURL).not.toHaveBeenCalled())
 })

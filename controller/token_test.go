@@ -2,8 +2,12 @@ package controller
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"database/sql"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"maps"
@@ -20,8 +24,11 @@ import (
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/driver/mysql"
@@ -52,6 +59,77 @@ type tokenResponseItem struct {
 	Attribution       *service.ManagedKeyAttribution `json:"attribution"`
 }
 
+const managedMemberA = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+const managedMemberB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+func managedControllerAccount(subject string) *service.ManagedAccount {
+	account := &service.ManagedAccount{OwnerID: 41, ActorRef: managedMemberA, Label: "Lab", Kind: "org",
+		ResourceScope:       service.ManagedResourceGrant{Kind: "all"},
+		AllowedActions:      []string{"model.keys.read", "model.keys.create", "model.keys.update", "model.keys.delete", "model.keys.reveal", "model.usage.read", "model.members.read"},
+		AllowedUpdateFields: []string{"name", "expired_time", "unlimited_quota", "model_limits_enabled", "model_limits", "allow_ips", "allow_user_quota_query", "group", "cross_group_retry", "auto_groups", "quota_delta"},
+		AllowedStatuses:     []int{1, 2},
+		ManagementRequest:   service.ManagementRequest{SchemaVersion: 2, Operation: "model.keys.read", Instance: "fixture-gateway", ActorID: 7, SessionID: "fixture-session", WorkspaceKey: "org:fixture"}}
+	if subject != "" {
+		account.ActorRef = subject
+		account.ResourceScope = service.ManagedResourceGrant{Kind: "subject", SubjectRef: subject}
+		account.AllowedActions = []string{"model.keys.read", "model.keys.update", "model.keys.delete", "model.keys.reveal", "model.usage.read"}
+		account.AllowedUpdateFields, account.AllowedStatuses = []string{"name"}, []int{2}
+	}
+	return account
+}
+
+// Use the real capability decoder and HTTP transport around controller fixtures.
+func startManagedControllerAuthority(t *testing.T, account *service.ManagedAccount, rpc http.HandlerFunc) {
+	t.Helper()
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	der, err := x509.MarshalPKIXPublicKey(public)
+	require.NoError(t, err)
+	keys, err := common.Marshal(map[string]any{"schema_version": "sai-authz-public-keys.v1", "keys": map[string]string{"fixture": string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))}})
+	require.NoError(t, err)
+	keyFile, credential := t.TempDir()+"/keys.json", t.TempDir()+"/credential"
+	require.NoError(t, os.WriteFile(keyFile, keys, 0600))
+	require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
+	t.Setenv("MODEL_MANAGEMENT_AUTHZ_KEYS_FILE", keyFile)
+	t.Setenv("MODEL_MANAGEMENT_AUTHZ_POLICY_EPOCH", "2")
+	t.Setenv("MODEL_MANAGEMENT_SITE_ID", "fixture-site")
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "Bearer "+strings.Repeat("x", 48), r.Header.Get("Authorization"))
+		if !strings.HasSuffix(r.URL.Path, "/authorize-management") {
+			rpc(w, r)
+			return
+		}
+		var request service.ManagementRequest
+		require.NoError(t, common.DecodeJson(r.Body, &request))
+		require.Equal(t, 2, request.SchemaVersion)
+		require.Equal(t, "fixture-session", request.SessionID)
+		if !slices.Contains(account.AllowedActions, request.Operation) {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		grant := *account
+		grant.ManagementRequest = request
+		raw, err := common.Marshal(grant)
+		require.NoError(t, err)
+		var fields map[string]any
+		require.NoError(t, common.Unmarshal(raw, &fields))
+		fields["assignee_ref"] = request.AssigneeRef
+		now := time.Now().Unix()
+		claims := jwt.MapClaims{"version": 1, "iss": "sai-portal", "aud": "sai-model-governance", "surface": "model-governance", "site": "fixture-site", "operations": []string{request.Operation}, "policy_epoch": 2, "jti": request.RequestID, "nbf": now, "exp": now + 15, "grant": fields}
+		token := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+		token.Header["typ"], token.Header["kid"] = "SAI-CAPABILITY", "fixture"
+		signed, err := token.SignedString(private)
+		require.NoError(t, err)
+		response, err := common.Marshal(map[string]any{"schema_version": 2, "capability": signed})
+		require.NoError(t, err)
+		_, _ = w.Write(response)
+	}))
+	t.Cleanup(server.Close)
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
+}
+
 func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
 	t.Setenv("LOG_SQL_DSN", "")
@@ -63,6 +141,12 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.NoError(t, db.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
 	require.NoError(t, db.Model(internal).Update("allow_ips", "192.0.2.3").Error)
 	require.NoError(t, db.Model(external).Update("management_creator_id", 7).Error)
+	contexts := map[string]int{}
+	for i, token := range []*model.Token{external, internal} {
+		ref := fmt.Sprintf("00000000-0000-4000-8000-%012d", i+1)
+		require.NoError(t, db.Model(token).Updates(map[string]any{"billing_context_ref": ref, "billing_context_confirmed": true, "managed_subject_ref": managedMemberA}).Error)
+		contexts[ref] = token.Id
+	}
 	credential := t.TempDir() + "/credential"
 	require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
 	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
@@ -76,20 +160,31 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 		if strings.HasSuffix(r.URL.Path, "/register-key") {
 			var receipt map[string]any
 			require.NoError(t, common.DecodeJson(r.Body, &receipt))
+			require.EqualValues(t, 2, receipt["schema_version"])
+			receipt["managed_subject_ref"] = managedMemberA
+			contexts[receipt["billing_context_ref"].(string)] = int(receipt["native_token_id"].(float64))
 			data, err := common.Marshal(receipt)
 			require.NoError(t, err)
 			_, _ = w.Write(data)
 			return
 		}
 		var body struct {
-			Tokens []service.ManagedKeyReference `json:"tokens"`
+			SchemaVersion int                               `json:"schema_version"`
+			Tokens        []service.ManagedContextReference `json:"tokens"`
 		}
 		require.NoError(t, common.DecodeJson(r.Body, &body))
-		require.Equal(t, []service.ManagedKeyReference{{TokenID: internal.Id, BindingRef: "11111111-1111-4111-8111-111111111111"}}, body.Tokens)
-		data, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41,
-			"items": []map[string]any{{"native_token_id": internal.Id, "managed_binding_ref": body.Tokens[0].BindingRef,
+		require.Equal(t, 2, body.SchemaVersion)
+		items := make([]map[string]any, 0, len(body.Tokens))
+		for _, ref := range body.Tokens {
+			if contexts[ref.ContextRef] != ref.TokenID {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			items = append(items, map[string]any{"native_token_id": ref.TokenID, "billing_context_ref": ref.ContextRef, "managed_subject_ref": managedMemberA,
 				"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: "Current member", Username: "member"},
-					Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}}}})
+					Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}})
+		}
+		data, err := common.Marshal(map[string]any{"schema_version": 2, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41, "items": items})
 		require.NoError(t, err)
 		_, _ = w.Write(data)
 	}))
@@ -98,8 +193,11 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	request := func(method, path string, body any) (*gin.Context, *httptest.ResponseRecorder) {
 		c, w := newAuthenticatedContext(t, method, path, body, 7)
 		c.Request.Header.Set("Idempotency-Key", "22222222-2222-4222-8222-222222222222")
-		c.Set("managed_account", &service.ManagedAccount{OwnerID: 41, Label: "Lab", Kind: "org",
-			ManagementRequest: service.ManagementRequest{Operation: "model.keys.read", Instance: "fixture-gateway", ActorID: 7, SessionID: "authenticated-session", WorkspaceKey: "org:fixture"}})
+		account := managedControllerAccount("")
+		if fields, ok := body.(map[string]any); ok {
+			account.AssigneeRef, _ = fields["assignee_ref"].(string)
+		}
+		c.Set("managed_account", account)
 		return c, w
 	}
 	c, w := request("GET", "/api/token/", nil)
@@ -179,7 +277,7 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	GetAllTokens(c)
 	require.Equal(t, http.StatusForbidden, w.Code)
 	attributionStatus = http.StatusOK
-	c, w = request("POST", "/api/token/", map[string]any{"name": "device", "remain_quota": 100, "expired_time": -1})
+	c, w = request("POST", "/api/token/", map[string]any{"name": "device", "remain_quota": 100, "expired_time": -1, "assignee_ref": managedMemberA})
 	AddToken(c)
 	require.True(t, decodeAPIResponse(t, w).Success)
 	var created model.Token
@@ -215,6 +313,12 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	c, w = request("POST", "/api/token/batch/keys", map[string]any{"ids": ids})
 	GetTokenKeysBatch(c)
 	response = decodeAPIResponse(t, w)
+	require.False(t, response.Success)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.NotContains(t, w.Body.String(), external.Key)
+	c, w = request("POST", "/api/token/batch/keys", map[string]any{"ids": []int{external.Id}})
+	GetTokenKeysBatch(c)
+	response = decodeAPIResponse(t, w)
 	require.True(t, response.Success)
 	var keys struct {
 		Keys map[int]string `json:"keys"`
@@ -222,6 +326,12 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.NoError(t, common.Unmarshal(response.Data, &keys))
 	require.Equal(t, map[int]string{external.Id: external.Key}, keys.Keys)
 	c, w = request("POST", "/api/token/batch", map[string]any{"ids": ids})
+	DeleteTokenBatch(c)
+	require.Equal(t, http.StatusForbidden, w.Code)
+	require.False(t, decodeAPIResponse(t, w).Success)
+	var preserved model.Token
+	require.NoError(t, db.First(&preserved, external.Id).Error, "a mixed batch must not delete its authorized item")
+	c, w = request("POST", "/api/token/batch", map[string]any{"ids": []int{external.Id}})
 	DeleteTokenBatch(c)
 	require.True(t, decodeAPIResponse(t, w).Success)
 	var count int64
@@ -244,6 +354,17 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	for _, row := range page.Items {
 		require.NotEqual(t, external.Id, row.ID)
 	}
+	pendingRef := "99999999-9999-4999-8999-999999999999"
+	pending := seedToken(t, db, 41, "pending registration", "pending-key")
+	require.NoError(t, db.Model(pending).Updates(map[string]any{"billing_context_ref": pendingRef, "status": common.TokenStatusDisabled}).Error)
+	c, w = request("GET", "/api/token/", nil)
+	GetAllTokens(c)
+	response = decodeAPIResponse(t, w)
+	require.True(t, response.Success, w.Body.String())
+	require.NoError(t, common.Unmarshal(response.Data, &page))
+	require.Equal(t, 3, page.Total)
+	require.Equal(t, pending.Id, page.Items[0].ID)
+	require.Equal(t, common.TokenStatusDisabled, page.Items[0].Status)
 }
 
 func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.T) {
@@ -268,6 +389,7 @@ func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
+		receipt["managed_subject_ref"] = managedMemberA
 		data, err := common.Marshal(receipt)
 		require.NoError(t, err)
 		_, _ = w.Write(data)
@@ -285,6 +407,7 @@ func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.
 	require.Equal(t, http.StatusServiceUnavailable, create("original").Code)
 	var token model.Token
 	require.NoError(t, db.Where("billing_context_ref = ?", ref).First(&token).Error)
+	require.Empty(t, token.ManagedSubjectRef, "a failed confirmation must not invent a subject")
 	key, id := token.Key, token.Id
 	c, w := newAuthenticatedContext(t, "POST", "/api/token/key", nil, 7)
 	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
@@ -294,12 +417,14 @@ func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.
 	require.True(t, decodeAPIResponse(t, create("original")).Success)
 	require.NoError(t, db.First(&token, id).Error)
 	require.True(t, token.BillingContextConfirmed)
+	require.Equal(t, managedMemberA, token.ManagedSubjectRef)
 	require.Equal(t, key, token.Key)
 	require.Equal(t, common.TokenStatusEnabled, token.Status)
 	require.NoError(t, db.Model(&token).Update("status", common.TokenStatusDisabled).Error)
 	require.True(t, decodeAPIResponse(t, create("original")).Success)
 	require.NoError(t, db.First(&token, id).Error)
 	require.Equal(t, common.TokenStatusDisabled, token.Status)
+	require.Equal(t, managedMemberA, token.ManagedSubjectRef, "a creation retry preserves its confirmed subject")
 	require.Equal(t, 2, calls)
 	require.Equal(t, http.StatusConflict, create("changed").Code)
 	var count int64
@@ -309,6 +434,138 @@ func TestNativeKeyRegistrationConfirmsBeforeEnablingAndRetriesOneKey(t *testing.
 	c.Params = gin.Params{{Key: "id", Value: strconv.Itoa(id)}}
 	GetTokenKey(c)
 	require.True(t, decodeAPIResponse(t, w).Success)
+}
+
+func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {
+	for _, database := range []struct {
+		name, env string
+		kind      common.DatabaseType
+	}{{"sqlite", "", common.DatabaseTypeSQLite}, {"mysql", "AUDIT_MYSQL_DSN", common.DatabaseTypeMySQL}, {"postgres", "AUDIT_POSTGRES_DSN", common.DatabaseTypePostgreSQL}} {
+		t.Run(database.name, func(t *testing.T) {
+			dsn := os.Getenv(database.env)
+			if database.env != "" && dsn == "" {
+				t.Skip(database.env + " is not configured")
+			}
+			db, _ := newAuditTestDatabase(t, database.name, dsn)
+			useLogExportDatabases(t, db, db, database.kind, database.kind)
+			require.NoError(t, db.AutoMigrate(&model.Token{}, &model.User{}, &model.Ability{}))
+			configureTokenAutoGroupsTest(t, "5", `["actor-group","owner-group"]`)
+			require.NoError(t, setting.UpdateUserUsableGroupsByJSONString(`{}`))
+			require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"actor-group":1,"owner-group":2}`))
+			for _, user := range []model.User{{Id: 7, Username: "member", Group: "actor-group", AffCode: "member-aff"}, {Id: 41, Username: "owner", Group: "owner-group", AffCode: "owner-aff"}} {
+				require.NoError(t, db.Create(&user).Error)
+			}
+			for _, ability := range []model.Ability{{Group: "actor-group", Model: "actor-only", ChannelId: 1, Enabled: true}, {Group: "owner-group", Model: "owner-only", ChannelId: 2, Enabled: true}} {
+				require.NoError(t, db.Create(&ability).Error)
+			}
+			owned := seedToken(t, db, 41, "owned", "member-owned-secret")
+			foreign := seedToken(t, db, 41, "another member", "another-member-secret")
+			legacy := seedToken(t, db, 41, "legacy unassigned", "legacy-unassigned-secret")
+			otherOwner := seedToken(t, db, 42, "other owner", "another-owner-secret")
+			ref := "11111111-1111-4111-8111-111111111111"
+			require.NoError(t, db.Model(owned).Updates(map[string]any{"managed_subject_ref": managedMemberA, "billing_context_ref": ref, "billing_context_confirmed": true,
+				"unlimited_quota": false, "model_limits_enabled": true, "model_limits": "owner-only", "allow_ips": "192.0.2.0/24", "auto_groups": `["owner-group"]`, "cross_group_retry": true, "group": "auto"}).Error)
+			require.NoError(t, db.Model(foreign).Update("managed_subject_ref", managedMemberB).Error)
+			require.NoError(t, db.Model(otherOwner).Update("managed_subject_ref", managedMemberA).Error)
+			account := managedControllerAccount(managedMemberA)
+			startManagedControllerAuthority(t, account, func(w http.ResponseWriter, r *http.Request) {
+				require.True(t, strings.HasSuffix(r.URL.Path, "/key-attributions"))
+				var request struct {
+					SchemaVersion int                               `json:"schema_version"`
+					Tokens        []service.ManagedContextReference `json:"tokens"`
+				}
+				require.NoError(t, common.DecodeJson(r.Body, &request))
+				require.Equal(t, 2, request.SchemaVersion)
+				require.Equal(t, []service.ManagedContextReference{{TokenID: owned.Id, ContextRef: ref}}, request.Tokens)
+				response, err := common.Marshal(map[string]any{"schema_version": 2, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41,
+					"items": []map[string]any{{"native_token_id": owned.Id, "billing_context_ref": ref, "managed_subject_ref": managedMemberA,
+						"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: "Member A", Username: "member"}, Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "lab", Label: "Lab"}}}}})
+				require.NoError(t, err)
+				_, _ = w.Write(response)
+			})
+			router := gin.New()
+			router.Use(func(c *gin.Context) {
+				c.Set("id", 7)
+				c.Set("session_id", "fixture-session")
+				c.Set("group", "actor-group")
+			})
+			router.GET("/api/token/", middleware.ManagedAccountAuthorization("model.keys.read"), GetAllTokens)
+			router.GET("/api/token/search", middleware.ManagedAccountAuthorization("model.keys.read"), SearchTokens)
+			router.GET("/api/token/:id", middleware.ManagedAccountAuthorization("model.keys.read"), GetToken)
+			router.PUT("/api/token/", middleware.ManagedAccountAuthorization("model.keys.update"), UpdateToken)
+			router.POST("/api/token/", middleware.ManagedAccountAuthorization("model.keys.create"), AddToken)
+			router.POST("/api/token/:id/key", middleware.ManagedAccountAuthorization("model.keys.reveal"), GetTokenKey)
+			router.POST("/api/token/batch/keys", middleware.ManagedAccountAuthorization("model.keys.reveal"), GetTokenKeysBatch)
+			router.POST("/api/token/batch", middleware.ManagedAccountAuthorization("model.keys.delete"), DeleteTokenBatch)
+			router.DELETE("/api/token/:id", middleware.ManagedAccountAuthorization("model.keys.delete"), DeleteToken)
+			router.GET("/api/user/self/groups", middleware.ManagedAccountAuthorization("model.keys.read"), GetUserGroups)
+			router.GET("/api/user/models", middleware.ManagedAccountAuthorization("model.keys.read"), GetUserModels)
+			router.GET("/api/token/auto-groups", middleware.ManagedAccountAuthorization("model.keys.read"), GetTokenAutoGroups)
+			call := func(method, path string, body any) *httptest.ResponseRecorder {
+				c, recorder := newAuthenticatedContext(t, method, path, body, 7)
+				c.Request.Header.Set(service.ManagedWorkspaceHeader, "org:fixture")
+				router.ServeHTTP(recorder, c.Request)
+				return recorder
+			}
+			for _, path := range []string{"/api/token/", "/api/token/search?keyword=owned"} {
+				response := decodeAPIResponse(t, call("GET", path, nil))
+				require.True(t, response.Success)
+				var page tokenPageResponse
+				require.NoError(t, common.Unmarshal(response.Data, &page))
+				require.Equal(t, 1, page.Total)
+				require.Len(t, page.Items, 1)
+				require.Equal(t, owned.Id, page.Items[0].ID)
+			}
+			for _, target := range []*model.Token{foreign, legacy, otherOwner} {
+				for _, operation := range []struct{ method, path string }{{"GET", fmt.Sprintf("/api/token/%d", target.Id)}, {"POST", fmt.Sprintf("/api/token/%d/key", target.Id)}, {"DELETE", fmt.Sprintf("/api/token/%d", target.Id)}} {
+					response := call(operation.method, operation.path, nil)
+					require.Equal(t, http.StatusForbidden, response.Code)
+					require.NotContains(t, response.Body.String(), target.Key)
+				}
+			}
+			for _, path := range []string{"/api/token/batch/keys", "/api/token/batch"} {
+				response := call("POST", path, map[string]any{"ids": []int{owned.Id, foreign.Id}})
+				require.Equal(t, http.StatusForbidden, response.Code)
+				require.NotContains(t, response.Body.String(), owned.Key)
+				require.NoError(t, db.First(&model.Token{}, owned.Id).Error)
+			}
+			before := model.Token{}
+			require.NoError(t, db.First(&before, owned.Id).Error)
+			response := call("PUT", "/api/token/", map[string]any{"id": owned.Id, "name": "my renamed key"})
+			require.True(t, decodeAPIResponse(t, response).Success, response.Body.String())
+			var after model.Token
+			require.NoError(t, db.First(&after, owned.Id).Error)
+			require.Equal(t, "my renamed key", after.Name)
+			require.Equal(t, before.RemainQuota, after.RemainQuota)
+			require.Equal(t, before.UnlimitedQuota, after.UnlimitedQuota)
+			require.Equal(t, before.ExpiredTime, after.ExpiredTime)
+			require.Equal(t, before.ModelLimits, after.ModelLimits)
+			require.Equal(t, before.ModelLimitsEnabled, after.ModelLimitsEnabled)
+			require.Equal(t, before.AllowIps, after.AllowIps)
+			require.Equal(t, before.Group, after.Group)
+			require.Equal(t, before.AutoGroups, after.AutoGroups)
+			require.Equal(t, before.CrossGroupRetry, after.CrossGroupRetry)
+			for _, change := range []map[string]any{{"quota_delta": 5, "expected_quota_revision": 0}, {"unlimited_quota": true}, {"model_limits_enabled": false}, {"allow_ips": ""}, {"expired_time": 0}, {"group": "default"}, {"cross_group_retry": false}} {
+				change["id"], change["name"] = owned.Id, "forbidden"
+				require.Equal(t, http.StatusForbidden, call("PUT", "/api/token/", change).Code)
+			}
+			require.Equal(t, http.StatusForbidden, call("POST", "/api/token/", map[string]any{"name": "forbidden", "assignee_ref": managedMemberA}).Code)
+			require.True(t, decodeAPIResponse(t, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})).Success)
+			require.Equal(t, http.StatusForbidden, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1}).Code)
+			for _, metadata := range []struct{ path, expected string }{{"/api/user/self/groups", "owner-group"}, {"/api/user/models", "owner-only"}, {"/api/token/auto-groups", "owner-group"}} {
+				response := call("GET", metadata.path, nil)
+				require.True(t, decodeAPIResponse(t, response).Success, response.Body.String())
+				require.Contains(t, response.Body.String(), metadata.expected)
+				require.NotContains(t, response.Body.String(), "actor-group")
+				require.NotContains(t, response.Body.String(), "actor-only")
+			}
+			revealed := call("POST", fmt.Sprintf("/api/token/%d/key", owned.Id), nil)
+			require.True(t, decodeAPIResponse(t, revealed).Success)
+			require.Contains(t, revealed.Body.String(), owned.Key)
+			require.True(t, decodeAPIResponse(t, call("POST", "/api/token/batch", map[string]any{"ids": []int{owned.Id}})).Success)
+			require.ErrorIs(t, db.First(&model.Token{}, owned.Id).Error, gorm.ErrRecordNotFound)
+		})
+	}
 }
 
 type tokenKeyResponse struct {
@@ -381,6 +638,8 @@ func setupTokenControllerTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
 	db := openTokenControllerTestDB(t)
+	t.Setenv("LOG_SQL_DSN", "")
+	require.NoError(t, model.InitLogDB(), "initialize the production dialect column quoting for the fixture")
 	migrateTokenControllerTestDB(t, db)
 	return db
 }

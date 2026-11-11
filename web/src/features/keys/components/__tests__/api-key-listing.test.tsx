@@ -50,10 +50,15 @@ import {
   useSystemConfigStore,
 } from '@/stores/system-config-store'
 
-import { apiKeySchema, type ApiKey } from '../../types'
+import {
+  apiKeySchema,
+  type ApiKey,
+  type ManagedAccountContext,
+} from '../../types'
 import { ApiKeyQuotaCell } from '../api-key-quota-cell'
 import { useApiKeysColumns } from '../api-keys-columns'
 import { ApiKeysDeleteDialog } from '../api-keys-delete-dialog'
+import { ApiKeysPrimaryButtons } from '../api-keys-primary-buttons'
 import { ApiKeysProvider } from '../api-keys-provider'
 import { ApiKeysTable } from '../api-keys-table'
 
@@ -295,9 +300,13 @@ it('keeps a long amount within its column while showing the full amount in detai
   ).toHaveLength(2)
 })
 
-function KeysPage() {
+function KeysPage(props: { account?: ManagedAccountContext }) {
   return (
-    <ApiKeysProvider>
+    <ApiKeysProvider
+      workspaceKey={props.account?.workspace_key}
+      account={props.account}
+    >
+      {props.account && <ApiKeysPrimaryButtons />}
       <ApiKeysTable />
       <ApiKeysDeleteDialog />
       <Toaster />
@@ -308,7 +317,8 @@ function KeysPage() {
 async function renderKeysPage(
   status = 1,
   overrides: Partial<ApiKey> = {},
-  additionalKeys: ApiKey[] = []
+  additionalKeys: ApiKey[] = [],
+  account?: ManagedAccountContext
 ) {
   let currentKey = { ...key, status, ...overrides }
   let deleted = false
@@ -348,7 +358,7 @@ async function renderKeysPage(
   const keysRoute = createRoute({
     getParentRoute: () => auth,
     path: 'keys/',
-    component: KeysPage,
+    component: () => <KeysPage account={account} />,
   })
   const usageRoute = createRoute({
     getParentRoute: () => auth,
@@ -678,4 +688,88 @@ it('keeps mobile quota readable and opens complete model and IP restrictions by 
   details = await screen.findByRole('dialog')
   expect(within(details).getByText('192.0.2.1')).toBeVisible()
   expect(within(details).getByText('2001:db8::1')).toBeVisible()
+})
+
+const memberAccount: ManagedAccountContext = {
+  workspace_key: 'org:11111111-1111-4111-8111-111111111111',
+  native_owner_id: 20,
+  account_label: 'Team',
+  account_kind: 'org',
+  resource_scope: {
+    kind: 'subject',
+    subject_ref: '22222222-2222-4222-8222-222222222222',
+  },
+  allowed_actions: [
+    'model.keys.read',
+    'model.keys.reveal',
+    'model.keys.update',
+    'model.keys.delete',
+    'model.usage.read',
+  ],
+  allowed_update_fields: ['name'],
+  allowed_statuses: [2],
+}
+
+it('members can disable and copy their external key while create and re-enable stay unavailable', async () => {
+  const user = userEvent.setup()
+  const { put, post } = await renderKeysPage(1, {}, [], memberAccount)
+  expect(
+    screen.queryByRole('button', { name: 'Create API Key' })
+  ).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled()
+  await user.click(screen.getByRole('button', { name: 'Disable' }))
+  await screen.findByText('Disabled')
+  expect(
+    screen.queryByRole('button', { name: 'Enable' })
+  ).not.toBeInTheDocument()
+  expect(put).toHaveBeenCalledWith(
+    '/api/token/?status_only=true',
+    { id: 7, status: 2 },
+    expect.objectContaining({
+      headers: { 'X-SAI-Workspace-Key': memberAccount.workspace_key },
+    })
+  )
+  await user.click(screen.getByRole('button', { name: 'Open menu' }))
+  expect(screen.getByRole('menuitem', { name: /^Delete$/ })).toBeVisible()
+  await user.click(screen.getByRole('menuitem', { name: 'Copy Key' }))
+  await waitFor(() =>
+    expect(post).toHaveBeenCalledWith(
+      '/api/token/7/key',
+      undefined,
+      expect.objectContaining({
+        headers: { 'X-SAI-Workspace-Key': memberAccount.workspace_key },
+      })
+    )
+  )
+})
+
+it('administrators keep create and re-enable controls and external key attribution does not mask it as managed', async () => {
+  await renderKeysPage(
+    2,
+    {
+      attribution: {
+        state: 'ready',
+        actor: { display_name: 'Alice', username: 'alice' },
+        workspace: { kind: 'org', code: 'team', label: 'Team' },
+      },
+    },
+    [],
+    {
+      ...memberAccount,
+      resource_scope: { kind: 'all', subject_ref: '' },
+      allowed_actions: [
+        ...memberAccount.allowed_actions,
+        'model.keys.create',
+        'model.members.read',
+      ],
+      allowed_statuses: [1, 2],
+    }
+  )
+  expect(screen.getByRole('button', { name: 'Create API Key' })).toBeEnabled()
+  expect(screen.getByRole('button', { name: 'Enable' })).toBeEnabled()
+  expect(screen.getByText('Alice')).toBeVisible()
+  expect(screen.queryByText('Managed automatically')).not.toBeInTheDocument()
+  expect(screen.getByRole('combobox', { name: 'Member' })).toBeVisible()
+  await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
+  expect(screen.getByRole('menuitem', { name: 'Copy Key' })).toBeVisible()
 })

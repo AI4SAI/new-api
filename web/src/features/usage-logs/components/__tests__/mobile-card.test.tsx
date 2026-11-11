@@ -24,6 +24,7 @@ import {
   RouterProvider,
 } from '@tanstack/react-router'
 import {
+  flexRender,
   getCoreRowModel,
   useReactTable,
   type VisibilityState,
@@ -66,6 +67,7 @@ function Fixture(props: {
   visibility?: VisibilityState
   logs?: UsageLog[]
   loading?: boolean
+  desktopToken?: boolean
 }) {
   const columns = useCommonLogsColumns(props.admin ?? true, false)
   const context = useUsageLogsContext()
@@ -75,6 +77,15 @@ function Fixture(props: {
     getCoreRowModel: getCoreRowModel(),
     state: { columnVisibility: props.visibility ?? {} },
   })
+  if (props.desktopToken) {
+    const cell = table
+      .getRowModel()
+      .rows[0].getAllCells()
+      .find((item) => item.column.id === 'token_name')
+    return cell ? (
+      <>{flexRender(cell.column.columnDef.cell, cell.getContext())}</>
+    ) : null
+  }
   return (
     <>
       <button type='button' onClick={() => context.setSensitiveVisible(false)}>
@@ -385,3 +396,36 @@ it('shows loading placeholders without displaying stale log fields', async () =>
     screen.queryByRole('button', { name: /^Model:/ })
   ).not.toBeInTheDocument()
 })
+
+it.each([false, true])(
+  'historical token-zero logs retain actor and workspace with an empty token name on desktop=%s',
+  async (desktopToken) => {
+    await renderLogs({
+      admin: false,
+      desktopToken,
+      logs: [
+        {
+          ...log,
+          token_id: 0,
+          token_name: '',
+          attribution: {
+            state: 'ready',
+            actor: { display_name: 'Alice', username: 'alice' },
+            workspace: { kind: 'org', code: 'lab', label: 'Research lab' },
+          },
+        },
+      ],
+    })
+    if (desktopToken) {
+      expect(screen.getByText(/Member: Alice/)).toBeVisible()
+      expect(screen.getByText(/Workspace: Research lab/)).toBeVisible()
+    } else {
+      expect(
+        screen.getByRole('button', { name: 'Member: Alice' })
+      ).toBeVisible()
+      expect(
+        screen.getByRole('button', { name: 'Workspace: Research lab' })
+      ).toBeVisible()
+    }
+  }
+)

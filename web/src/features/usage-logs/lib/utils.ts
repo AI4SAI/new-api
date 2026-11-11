@@ -183,6 +183,9 @@ export function buildApiParams(config: {
   const params: GetLogsParams = {
     p: page,
     page_size: pageSize,
+    ...(searchParams.subject_ref
+      ? { subject_ref: String(searchParams.subject_ref) }
+      : {}),
     ...(searchParams.type ? { type: processType(searchParams.type) } : {}),
     ...(searchParams.model ? { model_name: String(searchParams.model) } : {}),
     ...(searchParams.token_id

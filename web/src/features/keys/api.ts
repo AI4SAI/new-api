@@ -19,15 +19,17 @@ For commercial licensing, please contact support@quantumnous.com
 import { api } from '@/lib/api'
 import { requireServerSuccess } from '@/lib/server-error-message'
 
-import type {
-  ApiKey,
-  ApiResponse,
-  GetApiKeysParams,
-  GetApiKeysResponse,
-  SearchApiKeysParams,
-  ApiKeyFormData,
-  TokenAutoGroupsConfig,
-  ManagedAccountContext,
+import {
+  managedAccountContextSchema,
+  memberCandidatesSchema,
+  type ApiKey,
+  type ApiResponse,
+  type GetApiKeysParams,
+  type GetApiKeysResponse,
+  type SearchApiKeysParams,
+  type ApiKeyFormData,
+  type TokenAutoGroupsConfig,
+  type ManagedAccountContext,
 } from './types'
 
 export function modelAccountRequest(
@@ -54,19 +56,29 @@ export async function getManagedAccountContext(
       )
     ).data
   )
-  const value = response.data as ManagedAccountContext
-  if (
-    !value ||
-    value.workspace_key !== workspaceKey ||
-    !Number.isSafeInteger(value.native_owner_id) ||
-    value.native_owner_id <= 0 ||
-    typeof value.account_label !== 'string' ||
-    !value.account_label ||
-    !['org', 'project'].includes(value.account_kind)
-  ) {
+  const parsed = managedAccountContextSchema.safeParse(response.data)
+  if (!parsed.success || parsed.data.workspace_key !== workspaceKey) {
     throw new Error('Invalid model account context')
   }
-  return value
+  return parsed.data
+}
+
+export async function getMemberCandidates(
+  workspaceKey: string,
+  query = '',
+  after = '',
+  signal?: AbortSignal
+) {
+  const params = new URLSearchParams({ query, after, limit: '50' })
+  const response = requireServerSuccess(
+    (
+      await api.get(
+        `/api/token/member-candidates?${params}`,
+        modelAccountRequest(workspaceKey, signal)
+      )
+    ).data
+  )
+  return memberCandidatesSchema.parse(response.data)
 }
 
 // ============================================================================
@@ -79,9 +91,11 @@ export async function getApiKeys(
   workspaceKey?: string,
   signal?: AbortSignal
 ): Promise<GetApiKeysResponse> {
-  const { p = 1, size = 10 } = params
+  const { p = 1, size = 10, subject_ref } = params
+  const query = new URLSearchParams({ p: String(p), size: String(size) })
+  if (subject_ref) query.set('subject_ref', subject_ref)
   const res = await api.get(
-    `/api/token/?p=${p}&size=${size}`,
+    `/api/token/?${query}`,
     modelAccountRequest(workspaceKey, signal)
   )
   return res.data
@@ -95,6 +109,7 @@ export async function searchApiKeys(
 ): Promise<GetApiKeysResponse> {
   const { keyword = '', token = '', p, size } = params
   const queryParams = new URLSearchParams()
+  if (params.subject_ref) queryParams.set('subject_ref', params.subject_ref)
   if (keyword) queryParams.set('keyword', keyword)
   if (token) queryParams.set('token', token)
   if (p != null) queryParams.set('p', String(p))
@@ -147,7 +162,7 @@ export async function createApiKey(
 
 // Update an existing API key
 export async function updateApiKey(
-  data: ApiKeyFormData & { id: number },
+  data: Partial<ApiKeyFormData> & { id: number },
   workspaceKey?: string
 ): Promise<ApiResponse<ApiKey>> {
   const res = await api.put(

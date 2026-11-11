@@ -34,10 +34,13 @@ func callLogHandler(t *testing.T, handler gin.HandlerFunc, userId int, role int,
 	ctx.Set("id", userId)
 	ctx.Set("role", role)
 	if len(managedOwner) == 1 {
-		visibility, err := model.UserTokenLogVisibility(managedOwner[0])
+		ctx.Set("session_id", "fixture-session")
+		ctx.Request.Header.Set(service.ManagedWorkspaceHeader, "org:fixture")
+		require.NoError(t, service.AuthorizeManagedAccount(ctx, "model.usage.read"))
+		scope := service.ManagementResourceScope(ctx)
+		require.Equal(t, managedOwner[0], scope.OwnerID)
+		visibility, err := scope.UserTokenLogVisibility()
 		require.NoError(t, err)
-		ctx.Set("managed_account", &service.ManagedAccount{OwnerID: managedOwner[0], ManagementRequest: service.ManagementRequest{
-			Instance: "fixture-gateway", ActorID: userId, SessionID: "fixture-session", WorkspaceKey: "org:fixture", Operation: "model.usage.read"}})
 		ctx.Set("management_token_visibility", visibility)
 	}
 	handler(ctx)
@@ -73,34 +76,52 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			legacy := seedToken(t, mainDB, 41, "unknown-old-source", "legacy-log-key")
 			require.NoError(t, mainDB.Model(external).Update("management_creator_id", 7).Error)
 			require.NoError(t, mainDB.Model(internal).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
-			credential := t.TempDir() + "/credential"
-			require.NoError(t, os.WriteFile(credential, []byte(strings.Repeat("x", 48)), 0600))
-			t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", credential)
-			t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+			externalRef, internalRef := "10000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002"
+			playgroundA, playgroundB := "10000000-0000-4000-8000-000000000003", "10000000-0000-4000-8000-000000000004"
+			require.NoError(t, mainDB.Model(external).Updates(map[string]any{"billing_context_ref": externalRef, "billing_context_confirmed": true, "managed_subject_ref": managedMemberA}).Error)
+			require.NoError(t, mainDB.Model(internal).Updates(map[string]any{"billing_context_ref": internalRef, "billing_context_confirmed": true, "managed_subject_ref": managedMemberB}).Error)
+			contexts := map[string]struct {
+				tokenID int
+				subject string
+				name    string
+			}{externalRef: {external.Id, managedMemberA, "Member A"}, internalRef: {internal.Id, managedMemberB, "Current member"},
+				playgroundA: {0, managedMemberA, "Member A"}, playgroundB: {0, managedMemberB, "Current member"}}
 			calls, attributionStatus := 0, http.StatusOK
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			account := managedControllerAccount("")
+			startManagedControllerAuthority(t, account, func(w http.ResponseWriter, r *http.Request) {
 				calls++
 				require.Equal(t, "/v1/internal/models/key-attributions", r.URL.Path)
 				var body struct {
-					OwnerID int                           `json:"native_owner_id"`
-					Tokens  []service.ManagedKeyReference `json:"tokens"`
+					SchemaVersion int                               `json:"schema_version"`
+					OwnerID       int                               `json:"native_owner_id"`
+					Tokens        []service.ManagedContextReference `json:"tokens"`
 				}
 				require.NoError(t, common.DecodeJson(r.Body, &body))
+				require.Equal(t, 2, body.SchemaVersion)
 				require.Equal(t, 41, body.OwnerID)
-				require.Equal(t, []service.ManagedKeyReference{{TokenID: internal.Id, BindingRef: "11111111-1111-4111-8111-111111111111"}}, body.Tokens)
 				if attributionStatus != http.StatusOK {
 					w.WriteHeader(attributionStatus)
 					return
 				}
-				data, err := common.Marshal(map[string]any{"schema_version": 1, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41,
-					"items": []map[string]any{{"native_token_id": internal.Id, "managed_binding_ref": body.Tokens[0].BindingRef,
-						"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: "Current member", Username: "member"},
-							Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}}}})
+				items := make([]map[string]any, 0, len(body.Tokens))
+				seen := map[string]bool{}
+				for _, ref := range body.Tokens {
+					binding, exists := contexts[ref.ContextRef]
+					require.True(t, exists)
+					require.False(t, seen[ref.ContextRef], "repeated log rows resolve once per context")
+					seen[ref.ContextRef] = true
+					require.Equal(t, binding.tokenID, ref.TokenID)
+					if account.ResourceScope.Kind == "subject" {
+						require.Equal(t, account.ResourceScope.SubjectRef, binding.subject, "SQL must filter before the attribution callback")
+					}
+					items = append(items, map[string]any{"native_token_id": ref.TokenID, "billing_context_ref": ref.ContextRef, "managed_subject_ref": binding.subject,
+						"attribution": service.ManagedKeyAttribution{State: "ready", Actor: &service.ManagedKeyActor{DisplayName: binding.name, Username: "member"},
+							Workspace: &service.ManagedKeyWorkspace{Kind: "org", Code: "org-lab", Label: "Research lab"}}})
+				}
+				data, err := common.Marshal(map[string]any{"schema_version": 2, "gateway_instance_ref": "fixture-gateway", "native_owner_id": 41, "items": items})
 				require.NoError(t, err)
 				_, _ = w.Write(data)
-			}))
-			defer server.Close()
-			t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", server.URL+"/v1/internal/models/authorize-management")
+			})
 			for _, search := range []struct {
 				name  string
 				human bool
@@ -114,13 +135,14 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			now := time.Now().Unix()
 			expression := base64.StdEncoding.EncodeToString([]byte(`tier("request", fixed(0.00075))`))
 			for _, entry := range []model.Log{
-				{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5, TokenName: "device"},
-				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100, TokenName: internal.Name},
-				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private-repeat", Quota: 5, TokenName: internal.Name},
+				{UserId: 41, TokenId: external.Id, RequestId: "external-history", Quota: 5, TokenName: "device", BillingContextRef: externalRef},
+				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private", Quota: 100, TokenName: internal.Name, BillingContextRef: internalRef},
+				{UserId: 41, TokenId: internal.Id, RequestId: "pilot-private-repeat", Quota: 5, TokenName: internal.Name, BillingContextRef: internalRef},
 				{UserId: 41, TokenId: legacy.Id, RequestId: "legacy-private", Quota: 20, TokenName: legacy.Name},
 				{UserId: 41, TokenId: 9999, RequestId: "missing-key-private", Quota: 10},
-				{UserId: 41, TokenId: 0, RequestId: "playground-private", Quota: 7},
-				{UserId: 41, TokenId: external.Id, TokenName: "Pilot", RequestId: "external-same-display", Quota: 3},
+				{UserId: 41, TokenId: 0, RequestId: "playground-private", Quota: 7, BillingContextRef: playgroundA},
+				{UserId: 41, TokenId: 0, RequestId: "other-playground-private", Quota: 11, BillingContextRef: playgroundB},
+				{UserId: 41, TokenId: external.Id, TokenName: "Pilot", RequestId: "external-same-display", Quota: 3, BillingContextRef: externalRef},
 				{UserId: 42, TokenId: external.Id, RequestId: "another-owner", Quota: 1000},
 			} {
 				entry.Type = model.LogTypeConsume
@@ -135,7 +157,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				entry.Ip = "192.0.2.3"
 				entry.ChannelId = 17
 				entry.UpstreamRequestId = "upstream-private"
-				entry.BillingContextRef = "private-context"
+				entry.ManagedSubjectRef = contexts[entry.BillingContextRef].subject
 				entry.Other = common.MapToJsonStr(map[string]any{
 					"frt": 1250, "input_tokens_total": 120, "cache_tokens": 40,
 					"model_price": 0.002, "billing_unit": "request", "billing_mode": "tiered_expr",
@@ -157,7 +179,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 			require.NoError(t, legacy.Delete())
 			listed := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
 			require.Equal(t, 1, calls, "one page resolves repeated tokens in one batch")
-			require.EqualValues(t, 7, listed["data"].(map[string]any)["total"])
+			require.EqualValues(t, 8, listed["data"].(map[string]any)["total"])
 			rows := listed["data"].(map[string]any)["items"].([]any)
 			for _, item := range rows {
 				row := item.(map[string]any)
@@ -165,7 +187,7 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 					require.Empty(t, row[field])
 				}
 				require.EqualValues(t, 0, row["channel"])
-				for _, field := range []string{"request_id", "upstream_request_id", "billing_context_ref"} {
+				for _, field := range []string{"request_id", "upstream_request_id", "billing_context_ref", "managed_subject_ref", "ManagementBillingContextRef", "ManagementSubjectRef"} {
 					require.NotContains(t, row, field)
 				}
 				require.Equal(t, "fixture-model", row["model_name"])
@@ -198,11 +220,11 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 				}
 			}
 			stat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "", 41)[0]
-			require.EqualValues(t, 150, stat["data"].(map[string]any)["quota"])
+			require.EqualValues(t, 161, stat["data"].(map[string]any)["quota"])
 			exported := callLogHandler(t, ExportUserLogs, 7, common.RoleAdminUser, "", 41)
-			require.Len(t, exported, 8)
+			require.Len(t, exported, 9)
 			require.Equal(t, 2, calls)
-			for _, row := range exported[:7] {
+			for _, row := range exported[:8] {
 				require.Empty(t, row["content"])
 				require.NotContains(t, row["other"], "private")
 				require.Contains(t, row["other"], `"frt":1250`)
@@ -211,6 +233,30 @@ func TestManagedLogsKeepUsageHistoryWithoutPrivateDetails(t *testing.T) {
 					require.Equal(t, "Current member", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
 				}
 			}
+			playgroundNames := map[string]bool{}
+			for _, row := range exported[:8] {
+				if row["token_id"] == float64(0) {
+					playgroundNames[row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"].(string)] = true
+				}
+			}
+			require.Equal(t, map[string]bool{"Member A": true, "Current member": true}, playgroundNames)
+			*account = *managedControllerAccount(managedMemberA)
+			member := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "", 41)[0]
+			require.EqualValues(t, 3, member["data"].(map[string]any)["total"])
+			require.NotContains(t, fmt.Sprint(member), "Current member")
+			memberStat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "", 41)[0]
+			require.EqualValues(t, 15, memberStat["data"].(map[string]any)["quota"])
+			memberExport := callLogHandler(t, ExportUserLogs, 7, common.RoleAdminUser, "", 41)
+			require.Len(t, memberExport, 4)
+			require.EqualValues(t, 3, memberExport[3]["data"].(map[string]any)["count"])
+			for _, row := range memberExport[:3] {
+				require.Equal(t, "Member A", row["attribution"].(map[string]any)["actor"].(map[string]any)["display_name"])
+				require.NotContains(t, row, "billing_context_ref")
+				require.NotContains(t, row, "managed_subject_ref")
+			}
+			*account = *managedControllerAccount("")
+			selected := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "subject_ref="+managedMemberA, 41)[0]
+			require.EqualValues(t, 3, selected["data"].(map[string]any)["total"])
 			byAlias := callLogHandler(t, GetUserLogs, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
 			require.EqualValues(t, 1, byAlias["data"].(map[string]any)["total"])
 			aliasStat := callLogHandler(t, GetLogsSelfStat, 7, common.RoleCommonUser, "token_name=Pilot", 41)[0]
@@ -276,6 +322,14 @@ func useLogExportDatabases(t *testing.T, mainDB *gorm.DB, logDB *gorm.DB, mainTy
 	model.DB, model.LOG_DB = mainDB, logDB
 	common.SetDatabaseTypes(mainType, logType)
 	common.RedisEnabled, common.MemoryCacheEnabled = false, false
+	t.Setenv("LOG_SQL_DSN", "")
+	master := common.IsMasterNode
+	common.IsMasterNode = false
+	err := model.InitLogDB()
+	common.IsMasterNode = master
+	require.NoError(t, err, "initialize dialect column quoting without migrating the fixture")
+	model.LOG_DB = logDB
+	common.SetLogDatabaseType(logType)
 	t.Cleanup(func() {
 		model.DB, model.LOG_DB = previousDB, previousLogDB
 		common.SetDatabaseTypes(previousMain, previousLog)

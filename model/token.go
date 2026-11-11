@@ -12,8 +12,8 @@ import (
 )
 
 type Token struct {
-	Id                      int            `json:"id"`
-	UserId                  int            `json:"user_id" gorm:"index"`
+	Id                      int            `json:"id" gorm:"index:idx_token_managed_subject,priority:3"`
+	UserId                  int            `json:"user_id" gorm:"index;index:idx_token_managed_subject,priority:1"`
 	Key                     string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
 	Status                  int            `json:"status" gorm:"default:1"`
 	Name                    string         `json:"name" gorm:"index" `
@@ -34,6 +34,7 @@ type Token struct {
 	MetadataRevision        int64          `json:"-" gorm:"not null;default:1"`
 	QuotaMutationRef        string         `json:"-" gorm:"type:varchar(32)"`
 	ManagementCreatorID     int            `json:"management_creator_id,omitempty" gorm:"not null;default:0"`
+	ManagedSubjectRef       string         `json:"managed_subject_ref,omitempty" gorm:"type:varchar(128);not null;default:'';index:idx_token_managed_subject,priority:2"`
 	ManagedBindingRef       string         `json:"managed_binding_ref,omitempty" gorm:"type:varchar(36)"`
 	BillingContextRef       *string        `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);uniqueIndex"`
 	CreationRequestSHA      string         `json:"-" gorm:"type:varchar(64)"`
@@ -41,6 +42,50 @@ type Token struct {
 	CacheSchemaVersion      int            `json:"-" gorm:"-"`
 	// 允许用此令牌查询所属用户的额度；新建令牌默认开启，已有令牌升级后保持关闭
 	AllowUserQuotaQuery bool `json:"allow_user_quota_query"`
+	resourceScope       *ManagedResourceScope
+}
+
+var ErrManagedResourceScopeDenied = errors.New("managed resource scope denied")
+
+// ManagedResourceScope comes from the trusted authorizer, never request JSON.
+// A restricted scope without a subject cannot fall back to the whole account.
+type ManagedResourceScope struct {
+	OwnerID     int
+	SubjectRef  string
+	Restricted  bool
+	StrictBatch bool
+}
+
+func validManagedSubjectRef(subject string) bool {
+	return subject != "" && len(subject) <= 128 && subject == strings.TrimSpace(subject) && !strings.ContainsRune(subject, '\x00')
+}
+
+func (scope ManagedResourceScope) apply(query *gorm.DB, prefix string) (*gorm.DB, error) {
+	if scope.OwnerID <= 0 || scope.Restricted && !validManagedSubjectRef(scope.SubjectRef) {
+		return nil, ErrManagedResourceScopeDenied
+	}
+	query = query.Where(prefix+"user_id = ?", scope.OwnerID)
+	if scope.Restricted {
+		query = query.Where(prefix+"managed_subject_ref = ?", scope.SubjectRef)
+		// Preserve the indexed predicate and exact identity with MySQL's
+		// commonly case-insensitive default text collation.
+		mysql := common.UsingMainDatabase(common.DatabaseTypeMySQL)
+		if prefix == "logs." {
+			mysql = common.UsingLogDatabase(common.DatabaseTypeMySQL)
+		}
+		if mysql {
+			query = query.Where("BINARY "+prefix+"managed_subject_ref = ?", scope.SubjectRef)
+		}
+	}
+	return query, nil
+}
+
+func (token *Token) mutationQuery(tx *gorm.DB) (*gorm.DB, error) {
+	scope := ManagedResourceScope{OwnerID: token.UserId}
+	if token.resourceScope != nil {
+		scope = *token.resourceScope
+	}
+	return scope.apply(lockForUpdate(tx), "")
 }
 
 func (token *Token) GetAutoGroups() ([]string, error) {
@@ -115,9 +160,19 @@ func (token *Token) GetIpLimits() []string {
 }
 
 func GetAllUserTokens(userId int, startIdx int, num int, externalOnly ...bool) ([]*Token, error) {
+	return (ManagedResourceScope{OwnerID: userId}).GetAllTokens(startIdx, num, externalOnly...)
+}
+
+func (scope ManagedResourceScope) GetAllTokens(startIdx int, num int, externalOnly ...bool) ([]*Token, error) {
 	var tokens []*Token
-	var err error
-	err = visibleTokenQuery(DB, externalOnly).Where("user_id = ?", userId).Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
+	query, err := scope.apply(visibleTokenQuery(DB, externalOnly), "")
+	if err != nil {
+		return nil, err
+	}
+	err = query.Order("id desc").Limit(num).Offset(startIdx).Find(&tokens).Error
+	for _, token := range tokens {
+		token.resourceScope = &scope
+	}
 	return tokens, err
 }
 
@@ -168,6 +223,10 @@ func validateLikePattern(input string) error {
 const searchHardLimit = 100
 
 func SearchUserTokens(userId int, keyword string, token string, offset int, limit int, humanMetadata bool) (tokens []*Token, total int64, err error) {
+	return (ManagedResourceScope{OwnerID: userId}).SearchTokens(keyword, token, offset, limit, humanMetadata)
+}
+
+func (scope ManagedResourceScope) SearchTokens(keyword string, token string, offset int, limit int, humanMetadata bool) (tokens []*Token, total int64, err error) {
 	// model 层强制截断
 	if limit <= 0 || limit > searchHardLimit {
 		limit = searchHardLimit
@@ -179,12 +238,16 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	if token != "" {
 		token = strings.TrimPrefix(token, "sk-")
 	}
+	baseQuery, err := scope.apply(visibleTokenQuery(DB.Model(&Token{}), []bool{humanMetadata && token != ""}), "")
+	if err != nil {
+		return nil, 0, err
+	}
 
 	// 超量用户（令牌数超过上限）只允许精确搜索，禁止模糊搜索
 	maxTokens := operation_setting.GetMaxUserTokens()
 	hasFuzzy := strings.Contains(keyword, "%") || strings.Contains(token, "%")
 	if hasFuzzy {
-		count, err := CountUserTokens(userId)
+		count, err := scope.CountTokens()
 		if err != nil {
 			common.SysLog(common.LogText("failed to count user tokens: %s", err.Error()))
 			return nil, 0, common.NewMessage("Failed to get the token count")
@@ -193,8 +256,6 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 			return nil, 0, common.NewMessage("Token count exceeds the limit. Only exact search is allowed, do not use the % wildcard")
 		}
 	}
-
-	baseQuery := visibleTokenQuery(DB.Model(&Token{}), []bool{humanMetadata && token != ""}).Where("user_id = ?", userId)
 
 	// 非空才加 LIKE 条件，空则跳过（不过滤该字段）
 	if keyword != "" {
@@ -224,6 +285,9 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 	if err != nil {
 		common.SysError(common.LogText("failed to search tokens: %s", err.Error()))
 		return nil, 0, common.NewMessage("Failed to search tokens")
+	}
+	for _, token := range tokens {
+		token.resourceScope = &scope
 	}
 	return tokens, total, nil
 }
@@ -269,12 +333,22 @@ func ValidateUserToken(key string) (token *Token, err error) {
 }
 
 func GetTokenByIds(id int, userId int, externalOnly ...bool) (*Token, error) {
-	if id == 0 || userId == 0 {
+	return (ManagedResourceScope{OwnerID: userId}).GetToken(id, externalOnly...)
+}
+
+func (scope ManagedResourceScope) GetToken(id int, externalOnly ...bool) (*Token, error) {
+	if id <= 0 {
 		return nil, common.NewMessage("Token ID or user ID is empty")
 	}
-	token := Token{Id: id, UserId: userId}
-	var err error = nil
-	err = visibleTokenQuery(DB, externalOnly).First(&token, "id = ? and user_id = ?", id, userId).Error
+	query, err := scope.apply(visibleTokenQuery(DB, externalOnly), "")
+	if err != nil {
+		return nil, err
+	}
+	token := Token{Id: id, resourceScope: &scope}
+	err = query.First(&token, "id = ?", id).Error
+	if scope.Restricted && errors.Is(err, gorm.ErrRecordNotFound) {
+		err = ErrManagedResourceScopeDenied
+	}
 	return &token, err
 }
 
@@ -366,7 +440,7 @@ func GetTokenByBillingContext(userID int, reference string) (*Token, error) {
 // InsertPendingBillingToken creates one disabled key per immutable context.
 // A retry never changes the original key, parameters, or later user status.
 func (token *Token) InsertPendingBillingToken() error {
-	if token.BillingContextRef == nil || *token.BillingContextRef == "" || len(token.CreationRequestSHA) != 64 {
+	if token.BillingContextRef == nil || *token.BillingContextRef == "" || len(token.CreationRequestSHA) != 64 || token.ManagedSubjectRef != "" {
 		return ErrBillingContextConflict
 	}
 	var previous Token
@@ -396,7 +470,12 @@ func (token *Token) InsertPendingBillingToken() error {
 	return err
 }
 
-func (token *Token) ConfirmBillingContext() (err error) {
+// ConfirmBillingContext accepts a subject only from the trusted creation receipt.
+// Existing confirmed attribution, including legacy empty attribution, is immutable.
+func (token *Token) ConfirmBillingContext(subject ...string) (err error) {
+	if len(subject) > 1 || len(subject) == 1 && subject[0] != "" && !validManagedSubjectRef(subject[0]) {
+		return ErrBillingContextConflict
+	}
 	var attempted int64
 	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
 	err = DB.Transaction(func(tx *gorm.DB) error {
@@ -407,19 +486,29 @@ func (token *Token) ConfirmBillingContext() (err error) {
 		if current.BillingContextRef == nil || token.BillingContextRef == nil || *current.BillingContextRef != *token.BillingContextRef || current.CreationRequestSHA != token.CreationRequestSHA {
 			return ErrBillingContextConflict
 		}
+		if current.BillingContextConfirmed && len(subject) == 1 && current.ManagedSubjectRef != subject[0] {
+			return ErrBillingContextConflict
+		}
 		if !current.BillingContextConfirmed {
+			if len(subject) == 1 {
+				if current.ManagedSubjectRef != "" && current.ManagedSubjectRef != subject[0] {
+					return ErrBillingContextConflict
+				}
+				current.ManagedSubjectRef = subject[0]
+			}
 			next := max(current.MetadataRevision, 1) + 1
 			attempted, token.Key = next, current.Key
 			if err := setTokenMetadataFence(current.Key, next); err != nil {
 				return err
 			}
 			if err := tx.Model(&current).Updates(map[string]any{"billing_context_confirmed": true, "status": common.TokenStatusEnabled,
-				"metadata_revision": next}).Error; err != nil {
+				"metadata_revision": next, "managed_subject_ref": current.ManagedSubjectRef}).Error; err != nil {
 				return err
 			}
 			current.BillingContextConfirmed, current.Status = true, common.TokenStatusEnabled
 			current.MetadataRevision = next
 		}
+		current.resourceScope = token.resourceScope
 		*token = current
 		return nil
 	})
@@ -440,6 +529,9 @@ type TokenQuotaAdjustment struct {
 // Update never writes a loaded balance. Explicit quota increments are bound to
 // a management revision, so a lost response cannot turn a retry into more quota.
 func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
+	if token.resourceScope != nil && token.resourceScope.Restricted {
+		return ErrManagedResourceScopeDenied
+	}
 	var attempted int64
 	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
 	if len(adjustments) > 1 {
@@ -469,8 +561,15 @@ func (token *Token) Update(adjustments ...TokenQuotaAdjustment) (err error) {
 	}
 	err = DB.Transaction(func(tx *gorm.DB) (writeErr error) {
 		var current Token
-		if writeErr = lockForUpdate(tx).First(&current, token.Id).Error; writeErr != nil {
+		lockedQuery, writeErr := token.mutationQuery(tx)
+		if writeErr != nil {
 			return writeErr
+		}
+		if writeErr = lockedQuery.First(&current, token.Id).Error; writeErr != nil {
+			return writeErr
+		}
+		if current.ManagedSubjectRef != token.ManagedSubjectRef {
+			return ErrManagedResourceScopeDenied
 		}
 		if delta != 0 {
 			if current.QuotaRevision != adjustment.ExpectedRevision {
@@ -578,6 +677,14 @@ func (token *Token) SelectUpdate() (err error) {
 	return token.mutateMetadata(map[string]any{"status": token.Status}, false)
 }
 
+// UpdateManagedName cannot overwrite concurrently updated quota or routing.
+func (token *Token) UpdateManagedName(name string) error {
+	if len(name) > 50 {
+		return errors.New("token name is too long")
+	}
+	return token.mutateMetadata(map[string]any{"name": name}, false)
+}
+
 func (token *Token) Delete() (err error) {
 	return token.mutateMetadata(nil, true)
 }
@@ -588,8 +695,25 @@ func (token *Token) mutateMetadata(fields map[string]any, deleting bool) (err er
 	defer func() { token.resolveMetadataOutcome(&err, attempted) }()
 	err = DB.Transaction(func(tx *gorm.DB) error {
 		var current Token
-		if err := lockForUpdate(tx).First(&current, token.Id).Error; err != nil {
+		query, err := token.mutationQuery(tx)
+		if err != nil {
 			return err
+		}
+		if err := query.First(&current, token.Id).Error; err != nil {
+			if token.resourceScope != nil && token.resourceScope.Restricted && errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrManagedResourceScopeDenied
+			}
+			return err
+		}
+		if current.ManagedSubjectRef != token.ManagedSubjectRef {
+			return ErrManagedResourceScopeDenied
+		}
+		if token.resourceScope != nil && token.resourceScope.Restricted {
+			for field, value := range fields {
+				if field != "name" && (field != "status" || value != common.TokenStatusDisabled) {
+					return ErrManagedResourceScopeDenied
+				}
+			}
 		}
 		next := max(current.MetadataRevision, 1) + 1
 		attempted, token.Key = next, current.Key
@@ -609,6 +733,9 @@ func (token *Token) mutateMetadata(fields map[string]any, deleting bool) (err er
 			}
 		}
 		token.Key, token.MetadataRevision = current.Key, next
+		if name, ok := fields["name"].(string); ok {
+			token.Name = name
+		}
 		return nil
 	})
 	if err == nil {
@@ -742,18 +869,60 @@ func decreaseTokenQuota(id int, quota int) (err error) {
 
 // CountUserTokens returns total number of tokens for the given user, used for pagination
 func CountUserTokens(userId int, externalOnly ...bool) (int64, error) {
+	return (ManagedResourceScope{OwnerID: userId}).CountTokens(externalOnly...)
+}
+
+func (scope ManagedResourceScope) CountTokens(externalOnly ...bool) (int64, error) {
 	var total int64
-	err := visibleTokenQuery(DB.Model(&Token{}), externalOnly).Where("user_id = ?", userId).Count(&total).Error
+	query, err := scope.apply(visibleTokenQuery(DB.Model(&Token{}), externalOnly), "")
+	if err != nil {
+		return 0, err
+	}
+	err = query.Count(&total).Error
 	return total, err
+}
+
+func (scope ManagedResourceScope) batch(query *gorm.DB, ids []int, externalOnly []bool) ([]Token, error) {
+	if scope.Restricted || scope.StrictBatch {
+		query = query.Unscoped()
+	}
+	query, err := scope.apply(visibleTokenQuery(query, externalOnly), "")
+	if err != nil {
+		return nil, err
+	}
+	var tokens []Token
+	if err := query.Where("id IN ?", ids).Find(&tokens).Error; err != nil {
+		return nil, err
+	}
+	if scope.Restricted || scope.StrictBatch {
+		unique := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			if id <= 0 {
+				return nil, ErrManagedResourceScopeDenied
+			}
+			unique[id] = struct{}{}
+		}
+		if len(tokens) != len(unique) {
+			return nil, ErrManagedResourceScopeDenied
+		}
+	}
+	return tokens, nil
 }
 
 // BatchDeleteTokens 删除指定用户的一组令牌，返回成功删除数量
 func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, operationErr error) {
+	return (ManagedResourceScope{OwnerID: userId}).BatchDeleteTokens(ids, externalOnly...)
+}
+
+func (scope ManagedResourceScope) BatchDeleteTokens(ids []int, externalOnly ...bool) (count int, operationErr error) {
 	if len(ids) == 0 {
 		return 0, common.NewMessage("Token IDs cannot be empty")
 	}
 
 	tx := DB.Begin()
+	if tx.Error != nil {
+		return 0, tx.Error
+	}
 
 	var tokens []Token
 	defer func() {
@@ -761,9 +930,15 @@ func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, 
 			tokens[i].resolveMetadataOutcome(&operationErr, tokens[i].MetadataRevision)
 		}
 	}()
-	if err := lockForUpdate(visibleTokenQuery(tx, externalOnly)).Where("user_id = ? AND id IN (?)", userId, ids).Find(&tokens).Error; err != nil {
+	selected, err := scope.batch(lockForUpdate(tx), ids, externalOnly)
+	if err != nil {
 		tx.Rollback()
 		return 0, err
+	}
+	for _, token := range selected {
+		if !token.DeletedAt.Valid {
+			tokens = append(tokens, token)
+		}
 	}
 	for i := range tokens {
 		tokens[i].MetadataRevision = max(tokens[i].MetadataRevision, 1) + 1
@@ -777,7 +952,12 @@ func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, 
 		}
 	}
 
-	if err := visibleTokenQuery(tx, externalOnly).Where("user_id = ? AND id IN (?)", userId, ids).Delete(&Token{}).Error; err != nil {
+	query, err := scope.apply(visibleTokenQuery(tx, externalOnly), "")
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
+	if err := query.Where("id IN ?", ids).Delete(&Token{}).Error; err != nil {
 		tx.Rollback()
 		return 0, err
 	}
@@ -795,11 +975,21 @@ func BatchDeleteTokens(ids []int, userId int, externalOnly ...bool) (count int, 
 }
 
 func GetTokenKeysByIds(ids []int, userId int, externalOnly ...bool) ([]Token, error) {
-	var tokens []Token
-	err := visibleTokenQuery(DB, externalOnly).Where("billing_context_ref IS NULL OR billing_context_confirmed = ?", true).Select("id", commonKeyCol).
-		Where("user_id = ? AND id IN (?)", userId, ids).
-		Find(&tokens).Error
-	return tokens, err
+	return (ManagedResourceScope{OwnerID: userId}).GetTokenKeys(ids, externalOnly...)
+}
+
+func (scope ManagedResourceScope) GetTokenKeys(ids []int, externalOnly ...bool) ([]Token, error) {
+	selected, err := scope.batch(DB, ids, externalOnly)
+	if err != nil {
+		return nil, err
+	}
+	tokens := make([]Token, 0, len(selected))
+	for _, token := range selected {
+		if !token.DeletedAt.Valid && (token.BillingContextRef == nil || token.BillingContextConfirmed) {
+			tokens = append(tokens, Token{Id: token.Id, Key: token.Key})
+		}
+	}
+	return tokens, nil
 }
 
 // InvalidateUserTokensCache 清理指定用户所有令牌在 Redis 中的缓存，
@@ -853,9 +1043,16 @@ type TokenLogVisibility struct {
 // Derive disclosure from immutable provenance, including retired credentials.
 // Log and primary databases can be separate; names never establish provenance.
 func UserTokenLogVisibility(userID int) (map[int]TokenLogVisibility, error) {
+	return (ManagedResourceScope{OwnerID: userID}).UserTokenLogVisibility()
+}
+
+func (scope ManagedResourceScope) UserTokenLogVisibility() (map[int]TokenLogVisibility, error) {
 	var tokens []Token
-	err := DB.Unscoped().Select("id", "managed_binding_ref").Where("user_id = ?", userID).Find(&tokens).Error
+	query, err := scope.apply(DB.Unscoped().Select("id", "managed_binding_ref"), "")
 	if err != nil {
+		return nil, err
+	}
+	if err := query.Find(&tokens).Error; err != nil {
 		return nil, err
 	}
 	visibility := make(map[int]TokenLogVisibility, len(tokens))

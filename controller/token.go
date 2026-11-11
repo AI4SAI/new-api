@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -43,7 +44,27 @@ type tokenRequest struct {
 	QuotaDelta  *int                 `json:"quota_delta"`
 	AutoGroups  tokenAutoGroupsInput `json:"auto_groups"`
 	// 指针区分“未传”和显式 false：新建时未传即开启，更新时未传则保留原值。
-	AllowUserQuotaQuery *bool `json:"allow_user_quota_query"`
+	AllowUserQuotaQuery *bool  `json:"allow_user_quota_query"`
+	AssigneeRef         string `json:"assignee_ref"`
+	providedFields      map[string]bool
+}
+
+func (request *tokenRequest) UnmarshalJSON(data []byte) error {
+	type plain tokenRequest
+	var decoded plain
+	if err := common.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]any
+	if err := common.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*request = tokenRequest(decoded)
+	request.providedFields = make(map[string]bool, len(fields))
+	for field := range fields {
+		request.providedFields[field] = true
+	}
+	return nil
 }
 
 type tokenResponse struct {
@@ -51,6 +72,60 @@ type tokenResponse struct {
 	AutoGroups  []string                       `json:"auto_groups"`
 	Managed     bool                           `json:"managed"`
 	Attribution *service.ManagedKeyAttribution `json:"attribution,omitempty"`
+}
+
+func managedTokenError(c *gin.Context, err error) {
+	if errors.Is(err, model.ErrManagedResourceScopeDenied) || errors.Is(err, service.ErrManagedAccountDenied) {
+		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
+		return
+	}
+	common.ApiError(c, err)
+}
+
+func managedTokenUpdateAllowed(c *gin.Context, previous *model.Token, request tokenRequest, statusOnly bool) bool {
+	account := service.ManagementAccount(c)
+	if account == nil {
+		return true
+	}
+	if statusOnly {
+		return slices.Contains(account.AllowedStatuses, request.Status)
+	}
+	if account.ResourceScope.Kind == "subject" && !request.providedFields["name"] {
+		return false
+	}
+	token := request.Token
+	changes := map[string]bool{
+		"name":                   token.Name != previous.Name,
+		"expired_time":           token.ExpiredTime != previous.ExpiredTime,
+		"unlimited_quota":        token.UnlimitedQuota != previous.UnlimitedQuota,
+		"model_limits_enabled":   token.ModelLimitsEnabled != previous.ModelLimitsEnabled,
+		"model_limits":           token.ModelLimits != previous.ModelLimits,
+		"group":                  token.Group != previous.Group,
+		"cross_group_retry":      token.CrossGroupRetry != previous.CrossGroupRetry,
+		"quota_delta":            request.QuotaDelta != nil && *request.QuotaDelta != 0,
+		"allow_user_quota_query": request.AllowUserQuotaQuery != nil && *request.AllowUserQuotaQuery != previous.AllowUserQuotaQuery,
+	}
+	oldIPs, newIPs := "", ""
+	if previous.AllowIps != nil {
+		oldIPs = *previous.AllowIps
+	}
+	if token.AllowIps != nil {
+		newIPs = *token.AllowIps
+	}
+	changes["allow_ips"] = oldIPs != newIPs
+	if request.AutoGroups.Set {
+		previousGroups, err := previous.GetAutoGroups()
+		if err != nil {
+			return false
+		}
+		changes["auto_groups"] = !slices.Equal(previousGroups, request.AutoGroups.Groups)
+	}
+	for field, changed := range changes {
+		if changed && (request.providedFields[field] || account.ResourceScope.Kind != "subject") && !slices.Contains(account.AllowedUpdateFields, field) {
+			return false
+		}
+	}
+	return true
 }
 
 func maxTokenQuota() int {
@@ -71,6 +146,7 @@ func buildMaskedTokenResponse(token *model.Token, machine ...bool) *tokenRespons
 	maskedToken.Key = token.GetMaskedKey()
 	if len(machine) == 0 || !machine[0] {
 		maskedToken.BillingContextRef = nil
+		maskedToken.ManagedSubjectRef = ""
 	}
 	managed := token.ManagedBindingRef != ""
 	if managed && (len(machine) == 0 || !machine[0]) {
@@ -107,13 +183,13 @@ func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, 
 	if machine || service.ManagementAccount(c) == nil {
 		return responses, true
 	}
-	references := make([]service.ManagedKeyReference, 0, len(tokens))
+	references := make([]service.ManagedContextReference, 0, len(tokens))
 	for _, token := range tokens {
-		if token.ManagedBindingRef != "" {
-			references = append(references, service.ManagedKeyReference{TokenID: token.Id, BindingRef: token.ManagedBindingRef})
+		if token.BillingContextConfirmed && token.BillingContextRef != nil && *token.BillingContextRef != "" {
+			references = append(references, service.ManagedContextReference{TokenID: token.Id, ContextRef: *token.BillingContextRef})
 		}
 	}
-	attributions, err := service.ReadManagedKeyAttributions(c, references)
+	attributions, err := service.ReadManagedContextAttributions(c, references)
 	if errors.Is(err, service.ErrManagedAccountDenied) {
 		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
 		return nil, false
@@ -121,9 +197,11 @@ func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, 
 	if err != nil {
 		common.SysError(common.LogText("managed key attribution unavailable"))
 	}
-	for _, response := range responses {
-		if attribution := attributions[response.Id]; attribution != nil {
-			response.Attribution = attribution
+	for i, token := range tokens {
+		if token.BillingContextRef != nil {
+			if attribution := attributions[*token.BillingContextRef]; attribution != nil {
+				responses[i].Attribution = attribution
+			}
 		}
 	}
 	return responses, true
@@ -131,7 +209,7 @@ func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, 
 
 func getTokenRequestUserGroup(c *gin.Context) (string, error) {
 	if service.ManagementAccount(c) != nil {
-		return model.GetUserGroup(service.ManagementOwnerID(c), false)
+		return model.GetUserGroup(service.ManagementResourceScope(c).OwnerID, false)
 	}
 	if userGroup := common.GetContextKeyString(c, constant.ContextKeyUserGroup); userGroup != "" {
 		return userGroup, nil
@@ -183,14 +261,18 @@ func setTokenAutoGroups(c *gin.Context, token *model.Token, groups []string) boo
 }
 
 func GetAllTokens(c *gin.Context) {
-	userId := service.ManagementOwnerID(c)
+	scope := service.ManagementResourceScope(c)
 	pageInfo := common.GetPageQuery(c)
-	tokens, err := model.GetAllUserTokens(userId, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	tokens, err := scope.GetAllTokens(pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
-	total, _ := model.CountUserTokens(userId)
+	total, err := scope.CountTokens()
+	if err != nil {
+		managedTokenError(c, err)
+		return
+	}
 	pageInfo.SetTotal(int(total))
 	items, ok := presentTokenPage(c, tokens)
 	if !ok {
@@ -201,15 +283,15 @@ func GetAllTokens(c *gin.Context) {
 }
 
 func SearchTokens(c *gin.Context) {
-	userId := service.ManagementOwnerID(c)
+	scope := service.ManagementResourceScope(c)
 	keyword := c.Query("keyword")
 	token := c.Query("token")
 
 	pageInfo := common.GetPageQuery(c)
 
-	tokens, total, err := model.SearchUserTokens(userId, keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), !c.GetBool("access_token_managed"))
+	tokens, total, err := scope.SearchTokens(keyword, token, pageInfo.GetStartIdx(), pageInfo.GetPageSize(), !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	pageInfo.SetTotal(int(total))
@@ -223,14 +305,14 @@ func SearchTokens(c *gin.Context) {
 
 func GetToken(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := service.ManagementOwnerID(c)
+	scope := service.ManagementResourceScope(c)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId)
+	token, err := scope.GetToken(id)
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	items, ok := presentTokenPage(c, []*model.Token{token})
@@ -253,14 +335,14 @@ func GetTokenAutoGroups(c *gin.Context) {
 
 func GetTokenKey(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
-	userId := service.ManagementOwnerID(c)
+	scope := service.ManagementResourceScope(c)
 	if err != nil {
 		common.ApiError(c, err)
 		return
 	}
-	token, err := model.GetTokenByIds(id, userId, !c.GetBool("access_token_managed"))
+	token, err := scope.GetToken(id, !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	if token.BillingContextRef != nil && !token.BillingContextConfirmed {
@@ -372,6 +454,11 @@ func AddToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
+	account := service.ManagementAccount(c)
+	if account == nil && request.AssigneeRef != "" || account != nil && request.AssigneeRef != account.AssigneeRef {
+		managedTokenError(c, service.ErrManagedAccountDenied)
+		return
+	}
 	if request.RemainQuota != nil {
 		token.RemainQuota = *request.RemainQuota
 	}
@@ -379,7 +466,7 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if token.ManagementCreatorID != 0 || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
+	if token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -485,7 +572,8 @@ func AddToken(c *gin.Context) {
 		}
 		parameters, marshalErr := common.Marshal(map[string]any{"owner": cleanToken.UserId, "creator": c.GetInt("id"),
 			"workspace": c.GetHeader(service.ManagedWorkspaceHeader), "managed_ref": cleanToken.ManagedBindingRef,
-			"name": cleanToken.Name, "expiry": cleanToken.ExpiredTime, "quota": cleanToken.RemainQuota,
+			"assignee_ref": request.AssigneeRef,
+			"name":         cleanToken.Name, "expiry": cleanToken.ExpiredTime, "quota": cleanToken.RemainQuota,
 			"unlimited": cleanToken.UnlimitedQuota, "models_enabled": cleanToken.ModelLimitsEnabled,
 			"models": cleanToken.ModelLimits, "ips": cleanToken.AllowIps, "group": cleanToken.Group,
 			"cross_group_retry": cleanToken.CrossGroupRetry, "auto_groups": cleanToken.AutoGroups,
@@ -500,7 +588,7 @@ func AddToken(c *gin.Context) {
 		if err == nil && !cleanToken.BillingContextConfirmed {
 			err = service.RegisterModelKey(c, &cleanToken)
 			if err == nil {
-				err = cleanToken.ConfirmBillingContext()
+				err = cleanToken.ConfirmBillingContext(cleanToken.ManagedSubjectRef)
 			}
 		}
 	} else {
@@ -528,17 +616,17 @@ func AddToken(c *gin.Context) {
 
 func DeleteToken(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
-	userId := service.ManagementOwnerID(c)
-	token, err := model.GetTokenByIds(id, userId, !c.GetBool("access_token_managed"))
+	scope := service.ManagementResourceScope(c)
+	token, err := scope.GetToken(id, !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	params := tokenAuditParams(c)
 	params["id"], params["name"] = token.Id, token.Name
 	err = token.Delete()
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
@@ -549,7 +637,7 @@ func DeleteToken(c *gin.Context) {
 }
 
 func UpdateToken(c *gin.Context) {
-	userId := service.ManagementOwnerID(c)
+	scope := service.ManagementResourceScope(c)
 	statusOnly := c.Query("status_only")
 	request := tokenRequest{}
 	err := c.ShouldBindJSON(&request)
@@ -558,7 +646,7 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
-	if token.ManagementCreatorID != 0 || token.ManagedBindingRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
+	if request.AssigneeRef != "" || token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.ManagedBindingRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -590,9 +678,13 @@ func UpdateToken(c *gin.Context) {
 		common.ApiErrorT(c, "Token name is too long")
 		return
 	}
-	cleanToken, err := model.GetTokenByIds(token.Id, userId, !c.GetBool("access_token_managed"))
+	cleanToken, err := scope.GetToken(token.Id, !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
+		return
+	}
+	if !managedTokenUpdateAllowed(c, cleanToken, request, statusOnly != "") {
+		managedTokenError(c, service.ErrManagedAccountDenied)
 		return
 	}
 	if cleanToken.ManagementCreatorID > 0 && request.AllowUserQuotaQuery != nil && *request.AllowUserQuotaQuery {
@@ -639,7 +731,9 @@ func UpdateToken(c *gin.Context) {
 			}
 		}
 	}
-	if statusOnly != "" {
+	if scope.Restricted && statusOnly == "" {
+		err = cleanToken.UpdateManagedName(token.Name)
+	} else if statusOnly != "" {
 		err = cleanToken.SelectUpdate()
 	} else {
 		if delta == 0 {
@@ -657,14 +751,14 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	params["name"] = cleanToken.Name
 	if delta != 0 {
 		params["quota_delta"] = delta
 	}
-	if updated, loadErr := model.GetTokenByIds(cleanToken.Id, userId); loadErr == nil {
+	if updated, loadErr := scope.GetToken(cleanToken.Id); loadErr == nil {
 		cleanToken = updated
 	}
 	if statusOnly != "" {
@@ -717,10 +811,10 @@ func DeleteTokenBatch(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	userId := service.ManagementOwnerID(c)
-	count, err := model.BatchDeleteTokens(tokenBatch.Ids, userId, !c.GetBool("access_token_managed"))
+	scope := service.ManagementResourceScope(c)
+	count, err := scope.BatchDeleteTokens(tokenBatch.Ids, !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	params["count"] = count
@@ -747,10 +841,10 @@ func GetTokenKeysBatch(c *gin.Context) {
 		common.ApiErrorT(c, "Too many items in batch request, maximum is {{max}}", map[string]any{"max": 100})
 		return
 	}
-	userId := service.ManagementOwnerID(c)
-	tokens, err := model.GetTokenKeysByIds(tokenBatch.Ids, userId, !c.GetBool("access_token_managed"))
+	scope := service.ManagementResourceScope(c)
+	tokens, err := scope.GetTokenKeys(tokenBatch.Ids, !c.GetBool("access_token_managed"))
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	keysMap := make(map[int]string)
@@ -771,5 +865,25 @@ func GetManagedAccountContext(c *gin.Context) {
 		common.ApiErrorStatus(c, http.StatusForbidden, common.NewMessage("Managed account access is unavailable"))
 		return
 	}
-	common.ApiSuccess(c, gin.H{"workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID, "account_label": account.Label, "account_kind": account.Kind})
+	common.ApiSuccess(c, gin.H{"workspace_key": account.WorkspaceKey, "native_owner_id": account.OwnerID, "account_label": account.Label, "account_kind": account.Kind,
+		"schema_version": account.SchemaVersion, "resource_scope": account.ResourceScope, "allowed_actions": account.AllowedActions,
+		"allowed_update_fields": account.AllowedUpdateFields, "allowed_statuses": account.AllowedStatuses})
+}
+
+func GetManagedMemberCandidates(c *gin.Context) {
+	limit := 50
+	if value := c.Query("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			common.ApiErrorT(c, "Invalid parameters")
+			return
+		}
+		limit = parsed
+	}
+	result, err := service.ReadManagedMemberCandidates(c, c.Query("query"), c.Query("after"), limit)
+	if err != nil {
+		managedTokenError(c, err)
+		return
+	}
+	common.ApiSuccess(c, result)
 }

@@ -59,9 +59,9 @@ func sanitizeClickHouseLikePattern(input string) (string, error) {
 }
 
 type Log struct {
-	Id                     int               `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2;index:idx_model_usage_completion,priority:3"`
-	UserId                 int               `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1;index:idx_model_usage_period,priority:1;index:idx_model_usage_completion,priority:1;index:idx_model_usage_observed,priority:1"`
-	CreatedAt              int64             `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type;index:idx_model_usage_observed,priority:3"`
+	Id                     int               `json:"id" gorm:"index:idx_created_at_id,priority:2;index:idx_user_id_id,priority:2;index:idx_model_usage_completion,priority:3;index:idx_log_managed_subject,priority:3"`
+	UserId                 int               `json:"user_id" gorm:"index;index:idx_user_id_id,priority:1;index:idx_model_usage_period,priority:1;index:idx_model_usage_completion,priority:1;index:idx_model_usage_observed,priority:1;index:idx_log_managed_subject,priority:1;index:idx_log_managed_subject_time,priority:1"`
+	CreatedAt              int64             `json:"created_at" gorm:"bigint;index:idx_created_at_id,priority:1;index:idx_created_at_type;index:idx_model_usage_observed,priority:3;index:idx_log_managed_subject_time,priority:3"`
 	Type                   int               `json:"type" gorm:"index:idx_created_at_type"`
 	Content                string            `json:"content"`
 	Username               string            `json:"username" gorm:"index;index:index_username_model_name,priority:2;default:''"`
@@ -75,6 +75,7 @@ type Log struct {
 	ChannelId              int               `json:"channel" gorm:"index"`
 	ChannelName            string            `json:"channel_name" gorm:"->"`
 	TokenId                int               `json:"token_id" gorm:"default:0;index"`
+	ManagedSubjectRef      string            `json:"managed_subject_ref,omitempty" gorm:"type:varchar(128);not null;default:'';index:idx_log_managed_subject,priority:2;index:idx_log_managed_subject_time,priority:2"`
 	BillingContextRef      string            `json:"billing_context_ref,omitempty" gorm:"type:varchar(36);index;index:idx_model_usage_period,priority:2;index:idx_model_usage_completion,priority:2;index:idx_model_usage_observed,priority:2"`
 	BillingPolicyEpoch     string            `json:"policy_epoch,omitempty" gorm:"type:varchar(20);not null;default:'';index:idx_model_usage_period,priority:3"`
 	RequestStartedAt       int64             `json:"request_started_at,omitempty" gorm:"not null;default:0;index:idx_model_usage_period,priority:4"`
@@ -88,6 +89,9 @@ type Log struct {
 	MeteredInputTokens     *int64            `json:"-"`
 	MeteredCacheReadTokens *int64            `json:"-"`
 	MeteredOutputTokens    *int64            `json:"-"`
+
+	ManagementBillingContextRef string `json:"-" gorm:"-"`
+	ManagementSubjectRef        string `json:"-" gorm:"-"`
 }
 
 // don't use iota, avoid change log type value
@@ -136,6 +140,9 @@ func formatUserLogs(logs []*Log, startIdx int, tokenVisibility ...map[int]TokenL
 }
 
 func formatUserLog(log *Log, tokenVisibility ...map[int]TokenLogVisibility) {
+	log.ManagementBillingContextRef = log.BillingContextRef
+	log.ManagementSubjectRef = log.ManagedSubjectRef
+	log.ManagedSubjectRef = ""
 	if log.Type == LogTypeConsume {
 		log.Metering = log.TokenMetering()
 	}
@@ -330,21 +337,23 @@ func RecordErrorLog(c *gin.Context, userId int, channelId int, modelName string,
 		}
 	}
 	log := &Log{
-		UserId:           userId,
-		Username:         username,
-		CreatedAt:        common.GetTimestamp(),
-		Type:             LogTypeError,
-		Content:          content,
-		PromptTokens:     0,
-		CompletionTokens: 0,
-		TokenName:        tokenName,
-		ModelName:        modelName,
-		Quota:            0,
-		ChannelId:        channelId,
-		TokenId:          tokenId,
-		UseTime:          useTimeSeconds,
-		IsStream:         isStream,
-		Group:            group,
+		UserId:            userId,
+		Username:          username,
+		CreatedAt:         common.GetTimestamp(),
+		Type:              LogTypeError,
+		Content:           content,
+		PromptTokens:      0,
+		CompletionTokens:  0,
+		TokenName:         tokenName,
+		ModelName:         modelName,
+		Quota:             0,
+		ChannelId:         channelId,
+		TokenId:           tokenId,
+		ManagedSubjectRef: c.GetString("managed_subject_ref"),
+		BillingContextRef: c.GetString("model_billing_context_ref"),
+		UseTime:           useTimeSeconds,
+		IsStream:          isStream,
+		Group:             group,
 		Ip: func() string {
 			if needRecordIp {
 				return c.ClientIP()
@@ -408,6 +417,7 @@ func RecordConsumeLog(c *gin.Context, userId int, params RecordConsumeLogParams)
 		Quota:              params.Quota,
 		ChannelId:          params.ChannelId,
 		TokenId:            params.TokenId,
+		ManagedSubjectRef:  c.GetString("managed_subject_ref"),
 		BillingContextRef:  c.GetString("model_billing_context_ref"),
 		BillingPolicyEpoch: c.GetString("model_billing_policy_epoch"),
 		RequestStartedAt:   c.GetInt64("model_billing_request_started_at"),
@@ -464,26 +474,35 @@ func RecordTaskBillingLog(params RecordTaskBillingLogParams) {
 	}
 	username, _ := GetUsernameById(params.UserId, false)
 	tokenName := ""
+	subjectRef := ""
+	billingContextRef := ""
 	if params.TokenId > 0 {
-		if token, err := GetTokenById(params.TokenId); err == nil {
+		var token Token
+		if err := DB.Unscoped().Where("id = ? AND user_id = ?", params.TokenId, params.UserId).First(&token).Error; err == nil {
 			tokenName = token.Name
+			subjectRef = token.ManagedSubjectRef
+			if token.BillingContextRef != nil {
+				billingContextRef = *token.BillingContextRef
+			}
 		}
 	}
 	createdAt := common.GetTimestamp()
 	other := params.Other
 	log := &Log{
-		UserId:    params.UserId,
-		Username:  username,
-		CreatedAt: createdAt,
-		Type:      params.LogType,
-		Content:   other.setContent(params.Content),
-		TokenName: tokenName,
-		ModelName: params.ModelName,
-		Quota:     params.Quota,
-		ChannelId: params.ChannelId,
-		TokenId:   params.TokenId,
-		Group:     params.Group,
-		Other:     other.JSONString(),
+		UserId:            params.UserId,
+		Username:          username,
+		CreatedAt:         createdAt,
+		Type:              params.LogType,
+		Content:           other.setContent(params.Content),
+		TokenName:         tokenName,
+		ModelName:         params.ModelName,
+		Quota:             params.Quota,
+		ChannelId:         params.ChannelId,
+		TokenId:           params.TokenId,
+		ManagedSubjectRef: subjectRef,
+		BillingContextRef: billingContextRef,
+		Group:             params.Group,
+		Other:             other.JSONString(),
 	}
 	err := createLog(log)
 	if err != nil {
@@ -523,6 +542,7 @@ type LogFilter struct {
 	UpstreamRequestId  string
 	UserID             *int
 	TokenID            *int
+	ResourceScope      *ManagedResourceScope
 	TokenVisibility    map[int]TokenLogVisibility
 	BillingContextRef  *string
 	BillingPolicyEpoch *string
@@ -533,6 +553,12 @@ type LogFilter struct {
 
 func (f LogFilter) apply(tx *gorm.DB) (*gorm.DB, error) {
 	var err error
+	if f.ResourceScope != nil {
+		tx, err = f.ResourceScope.apply(tx, "logs.")
+		if err != nil {
+			return nil, err
+		}
+	}
 	if f.Context != nil {
 		tx = tx.WithContext(f.Context)
 	}

@@ -63,8 +63,10 @@ func logFilterFromQuery(c *gin.Context, admin bool) model.LogFilter {
 			visibility = map[int]model.TokenLogVisibility{}
 		}
 		filter.TokenVisibility = visibility
-		owner := service.ManagementOwnerID(c)
+		scope := service.ManagementResourceScope(c)
+		owner := scope.OwnerID
 		filter.UserID = &owner
+		filter.ResourceScope = &scope
 	}
 	return filter
 }
@@ -116,9 +118,9 @@ func GetUserLogs(c *gin.Context) {
 		}
 		filter.StartTimestamp = startTimestamp
 	}
-	logs, total, err := model.GetUserLogs(service.ManagementOwnerID(c), filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
+	logs, total, err := model.GetUserLogs(service.ManagementResourceScope(c).OwnerID, filter, pageInfo.GetStartIdx(), pageInfo.GetPageSize())
 	if err != nil {
-		common.ApiError(c, err)
+		managedTokenError(c, err)
 		return
 	}
 	items, err := presentUsageLogPage(c, logs, filter.TokenVisibility)
@@ -141,19 +143,22 @@ type usageLogResponse struct {
 // The stored name, billing facts and private-log projection remain unchanged.
 func presentUsageLogPage(c *gin.Context, logs []*model.Log, visibility map[int]model.TokenLogVisibility) ([]usageLogResponse, error) {
 	items := make([]usageLogResponse, len(logs))
-	references := []service.ManagedKeyReference{}
-	seen := make(map[int]bool)
+	references := []service.ManagedContextReference{}
+	seen := make(map[string]int)
 	for i, log := range logs {
 		items[i].Log = log
-		if token := visibility[log.TokenId]; token.Managed {
+		contextRef := log.ManagementBillingContextRef
+		if service.ManagementAccount(c) != nil && contextRef != "" {
 			items[i].Attribution = &service.ManagedKeyAttribution{State: "unavailable"}
-			if !seen[log.TokenId] {
-				references = append(references, service.ManagedKeyReference{TokenID: log.TokenId, BindingRef: token.BindingRef})
-				seen[log.TokenId] = true
+			if previous, exists := seen[contextRef]; exists && previous != log.TokenId {
+				return nil, service.ErrManagedAccountDenied
+			} else if !exists {
+				references = append(references, service.ManagedContextReference{TokenID: log.TokenId, ContextRef: contextRef})
+				seen[contextRef] = log.TokenId
 			}
 		}
 	}
-	attributions, err := service.ReadManagedKeyAttributions(c, references)
+	attributions, err := service.ReadManagedContextAttributions(c, references)
 	if errors.Is(err, service.ErrManagedAccountDenied) {
 		return nil, err
 	}
@@ -161,7 +166,7 @@ func presentUsageLogPage(c *gin.Context, logs []*model.Log, visibility map[int]m
 		common.SysError(common.LogText("managed key attribution unavailable"))
 	}
 	for i := range items {
-		if attribution := attributions[items[i].TokenId]; attribution != nil {
+		if attribution := attributions[items[i].ManagementBillingContextRef]; attribution != nil {
 			items[i].Attribution = attribution
 		}
 	}
@@ -195,7 +200,7 @@ func exportLogs(c *gin.Context, all bool) {
 	}
 	filter.StartTimestamp = startTimestamp
 
-	userId := service.ManagementOwnerID(c)
+	userId := service.ManagementResourceScope(c).OwnerID
 	release, ok, err := service.AcquireLogExportLock(userId)
 	if err != nil {
 		common.SysError(common.LogText("failed to lock log export: %s", err.Error()))
@@ -216,6 +221,9 @@ func exportLogs(c *gin.Context, all bool) {
 	count := 0
 	page := make([]*model.Log, 0, 100)
 	writePage := func() error {
+		if err := service.RefreshManagedExportAuthorization(c); err != nil {
+			return err
+		}
 		items, err := presentUsageLogPage(c, page, filter.TokenVisibility)
 		if err != nil {
 			return err

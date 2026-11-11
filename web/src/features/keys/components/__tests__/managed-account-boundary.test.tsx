@@ -17,8 +17,9 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 For commercial licensing, please contact support@quantumnous.com
 */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { act, render, screen } from '@testing-library/react'
+import { act, render, screen, fireEvent } from '@testing-library/react'
 import axios from 'axios'
+import { useState } from 'react'
 import { afterEach, expect, test, vi } from 'vitest'
 
 import { getManagedAccountContext } from '../../api'
@@ -57,6 +58,10 @@ test('a late organization response cannot replace another organization or person
           native_owner_id: 22,
           account_label: 'Organization B',
           account_kind: 'org',
+          resource_scope: { kind: 'all', subject_ref: '' },
+          allowed_actions: ['model.keys.read'],
+          allowed_update_fields: ['name'],
+          allowed_statuses: [1, 2],
         }
   )
   const view = render(content('org:a'))
@@ -69,6 +74,10 @@ test('a late organization response cannot replace another organization or person
       native_owner_id: 11,
       account_label: 'Organization A',
       account_kind: 'org',
+      resource_scope: { kind: 'all', subject_ref: '' },
+      allowed_actions: ['model.keys.read'],
+      allowed_update_fields: ['name'],
+      allowed_statuses: [1, 2],
     })
   })
   expect(screen.queryByText('Organization A')).not.toBeInTheDocument()
@@ -99,3 +108,59 @@ test.each([403, 503])(
     expect(getManagedAccountContext).toHaveBeenCalledTimes(1)
   }
 )
+
+function ScopedDraft() {
+  const [draft, setDraft] = useState('')
+  return (
+    <input
+      aria-label='Key draft'
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+    />
+  )
+}
+
+test('a permission change within the same account clears the previous scope view state', async () => {
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const account: ManagedAccountContext = {
+    workspace_key: 'org:a',
+    native_owner_id: 1,
+    account_label: 'Team',
+    account_kind: 'org',
+    resource_scope: { kind: 'all', subject_ref: '' },
+    allowed_actions: ['model.keys.read', 'model.keys.create'],
+    allowed_update_fields: ['name', 'quota_delta'],
+    allowed_statuses: [1, 2],
+  }
+  vi.mocked(getManagedAccountContext).mockResolvedValue(account)
+  render(
+    <QueryClientProvider client={client}>
+      <ManagedAccountBoundary workspaceKey='org:a'>
+        {() => <ScopedDraft />}
+      </ManagedAccountBoundary>
+    </QueryClientProvider>
+  )
+  fireEvent.change(await screen.findByLabelText('Key draft'), {
+    target: { value: 'Old administrator draft' },
+  })
+  expect(screen.getByLabelText('Key draft')).toHaveValue(
+    'Old administrator draft'
+  )
+  act(() =>
+    client.setQueriesData(
+      { queryKey: ['model-account-context'] },
+      {
+        ...account,
+        resource_scope: {
+          kind: 'subject',
+          subject_ref: '11111111-1111-4111-8111-111111111111',
+        },
+        allowed_actions: ['model.keys.read'],
+        allowed_update_fields: ['name'],
+        allowed_statuses: [2],
+      }
+    )
+  )
+  await screen.findByDisplayValue('')
+  expect(screen.getByLabelText('Key draft')).toHaveValue('')
+})

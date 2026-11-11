@@ -25,11 +25,15 @@ import { handleServerError } from '@/lib/handle-server-error'
 
 import { fetchTokenKey, fetchTokenKeysBatch } from '../api'
 import { ERROR_MESSAGES } from '../constants'
-import type { ApiKey, ApiKeysDialogType } from '../types'
+import type { ApiKey, ApiKeysDialogType, ManagedAccountContext } from '../types'
 
 type ApiKeysContextType = {
   workspaceKey?: string
   scopeKey: string
+  account?: ManagedAccountContext
+  canPerform: (action: string) => boolean
+  canUpdateField: (field: string) => boolean
+  canSetStatus: (status: number) => boolean
   open: ApiKeysDialogType | null
   setOpen: (str: ApiKeysDialogType | null) => void
   currentRow: ApiKey | null
@@ -51,13 +55,32 @@ export function ApiKeysProvider({
   children,
   workspaceKey,
   scopeKey = 'personal',
+  account,
 }: {
   children: React.ReactNode
   workspaceKey?: string
   scopeKey?: string
+  account?: ManagedAccountContext
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
+  const canPerform = useCallback(
+    (action: string) =>
+      !workspaceKey || !!account?.allowed_actions.includes(action),
+    [workspaceKey, account]
+  )
+  const canUpdateField = useCallback(
+    (field: string) =>
+      canPerform('model.keys.update') &&
+      (!workspaceKey || !!account?.allowed_update_fields.includes(field)),
+    [workspaceKey, account, canPerform]
+  )
+  const canSetStatus = useCallback(
+    (status: number) =>
+      canPerform('model.keys.update') &&
+      (!workspaceKey || !!account?.allowed_statuses.includes(status)),
+    [workspaceKey, account, canPerform]
+  )
   const [open, setOpen] = useDialogState<ApiKeysDialogType>(null)
   const [currentRow, setCurrentRow] = useState<ApiKey | null>(null)
   const [resolvedKey, setResolvedKey] = useState('')
@@ -91,6 +114,7 @@ export function ApiKeysProvider({
 
   const resolveRealKey = useCallback(
     async (id: number): Promise<string | null> => {
+      if (!canPerform('model.keys.reveal')) return null
       if (!workspaceKey && resolvedKeys[id]) return resolvedKeys[id]
       if (id in pendingRequests.current) return pendingRequests.current[id]
 
@@ -124,11 +148,12 @@ export function ApiKeysProvider({
       pendingRequests.current[id] = request
       return request
     },
-    [resolvedKeys, t, workspaceKey]
+    [resolvedKeys, t, workspaceKey, canPerform]
   )
 
   const resolveRealKeysBatch = useCallback(
     async (ids: number[]): Promise<Record<number, string>> => {
+      if (!canPerform('model.keys.reveal')) return {}
       const uncachedIds = workspaceKey
         ? ids
         : ids.filter((id) => !resolvedKeys[id])
@@ -175,7 +200,7 @@ export function ApiKeysProvider({
         }
       }
     },
-    [resolvedKeys, t, workspaceKey]
+    [resolvedKeys, t, workspaceKey, canPerform]
   )
 
   return (
@@ -183,6 +208,10 @@ export function ApiKeysProvider({
       value={{
         workspaceKey,
         scopeKey,
+        account,
+        canPerform,
+        canUpdateField,
+        canSetStatus,
         open,
         setOpen,
         currentRow,

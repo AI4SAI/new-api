@@ -214,9 +214,11 @@ function ComboboxTrigger({
 }
 
 function ComboboxClear({ className, ...props }: ComboboxPrimitive.Clear.Props) {
+  const { t } = useTranslation()
   return (
     <ComboboxPrimitive.Clear
       data-slot='combobox-clear'
+      aria-label={t('Clear')}
       render={<InputGroupButton variant='ghost' size='icon-xs' />}
       className={cn(className)}
       {...props}
