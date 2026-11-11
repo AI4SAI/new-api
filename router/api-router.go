@@ -297,8 +297,8 @@ func SetApiRouter(router *gin.Engine) {
 			tokenRoute.POST("/:id/key", middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.ManagedAccountAuthorization("model.keys.reveal"), controller.GetTokenKey)
 			tokenRoute.POST("/", middleware.ManagedAccountAuthorization("model.keys.create"), controller.AddToken)
 			tokenRoute.PUT("/", middleware.ManagedAccountAuthorization("model.keys.update"), controller.UpdateToken)
-			tokenRoute.DELETE("/:id", middleware.ManagedAccountAuthorization("model.keys.delete"), controller.DeleteToken)
-			tokenRoute.POST("/batch", middleware.ManagedAccountAuthorization("model.keys.delete"), controller.DeleteTokenBatch)
+			tokenRoute.DELETE("/:id", controller.DeleteToken)
+			tokenRoute.POST("/batch", controller.DeleteTokenBatch)
 			tokenRoute.POST("/batch/keys", middleware.CriticalRateLimit(), middleware.DisableCache(), middleware.ManagedAccountAuthorization("model.keys.reveal"), controller.GetTokenKeysBatch)
 		}
 

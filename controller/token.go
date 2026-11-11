@@ -620,16 +620,7 @@ func AddToken(c *gin.Context) {
 }
 
 func DeleteToken(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
-	scope := service.ManagementResourceScope(c)
-	token, err := scope.GetToken(id, !c.GetBool("access_token_managed"))
-	if err != nil {
-		managedTokenError(c, err)
-		return
-	}
-	params := tokenAuditParams(c)
-	params["id"], params["name"] = token.Id, token.Name
-	managedTokenError(c, token.Delete())
+	managedTokenError(c, model.ErrTokenDeletionNotAllowed)
 }
 
 func UpdateToken(c *gin.Context) {
@@ -797,19 +788,7 @@ type TokenBatch struct {
 }
 
 func DeleteTokenBatch(c *gin.Context) {
-	tokenBatch := TokenBatch{}
-	if err := c.ShouldBindJSON(&tokenBatch); err != nil {
-		common.ApiErrorT(c, "Invalid parameters")
-		return
-	}
-	tokenBatchAuditParams(c, tokenBatch.Ids)
-	if len(tokenBatch.Ids) == 0 {
-		common.ApiErrorT(c, "Invalid parameters")
-		return
-	}
-	scope := service.ManagementResourceScope(c)
-	_, err := scope.BatchDeleteTokens(tokenBatch.Ids, !c.GetBool("access_token_managed"))
-	managedTokenError(c, err)
+	managedTokenError(c, model.ErrTokenDeletionNotAllowed)
 }
 
 func GetTokenKeysBatch(c *gin.Context) {

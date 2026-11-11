@@ -564,8 +564,8 @@ func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {
 			router.POST("/api/token/", middleware.ManagedAccountAuthorization("model.keys.create"), AddToken)
 			router.POST("/api/token/:id/key", middleware.ManagedAccountAuthorization("model.keys.reveal"), GetTokenKey)
 			router.POST("/api/token/batch/keys", middleware.ManagedAccountAuthorization("model.keys.reveal"), GetTokenKeysBatch)
-			router.POST("/api/token/batch", middleware.ManagedAccountAuthorization("model.keys.delete"), DeleteTokenBatch)
-			router.DELETE("/api/token/:id", middleware.ManagedAccountAuthorization("model.keys.delete"), DeleteToken)
+			router.POST("/api/token/batch", DeleteTokenBatch)
+			router.DELETE("/api/token/:id", DeleteToken)
 			router.GET("/api/user/self/groups", middleware.ManagedAccountAuthorization("model.keys.read"), GetUserGroups)
 			router.GET("/api/user/models", middleware.ManagedAccountAuthorization("model.keys.read"), GetUserModels)
 			router.GET("/api/token/auto-groups", middleware.ManagedAccountAuthorization("model.keys.read"), GetTokenAutoGroups)
@@ -1500,15 +1500,16 @@ func verifyAPITokenAudit(t *testing.T) {
 		{name: "disable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":2}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":1,"to":2}`},
 		{name: "enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", success: true, params: `{"id":$id,"name":"owned","from":2,"to":1}`, initialStatus: common.TokenStatusDisabled},
 		{name: "expired enable", method: "PUT", path: "/?status_only=true", body: `{"id":$id,"status":1}`, action: "token.status_update", params: `{"id":$id,"name":"owned"}`, initialStatus: common.TokenStatusExpired},
-		{name: "delete is refused", method: "DELETE", path: "/$id", action: "token.delete", params: `{"id":$id,"name":"owned"}`},
+		{name: "delete is refused", method: "DELETE", path: "/$id", action: "token.delete", params: `{"id":$id}`},
 		{name: "foreign delete", method: "DELETE", path: "/$other", action: "token.delete", params: `{"id":$other}`},
 		{name: "missing delete", method: "DELETE", path: "/999999", action: "token.delete", params: `{"id":999999}`},
 		{name: "key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`},
 		{name: "PAT key view", method: "POST", path: "/$id/key", action: "token.key_view", success: true, params: `{"id":$id,"name":"owned"}`, usePAT: true},
 		{name: "foreign key view", method: "POST", path: "/$other/key", action: "token.key_view", params: `{"id":$other}`},
 		{name: "rate limited key view", method: "POST", path: "/$id/key", action: "token.key_view", params: `{"id":$id}`, rateLimit: true},
-		{name: "batch delete is refused without partial changes", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", params: `{"requested_ids":[$id,$id,$other,999999],"total":4}`},
-		{name: "empty batch delete", method: "POST", path: "/batch", body: `{"ids":[]}`, action: "token.delete_batch", params: `{"requested_ids":[],"total":0}`},
+		{name: "batch delete is refused without partial changes", method: "POST", path: "/batch", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.delete_batch", params: `{}`},
+		{name: "empty batch delete", method: "POST", path: "/batch", body: `{"ids":[]}`, action: "token.delete_batch", params: `{}`},
+		{name: "malformed batch delete", method: "POST", path: "/batch", body: `{"ids":`, action: "token.delete_batch", params: `{}`},
 		{name: "batch keys partial and duplicate", method: "POST", path: "/batch/keys", body: `{"ids":[$id,$id,$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$id,$id,$other,999999],"total":4,"count":1,"returned_ids":[$id]}`},
 		{name: "batch keys no matches", method: "POST", path: "/batch/keys", body: `{"ids":[$other,999999]}`, action: "token.key_view_batch", success: true, params: `{"requested_ids":[$other,999999],"total":2,"count":0,"returned_ids":[]}`},
 		{name: "empty batch keys", method: "POST", path: "/batch/keys", body: `{"ids":[]}`, action: "token.key_view_batch", params: `{"requested_ids":[],"total":0}`},
@@ -1601,9 +1602,10 @@ func verifyAPITokenAudit(t *testing.T) {
 			assert.Equal(t, response.Code, operation.Status)
 			if tc.rateLimit {
 				assert.Equal(t, 429, response.Code)
-			} else if tc.name == "delete is refused" || tc.name == "batch delete is refused without partial changes" {
+			} else if tc.action == "token.delete" || tc.action == "token.delete_batch" {
 				assert.Equal(t, http.StatusForbidden, response.Code)
 				assert.False(t, decodeAPIResponse(t, response).Success)
+				assert.Contains(t, response.Body.String(), "KEY_DELETION_NOT_ALLOWED")
 				require.NoError(t, model.DB.First(&model.Token{}, owned.Id).Error)
 			} else if tc.name == "create storage failure" {
 				assert.Equal(t, http.StatusServiceUnavailable, response.Code)
@@ -1677,9 +1679,15 @@ func verifyAPITokenAudit(t *testing.T) {
 			encoded, err := common.Marshal(event.Other.Op.Params)
 			require.NoError(t, err)
 			require.NoError(t, common.Unmarshal(encoded, &params))
-			assert.Equal(t, ids[:100], params.IDs)
-			assert.True(t, params.Truncated)
-			assert.Equal(t, 101, params.Total)
+			if path == "/api/token/batch/keys" {
+				assert.Equal(t, ids[:100], params.IDs)
+				assert.True(t, params.Truncated)
+				assert.Equal(t, 101, params.Total)
+			} else {
+				assert.Empty(t, params.IDs, "retired deletion does not parse the batch body")
+				assert.False(t, params.Truncated)
+				assert.Zero(t, params.Total)
+			}
 			assert.False(t, event.Success)
 			if event.Success {
 				require.NotNil(t, params.Count)

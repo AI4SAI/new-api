@@ -4,18 +4,26 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/middleware"
+	"github.com/QuantumNous/new-api/model"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/service/authz"
 	"github.com/gin-gonic/gin"
+	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 // accessTokenExemptRoutes are /api routes that never reach dashboard
@@ -147,6 +155,69 @@ func TestAccessTokenRouteRulesCoverEveryDashboardRoute(t *testing.T) {
 		assert.Equal(t, "session", rule.Kind(), key)
 		assert.Empty(t, rule.Scope(), key)
 	}
+}
+
+func TestRetiredTokenDeleteRoutesRejectWithoutCoreOrKeyReads(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	connection, err := db.DB()
+	require.NoError(t, err)
+	connection.SetMaxOpenConns(1)
+	previousDB, previousLogDB, previousRedis := model.DB, model.LOG_DB, common.RedisEnabled
+	previousSecret, previousDatabase := common.SessionSecret, common.MainDatabaseType()
+	model.DB, model.LOG_DB, common.RedisEnabled = db, db, false
+	common.SessionSecret = "retired-delete-route-session-secret"
+	common.SetMainDatabaseType(common.DatabaseTypeSQLite)
+	t.Cleanup(func() {
+		model.DB, model.LOG_DB, common.RedisEnabled = previousDB, previousLogDB, previousRedis
+		common.SessionSecret = previousSecret
+		common.SetMainDatabaseType(previousDatabase)
+		require.NoError(t, connection.Close())
+	})
+	// There is deliberately no Token table: refusal must not query a key.
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.UserAccessToken{}, &model.AuditLog{}, &model.Option{}))
+	user := model.User{Username: "retired-delete-user", Status: common.UserStatusEnabled, Role: common.RoleCommonUser, AuthVersion: 1, Group: "default"}
+	require.NoError(t, db.Create(&user).Error)
+	session := model.UserSession{SID: "retired-delete-session", UserID: user.Id, Version: 1, UserAuthVersion: 1,
+		Status: model.UserSessionStatusActive, RefreshHash: "fixture", LoginMethod: "oidc", ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	require.NoError(t, model.CreateUserSession(&session))
+	credential, _, err := service.IssueAccessToken(service.AuthIdentity{UserID: user.Id, SessionID: session.SID, UserAuthVersion: 1, SessionVersion: 1})
+	require.NoError(t, err)
+	var coreCalls atomic.Int64
+	core := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		coreCalls.Add(1)
+		w.WriteHeader(http.StatusUnprocessableEntity)
+	}))
+	defer core.Close()
+	secret := filepath.Join(t.TempDir(), "admission")
+	require.NoError(t, os.WriteFile(secret, []byte(strings.Repeat("x", 48)), 0600))
+	t.Setenv("MODEL_BILLING_INSTANCE_REF", "fixture-gateway")
+	t.Setenv("MODEL_BILLING_ADMISSION_KEY_FILE", secret)
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", core.URL+"/v1/internal/models/authorize-management")
+	engine := newAccessTokenScopeTestEngine(t)
+	for _, test := range []struct{ method, path, body, action string }{
+		{http.MethodDelete, "/api/token/3", "", "token.delete"},
+		{http.MethodDelete, "/api/token/not-an-id", "", "token.delete"},
+		{http.MethodPost, "/api/token/batch", `{"ids":[3,4]}`, "token.delete_batch"},
+		{http.MethodPost, "/api/token/batch", `{"ids":`, "token.delete_batch"},
+	} {
+		request := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+		request.Header.Set("Authorization", "Bearer "+credential)
+		request.Header.Set("X-SAI-Workspace-Key", "org:fixture")
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		require.Equal(t, http.StatusForbidden, response.Code, response.Body.String())
+		require.Contains(t, response.Body.String(), "KEY_DELETION_NOT_ALLOWED")
+		var event model.AuditLog
+		require.NoError(t, db.Order("id desc").First(&event).Error)
+		require.Equal(t, test.action, event.Action)
+		require.False(t, event.Success)
+		require.Equal(t, http.StatusForbidden, event.Status)
+		require.NotContains(t, event.Other.Op.Params, "name")
+		require.NotContains(t, event.Other.Op.Params, "requested_ids")
+	}
+	require.Zero(t, coreCalls.Load(), "retired operations must never ask Core for authorization")
 }
 
 func TestAccessTokenCatalogCoversEveryPermission(t *testing.T) {
