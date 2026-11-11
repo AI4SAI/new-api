@@ -156,6 +156,7 @@ func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServ
 	router := gin.New()
 	for _, route := range []struct{ method, path string }{
 		{http.MethodGet, "/api/user/self"}, {http.MethodGet, "/api/token/"},
+		{http.MethodGet, "/api/token/member-candidates"},
 		{http.MethodGet, "/api/log/self"}, {http.MethodPost, "/api/user/topup"},
 		{http.MethodGet, "/api/subscription/plans"}, {http.MethodDelete, "/api/user/self"},
 		{http.MethodPut, "/api/user/setting"}, {http.MethodGet, "/api/user/access_tokens"},
@@ -169,6 +170,9 @@ func TestModelServiceConsoleProtectsPersonalOperationsWithoutBlockingManagedServ
 	}{
 		{http.MethodGet, "/api/user/self", bundle.AccessToken, http.StatusNoContent},
 		{http.MethodGet, "/api/token/", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/token/member-candidates", bundle.AccessToken, http.StatusNoContent},
+		{http.MethodGet, "/api/token/member-candidates", personal, http.StatusForbidden},
+		{http.MethodGet, "/api/token/member-candidates", managed, http.StatusForbidden},
 		{http.MethodGet, "/api/log/self", bundle.AccessToken, http.StatusNoContent},
 		{http.MethodPost, "/api/user/topup", bundle.AccessToken, http.StatusForbidden},
 		{http.MethodPost, "/api/user/topup", personal, http.StatusForbidden},
