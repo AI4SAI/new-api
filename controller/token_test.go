@@ -223,6 +223,17 @@ func TestManagedTokensSeparateActorOwnerAndInternalCredentials(t *testing.T) {
 	require.NotNil(t, page.Items[0].RemainQuota)
 	require.Equal(t, 100, *page.Items[0].RemainQuota)
 	require.Equal(t, 7, c.GetInt("id"))
+	for _, status := range []int{common.TokenStatusDisabled, common.TokenStatusEnabled} {
+		c, w = request("PUT", "/api/token/?status_only=true", map[string]any{"id": external.Id, "status": status})
+		UpdateToken(c)
+		require.True(t, decodeAPIResponse(t, w).Success)
+		c, w = request("GET", "/api/token/", nil)
+		GetAllTokens(c)
+		require.NoError(t, common.Unmarshal(decodeAPIResponse(t, w).Data, &page))
+		require.Equal(t, external.Id, page.Items[1].ID)
+		require.Equal(t, status, page.Items[1].Status)
+		require.False(t, page.Items[1].CanEnable, "administrators keep their status actions without the member hint")
+	}
 	for _, query := range []struct {
 		query string
 		count int
@@ -645,7 +656,8 @@ func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {
 			require.Equal(t, before.UsedQuota, after.UsedQuota)
 			response = call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})
 			require.True(t, decodeAPIResponse(t, response).Success)
-			require.Contains(t, response.Body.String(), `"can_enable":true`)
+			response = call("GET", fmt.Sprintf("/api/token/%d", owned.Id), nil)
+			require.Contains(t, response.Body.String(), `"can_enable":true`, "the UI refreshes the key after updating its status")
 			admin, err = model.GetTokenByIds(owned.Id, 41)
 			require.NoError(t, err)
 			admin.Status = common.TokenStatusDisabled
@@ -1098,8 +1110,11 @@ func TestTokenMigrationFromChar48ToVarchar128Postgres(t *testing.T) {
 
 func TestGetAllTokensMasksKeyInResponse(t *testing.T) {
 	db := setupTokenControllerTestDB(t)
+	t.Setenv("MODEL_MANAGEMENT_AUTHORIZATION_URL", "invalid")
 	token := seedToken(t, db, 1, "list-token", "abcd1234efgh5678")
 	seedToken(t, db, 2, "other-user-token", "zzzz1234yyyy5678")
+	token.Status = common.TokenStatusDisabled
+	require.NoError(t, token.SelectUpdate())
 
 	ctx, recorder := newAuthenticatedContext(t, http.MethodGet, "/api/token/?p=1&size=10", nil, 1)
 	GetAllTokens(ctx)
@@ -1122,6 +1137,15 @@ func TestGetAllTokensMasksKeyInResponse(t *testing.T) {
 	if strings.Contains(recorder.Body.String(), token.Key) {
 		t.Fatalf("list response leaked raw token key: %s", recorder.Body.String())
 	}
+	require.False(t, page.Items[0].CanEnable, "personal keys do not consume the member hint")
+	ctx, recorder = newAuthenticatedContext(t, http.MethodPut, "/api/token/?status_only=true",
+		map[string]any{"id": token.Id, "status": common.TokenStatusEnabled}, 1)
+	UpdateToken(ctx)
+	require.True(t, decodeAPIResponse(t, recorder).Success, "personal owners can still enable their keys")
+	var stored model.Token
+	require.NoError(t, db.First(&stored, token.Id).Error)
+	require.Equal(t, common.TokenStatusEnabled, stored.Status)
+	require.Zero(t, stored.SelfDisabledByUserID)
 }
 
 func TestSearchTokensMasksKeyInResponse(t *testing.T) {

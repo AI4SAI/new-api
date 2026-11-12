@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "Disable Two-Factor Authentication",
     "disabled": "disabled",
     "Disabled": "Disabled",
+    "Can re-enable": "Can re-enable",
     "Disabled {{count}} keys": "Disabled {{count}} keys",
     "Disabled all channels with tag: {{tag}}": "Disabled all channels with tag: {{tag}}",
     "Disabled channels with tag {{tag}}": "Disabled channels with tag {{tag}}",

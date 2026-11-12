@@ -31,7 +31,6 @@ import {
   useDataTable,
 } from '@/components/data-table'
 import { ErrorState } from '@/components/error-state'
-import { StatusBadge } from '@/components/status-badge'
 import {
   Empty,
   EmptyDescription,
@@ -49,7 +48,6 @@ import { getApiKeys, searchApiKeys } from '../api'
 import {
   API_KEY_STATUS,
   API_KEY_STATUS_OPTIONS,
-  API_KEY_STATUSES,
   ERROR_MESSAGES,
 } from '../constants'
 import type { ApiKey, MemberCandidate } from '../types'
@@ -58,6 +56,7 @@ import { ApiKeyActivityCell } from './api-key-timestamp-cell'
 import {
   ApiKeyCell,
   ApiKeyNameCell,
+  ApiKeyStatusCell,
   ModelLimitsCell,
   IpRestrictionsCell,
 } from './api-keys-cells'
@@ -139,7 +138,6 @@ function ApiKeysMobileList({
     <div className='min-w-0 space-y-3'>
       {rows.map((row) => {
         const apiKey = row.original
-        const statusConfig = API_KEY_STATUSES[apiKey.status]
         const groupCell = row
           .getAllCells()
           .find((cell) => cell.column.id === 'group')
@@ -161,14 +159,10 @@ function ApiKeysMobileList({
                   <ApiKeyNameCell apiKey={apiKey} />
                 </div>
               </div>
-              {statusConfig && (
-                <StatusBadge
-                  label={t(statusConfig.label)}
-                  variant={statusConfig.variant}
-                  copyable={false}
-                  className='shrink-0 px-0 text-xs font-normal'
-                />
-              )}
+              <ApiKeyStatusCell
+                apiKey={apiKey}
+                className='px-0 text-xs font-normal'
+              />
             </div>
 
             <div className='flex min-w-0 items-center justify-between gap-2'>

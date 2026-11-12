@@ -31,7 +31,6 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
 import { modelAccountRequest } from '../api'
-import { API_KEY_STATUSES } from '../constants'
 import type { ApiKey } from '../types'
 import { ApiKeyGroupCell } from './api-key-group-cell'
 import { ApiKeyQuotaCell } from './api-key-quota-cell'
@@ -42,6 +41,7 @@ import {
 import {
   ApiKeyCell,
   ApiKeyNameCell,
+  ApiKeyStatusCell,
   IpRestrictionsCell,
   ModelLimitsCell,
 } from './api-keys-cells'
@@ -129,19 +129,9 @@ export function useApiKeysColumns(
       {
         accessorKey: 'status',
         header: t('Status'),
-        cell: ({ row }) => {
-          const statusConfig =
-            API_KEY_STATUSES[row.getValue('status') as number]
-          if (!statusConfig) return null
-          return (
-            <StatusBadge
-              label={t(statusConfig.label)}
-              variant={statusConfig.variant}
-              copyable={false}
-              className='-ml-1.5'
-            />
-          )
-        },
+        cell: ({ row }) => (
+          <ApiKeyStatusCell apiKey={row.original} className='-ml-1.5' />
+        ),
         filterFn: (row, id, value) => value.includes(String(row.getValue(id))),
         size: 120,
         meta: { mobileBadge: true },

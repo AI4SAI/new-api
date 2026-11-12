@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "二要素認証を無効にする",
     "disabled": "無効",
     "Disabled": "無効",
+    "Can re-enable": "再度有効にできます",
     "Disabled {{count}} keys": "{{count}} 個のキーを無効にしました",
     "Disabled all channels with tag: {{tag}}": "タグ「{{tag}}」の全チャネルを無効にしました",
     "Disabled channels with tag {{tag}}": "タグ {{tag}} のチャネルを無効化しました",

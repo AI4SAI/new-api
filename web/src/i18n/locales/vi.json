@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "Vô hiệu hóa Xác thực hai yếu tố",
     "disabled": "vô hiệu hóa",
     "Disabled": "Đã tắt",
+    "Can re-enable": "Có thể bật lại",
     "Disabled {{count}} keys": "Đã tắt {{count}} khóa",
     "Disabled all channels with tag: {{tag}}": "Đã tắt tất cả kênh với nhãn: {{tag}}",
     "Disabled channels with tag {{tag}}": "Đã vô hiệu hóa các kênh có thẻ {{tag}}",

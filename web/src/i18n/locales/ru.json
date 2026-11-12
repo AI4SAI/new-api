@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "Отключить двухфакторную аутентификацию",
     "disabled": "отключено",
     "Disabled": "Отключено",
+    "Can re-enable": "Можно включить",
     "Disabled {{count}} keys": "Отключено ключей: {{count}}",
     "Disabled all channels with tag: {{tag}}": "Все каналы с тегом {{tag}} отключены",
     "Disabled channels with tag {{tag}}": "Отключены каналы с тегом {{tag}}",

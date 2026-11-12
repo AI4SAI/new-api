@@ -37,9 +37,42 @@ import {
 } from '@/components/ui/tooltip'
 import { copyToClipboard } from '@/lib/copy-to-clipboard'
 
+import { API_KEY_STATUS, API_KEY_STATUSES } from '../constants'
 import { formatKeyAssignee } from '../lib'
 import type { ApiKey } from '../types'
 import { useApiKeys } from './api-keys-provider'
+
+export function ApiKeyStatusCell(props: {
+  apiKey: ApiKey
+  className?: string
+}) {
+  const { t } = useTranslation()
+  const { account, canSetStatus } = useApiKeys()
+  const statusConfig = API_KEY_STATUSES[props.apiKey.status]
+  if (!statusConfig) return null
+  const canReenable =
+    account?.resource_scope.kind === 'subject' &&
+    !props.apiKey.managed &&
+    props.apiKey.status === API_KEY_STATUS.DISABLED &&
+    props.apiKey.can_enable === true &&
+    canSetStatus(API_KEY_STATUS.ENABLED)
+
+  return (
+    <div className='flex shrink-0 flex-col items-end md:items-start'>
+      <StatusBadge
+        label={t(statusConfig.label)}
+        variant={statusConfig.variant}
+        copyable={false}
+        className={props.className}
+      />
+      {canReenable && (
+        <span className='text-muted-foreground text-xs font-normal'>
+          {t('Can re-enable')}
+        </span>
+      )}
+    </div>
+  )
+}
 
 export function ApiKeyNameCell({ apiKey }: { apiKey: ApiKey }) {
   const { t } = useTranslation()

@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "禁用双重身份验证",
     "disabled": "已禁用",
     "Disabled": "已禁用",
+    "Can re-enable": "可自行启用",
     "Disabled {{count}} keys": "已禁用 {{count}} 个密钥",
     "Disabled all channels with tag: {{tag}}": "已禁用标签「{{tag}}」下的所有渠道",
     "Disabled channels with tag {{tag}}": "禁用标签为 {{tag}} 的渠道",

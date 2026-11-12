@@ -1969,6 +1969,7 @@
     "Disable Two-Factor Authentication": "Désactiver l'authentification à deux facteurs",
     "disabled": "désactivé",
     "Disabled": "Désactivé",
+    "Can re-enable": "Réactivation possible",
     "Disabled {{count}} keys": "{{count}} clés désactivées",
     "Disabled all channels with tag: {{tag}}": "Tous les canaux avec le tag {{tag}} ont été désactivés",
     "Disabled channels with tag {{tag}}": "Canaux avec l'étiquette {{tag}} désactivés",

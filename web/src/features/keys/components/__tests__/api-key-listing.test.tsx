@@ -757,6 +757,8 @@ it.each([false, true])(
       memberAccount
     )
     const user = userEvent.setup()
+    expect(screen.getByText('Disabled')).toBeVisible()
+    expect(screen.getByText('Can re-enable')).toBeVisible()
     const enable = screen.getByRole('button', { name: 'Enable' })
     act(() => enable.focus())
     await user.keyboard('{Enter}')
@@ -770,6 +772,7 @@ it.each([false, true])(
       )
     )
     await screen.findByText('Enabled')
+    expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Disable' })).toBeEnabled()
     expect(post).not.toHaveBeenCalled()
   }
@@ -785,6 +788,7 @@ it.each([undefined, false])(
       memberAccount
     )
     expect(screen.getByText('Disabled')).toBeVisible()
+    expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Enable' })
     ).not.toBeInTheDocument()
@@ -797,6 +801,7 @@ it('a row capability cannot grant re-enable when the account action is unavailab
     ...memberAccount,
     allowed_statuses: [2],
   })
+  expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Enable' })
   ).not.toBeInTheDocument()
@@ -806,6 +811,7 @@ it.each([3, 4])(
   'a member cannot re-enable status %s even with a stale row capability',
   async (status) => {
     await renderKeysPage(status, { can_enable: true }, [], memberAccount)
+    expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
     expect(
       screen.queryByRole('button', { name: 'Enable' })
     ).not.toBeInTheDocument()
@@ -820,6 +826,7 @@ it('a managed key keeps its original read-only actions even with an enable capab
     memberAccount
   )
   expect(screen.getByRole('button', { name: 'Usage' })).toBeVisible()
+  expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
   expect(
     screen.queryByRole('button', { name: 'Enable' })
   ).not.toBeInTheDocument()
@@ -844,6 +851,7 @@ it('administrators keep create and re-enable controls and external key attributi
   await renderKeysPage(
     2,
     {
+      can_enable: true,
       attribution: {
         state: 'ready',
         actor: { display_name: 'Alice', username: 'alice' },
@@ -864,12 +872,49 @@ it('administrators keep create and re-enable controls and external key attributi
   )
   expect(screen.getByRole('button', { name: 'Create API Key' })).toBeEnabled()
   expect(screen.getByRole('button', { name: 'Enable' })).toBeEnabled()
+  expect(screen.getByText('Disabled')).toBeVisible()
+  expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
   expect(screen.getByText('Alice')).toBeVisible()
   expect(screen.queryByText('Managed automatically')).not.toBeInTheDocument()
   expect(screen.getByRole('combobox', { name: 'Member' })).toBeVisible()
   await userEvent.click(screen.getByRole('button', { name: 'Open menu' }))
   expect(screen.getByRole('menuitem', { name: 'Copy Key' })).toBeVisible()
 })
+
+it('personal keys retain the original status without a member restore hint', async () => {
+  await renderKeysPage(2, { can_enable: true })
+  expect(screen.getByText('Disabled')).toBeVisible()
+  expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Enable' })).toBeEnabled()
+})
+
+it.each([false, true])(
+  'translates the member restore hint when the language changes on mobile=%s',
+  async (mobile) => {
+    if (mobile) {
+      const matchMedia = window.matchMedia
+      vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query.includes('max-width'),
+      }))
+    }
+    await renderKeysPage(2, { can_enable: true }, [], memberAccount)
+    expect(screen.getByText('Can re-enable')).toBeVisible()
+    i18n.addResourceBundle('zh', 'translation', zh.translation, true, true)
+    try {
+      await act(async () => {
+        await i18n.changeLanguage('zh')
+      })
+      expect(screen.getByText('可自行启用')).toBeVisible()
+      expect(screen.getByText('已禁用')).toBeVisible()
+      expect(screen.queryByText('Can re-enable')).not.toBeInTheDocument()
+    } finally {
+      await act(async () => {
+        await i18n.changeLanguage('en')
+      })
+    }
+  }
+)
 
 it.each([
   ['unknown', 'Assignee unknown', false],

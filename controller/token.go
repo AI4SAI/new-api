@@ -183,25 +183,11 @@ func buildMaskedTokenResponses(tokens []*model.Token, machine bool) []*tokenResp
 }
 
 func canEnableToken(c *gin.Context, token *model.Token) bool {
-	if token.Status != common.TokenStatusDisabled || token.DeletedAt.Valid ||
-		(token.ManagedBindingRef != "" && !c.GetBool("access_token_managed")) ||
-		(token.BillingContextRef != nil && !token.BillingContextConfirmed) ||
-		(token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp()) ||
-		(!token.UnlimitedQuota && token.RemainQuota <= 0) {
-		return false
-	}
 	account := service.ManagementAccount(c)
-	if account == nil {
-		return token.UserId == c.GetInt("id")
-	}
-	if account.OwnerID != token.UserId || !slices.Contains(account.AllowedActions, "model.keys.update") ||
-		!slices.Contains(account.AllowedStatuses, common.TokenStatusEnabled) {
-		return false
-	}
-	if account.ResourceScope.Kind == "subject" {
-		return token.ManagedSubjectRef == account.ResourceScope.SubjectRef && token.CanSelfEnable(account.ActorID)
-	}
-	return true
+	return account != nil && account.ResourceScope.Kind == "subject" && account.OwnerID == token.UserId &&
+		token.ManagedSubjectRef == account.ResourceScope.SubjectRef &&
+		slices.Contains(account.AllowedActions, "model.keys.update") &&
+		slices.Contains(account.AllowedStatuses, common.TokenStatusEnabled) && token.CanSelfEnable(account.ActorID)
 }
 
 func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, bool) {
@@ -802,12 +788,10 @@ func UpdateToken(c *gin.Context) {
 		params["changed_fields"] = changedFields
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
-	response := buildMaskedTokenResponse(cleanToken, c.GetBool("access_token_managed"))
-	response.CanEnable = canEnableToken(c, cleanToken)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    response,
+		"data":    buildMaskedTokenResponse(cleanToken, c.GetBool("access_token_managed")),
 	})
 }
 
