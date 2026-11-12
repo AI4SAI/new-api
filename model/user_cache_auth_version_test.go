@@ -2,7 +2,6 @@ package model
 
 import (
 	"errors"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,26 +14,40 @@ import (
 	"gorm.io/gorm"
 )
 
-// Sharded Redis hashes only the text inside the first brace pair, so fence
-// and version keys tagged with the untagged cache key share its slot.
-// Miniredis does not enforce slots, so check the tags explicitly.
-func TestAuthCacheKeysShareClusterHashTag(t *testing.T) {
-	for _, tc := range []struct {
-		cacheKey string
-		related  []string
-	}{
-		{getUserCacheKey(5), []string{getUserAuthFenceKey(5), getUserAuthVersionKey(5)}},
-		{getTokenCacheKey("test-token"), []string{getTokenCacheFenceKey("test-token")}},
-	} {
-		assert.NotContains(t, tc.cacheKey, "{")
-		for _, key := range tc.related {
-			_, suffix, ok := strings.Cut(key, "{")
-			require.True(t, ok)
-			tag, _, ok := strings.Cut(suffix, "}")
-			require.True(t, ok)
-			assert.Equal(t, tc.cacheKey, tag)
-		}
-	}
+// Old and new gateways can overlap while existing streams finish. Pending
+// changes published by the old gateway must still block a new cache fill.
+func TestLegacyAuthCacheFencesRemainEffectiveDuringUpgrade(t *testing.T) {
+	server := useUserCacheMiniRedis(t)
+	user := User{Id: 5, Username: "legacy-cache-user", Role: common.RoleCommonUser,
+		Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, Quota: 1000}
+	require.NoError(t, populateUserCache(user))
+	_, err := cacheApplyUserQuotaDelta(user.Id, -100)
+	require.NoError(t, err)
+	server.Set("auth:user:fence:5", "2")
+	_, err = cacheGetUserBase(user.Id)
+	require.ErrorIs(t, err, ErrUserAuthCachePending)
+	require.ErrorIs(t, populateUserCache(user), ErrUserAuthCachePending)
+
+	server.Del("auth:user:fence:5")
+	server.Set("auth:user:version:5", "2")
+	_, err = cacheGetUserBase(user.Id)
+	require.ErrorIs(t, err, ErrUserAuthCachePending)
+	user.AuthVersion = 2
+	require.NoError(t, populateUserCache(user))
+	stored, err := cacheGetUserBase(user.Id)
+	require.NoError(t, err)
+	assert.Equal(t, 900, stored.Quota, "metadata repair must retain outstanding reservations")
+
+	token := Token{Id: 7, UserId: user.Id, Key: "legacy-cache-token", Status: common.TokenStatusEnabled, RemainQuota: 1000}
+	_, err = cacheInitToken(token)
+	require.NoError(t, err)
+	_, err = cacheApplyTokenQuotaDelta(token.Id, token.Key, -100)
+	require.NoError(t, err)
+	server.Set("token:fence:"+common.GenerateHMAC(token.Key), "1")
+	result, err := cacheInitToken(token)
+	require.NoError(t, err)
+	assert.Zero(t, result, "old token mutation fence must block the new fill")
+	assert.Equal(t, "900", server.HGet(getTokenCacheKey(token.Key), "RemainQuota"))
 }
 
 func useUserCacheMiniRedis(t *testing.T) *miniredis.Miniredis {
