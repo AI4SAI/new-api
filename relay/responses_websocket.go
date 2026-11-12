@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -87,18 +88,24 @@ type responsesWSCallState struct {
 	// A nonzero closeCode ends the connection after this request.
 	closeCode   int
 	closeReason string
+	// submitted is guarded by the session stateMu and marks create submission.
+	submitted bool
 }
 
 type responsesWSSession struct {
-	ctx            context.Context
-	cancel         context.CancelFunc
-	client         *websocket.Conn
-	runner         ResponsesWSRequestRunner
-	request        *http.Request
-	requestID      string
-	nextEventIndex int
-	workers        sync.WaitGroup
-	closeOnce      sync.Once
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	client               *websocket.Conn
+	runner               ResponsesWSRequestRunner
+	request              *http.Request
+	requestID            string
+	nextEventIndex       int
+	workers              sync.WaitGroup
+	closeOnce            sync.Once
+	clientCloseOnce      sync.Once
+	clientGone           atomic.Bool
+	clientDone           chan struct{}
+	clientDisconnectedAt time.Time // published by closing clientDone
 
 	clientWriteMu sync.Mutex
 	targetWriteMu sync.Mutex
@@ -125,7 +132,7 @@ type responsesWSSession struct {
 
 func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner ResponsesWSRequestRunner) *types.NewAPIError {
 	ctx, cancel := context.WithCancel(c.Request.Context())
-	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner,
+	s := &responsesWSSession{ctx: ctx, cancel: cancel, client: client, runner: runner, clientDone: make(chan struct{}),
 		request: c.Request.Clone(ctx), requestID: c.GetString(common.RequestIdKey)}
 	if s.requestID == "" {
 		s.requestID = common.NewRequestId()
@@ -136,8 +143,15 @@ func ResponsesWebSocketHelper(c *gin.Context, client *websocket.Conn, runner Res
 	}
 	client.SetReadLimit(int64(maxMB) << 20)
 	defer func() {
-		// Unless an earlier shutdown ended the read, the client closed or left.
-		// Gorilla already answered a client close frame, so this tells the upstream.
+		// Retain the active upstream response for bounded usage collection.
+		// Policy revocation and explicit server shutdown still cancel s.ctx.
+		s.disconnectClient()
+		if state := s.getCurrent(); state != nil {
+			select {
+			case <-state.done:
+			case <-s.ctx.Done():
+			}
+		}
 		s.shutdown(websocket.CloseNormalClosure, "")
 		s.workers.Wait()
 	}()
@@ -204,7 +218,7 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		}
 		s.clientWriteMu.Lock()
 		s.stateMu.Lock()
-		if outgoing != nil {
+		if outgoing != nil && !s.clientGone.Load() {
 			if err := s.client.SetWriteDeadline(s.clientWriteBudget.Deadline(time.Now(), len(outgoing.body))); err != nil {
 				state.closeCode = websocket.CloseInternalServerErr
 			} else if err := s.client.WriteMessage(outgoing.kind, outgoing.body); err != nil {
@@ -219,6 +233,9 @@ func (s *responsesWSSession) runRequest(state *responsesWSCallState, message []b
 		s.stateMu.Unlock()
 		s.clientWriteMu.Unlock()
 	}()
+	if s.clientGone.Load() {
+		return
+	}
 	request := s.request.Clone(s.ctx)
 	request.Body = io.NopCloser(bytes.NewReader(message))
 	request.ContentLength = int64(len(message))
@@ -289,7 +306,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		if apiErr != nil {
 			return apiErr
 		}
-		if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
+		if err := s.writeCreate(state, payload); err != nil {
 			state.closeCode = websocket.CloseInternalServerErr
 			return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 		}
@@ -341,7 +358,7 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 			if !s.setTarget(target) {
 				return types.NewError(context.Canceled, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
-			if err := s.writeTarget(websocket.TextMessage, payload); err != nil {
+			if err := s.writeCreate(state, payload); err != nil {
 				state.closeCode = websocket.CloseInternalServerErr
 				return types.NewError(err, types.ErrorCodeBadResponse, types.ErrOptionWithSkipRetry())
 			}
@@ -381,6 +398,14 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 	}
 	idle := time.NewTimer(timeout)
 	defer idle.Stop()
+	clientDone := s.clientDone
+	var drainTimer *time.Timer
+	var drainExpired <-chan time.Time
+	defer func() {
+		if drainTimer != nil {
+			drainTimer.Stop()
+		}
+	}()
 	accepted := false
 	var pendingControl []byte
 	var sentControl []byte
@@ -508,6 +533,15 @@ func (s *responsesWSSession) runCall(c *gin.Context, state *responsesWSCallState
 		case <-idle.C:
 			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, context.DeadlineExceeded)
 			state.closeCode, state.closeReason = websocket.CloseInternalServerErr, "upstream response timed out"
+			ConsumeResponsesQuota(c, info, accumulator.Finish())
+			return nil
+		case <-clientDone:
+			clientDone = nil
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, context.Canceled)
+			remaining := min(helper.StreamDrainTimeout(c.Request.Context()), max(timeout-time.Since(s.clientDisconnectedAt), 0))
+			drainTimer = time.NewTimer(remaining)
+			drainExpired = drainTimer.C
+		case <-drainExpired:
 			ConsumeResponsesQuota(c, info, accumulator.Finish())
 			return nil
 		case <-s.ctx.Done():
@@ -718,13 +752,49 @@ func (s *responsesWSSession) writeTarget(kind int, message []byte) error {
 	return target.WriteMessage(kind, message)
 }
 
+func (s *responsesWSSession) writeCreate(state *responsesWSCallState, message []byte) error {
+	s.stateMu.Lock()
+	if s.clientGone.Load() || s.ctx.Err() != nil {
+		s.stateMu.Unlock()
+		return context.Canceled
+	}
+	state.submitted = true
+	s.stateMu.Unlock()
+	return s.writeTarget(websocket.TextMessage, message)
+}
+
 func (s *responsesWSSession) writeClient(kind int, message []byte) error {
 	s.clientWriteMu.Lock()
 	defer s.clientWriteMu.Unlock()
-	if err := s.client.SetWriteDeadline(s.clientWriteBudget.Deadline(time.Now(), len(message))); err != nil {
-		return err
+	if s.clientGone.Load() {
+		return nil
 	}
-	return s.client.WriteMessage(kind, message)
+	if err := s.client.SetWriteDeadline(s.clientWriteBudget.Deadline(time.Now(), len(message))); err != nil {
+		s.disconnectClient()
+		return nil
+	}
+	if err := s.client.WriteMessage(kind, message); err != nil {
+		s.disconnectClient()
+	}
+	return nil
+}
+
+func (s *responsesWSSession) disconnectClient() {
+	s.clientCloseOnce.Do(func() {
+		s.clientDisconnectedAt = time.Now()
+		s.clientGone.Store(true)
+		if s.clientDone != nil {
+			close(s.clientDone)
+		}
+		s.stateMu.Lock()
+		submitted := s.current != nil && s.current.submitted
+		s.stateMu.Unlock()
+		if !submitted {
+			// Authentication/dialing is still cancellable before create is sent.
+			s.cancel()
+		}
+		_ = s.client.Close()
+	})
 }
 
 func (s *responsesWSSession) sendError(eventID, streamID string, apiErr *types.NewAPIError) {

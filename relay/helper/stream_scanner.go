@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -99,17 +100,110 @@ func (b *StreamWriteBudget) Deadline(now time.Time, n int) time.Time {
 // recorders) are silently ignored.
 type streamResponseWriter struct {
 	gin.ResponseWriter
-	budget StreamWriteBudget
+	budget         StreamWriteBudget
+	clientContext  context.Context
+	status         *relaycommon.StreamStatus
+	disconnected   chan struct{}
+	disconnectOnce sync.Once
+	discarded      atomic.Bool
 }
 
 func (w *streamResponseWriter) Write(p []byte) (int, error) {
+	if w.discardWrite() {
+		return len(p), nil
+	}
 	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.budget.Deadline(time.Now(), len(p)))
-	return w.ResponseWriter.Write(p)
+	n, err := w.ResponseWriter.Write(p)
+	if err != nil && w.disconnected != nil {
+		w.disconnect(err)
+		w.discarded.Store(true)
+		return len(p), nil
+	}
+	return n, err
 }
 
 func (w *streamResponseWriter) WriteString(s string) (int, error) {
+	if w.discardWrite() {
+		return len(s), nil
+	}
 	_ = http.NewResponseController(w.ResponseWriter).SetWriteDeadline(w.budget.Deadline(time.Now(), len(s)))
-	return w.ResponseWriter.WriteString(s)
+	n, err := w.ResponseWriter.WriteString(s)
+	if err != nil && w.disconnected != nil {
+		w.disconnect(err)
+		w.discarded.Store(true)
+		return len(s), nil
+	}
+	return n, err
+}
+
+// Once the downstream closes, keep parsing the upstream for authoritative usage.
+// Writes become no-ops, but the original handler still owns settlement and cleanup.
+func (w *streamResponseWriter) disconnect(err error) {
+	if w.disconnected == nil {
+		return
+	}
+	w.disconnectOnce.Do(func() {
+		w.status.SetEndReason(relaycommon.StreamEndReasonClientGone, err)
+		close(w.disconnected)
+	})
+}
+
+func (w *streamResponseWriter) discardWrite() bool {
+	if w.disconnected == nil {
+		return false
+	}
+	if err := w.clientContext.Err(); err != nil {
+		w.disconnect(err)
+	}
+	select {
+	case <-w.disconnected:
+		w.discarded.Store(true)
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *streamResponseWriter) Flush() { _ = w.FlushError() }
+
+func (w *streamResponseWriter) FlushError() error {
+	if w.discardWrite() {
+		return nil
+	}
+	w.ResponseWriter.Flush()
+	if w.disconnected != nil && w.clientContext.Err() != nil {
+		w.disconnect(w.clientContext.Err())
+	}
+	var writer http.ResponseWriter = w.ResponseWriter
+	for {
+		if flusher, ok := writer.(interface{ FlushError() error }); ok {
+			err := flusher.FlushError()
+			if err != nil && w.disconnected != nil {
+				w.disconnect(err)
+				w.discarded.Store(true)
+				return nil
+			}
+			return err
+		}
+		unwrapper, ok := writer.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return nil
+		}
+		writer = unwrapper.Unwrap()
+	}
+}
+
+// StreamDrainTimeout is an absolute budget after a client disconnects. Upstream
+// events never extend it, and an existing request deadline always wins.
+func StreamDrainTimeout(ctx context.Context) time.Duration {
+	timeout := time.Duration(constant.StreamingTimeout) * time.Second
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = min(timeout, max(time.Until(deadline), 0))
+	}
+	return timeout
 }
 
 // Unwrap lets http.ResponseController reach the connection.
@@ -127,6 +221,7 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	// subsequent ping and data writes through its shared write mutex.
 	if writer, ok := c.Writer.(*streamKeepAliveWriter); ok {
 		writer.stop()
+		c.Writer = writer.ResponseWriter
 	}
 
 	// 无条件新建 StreamStatus
@@ -135,6 +230,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	ctx, cancel := context.WithCancel(context.Background())
 
 	streamingTimeout := time.Duration(constant.StreamingTimeout) * time.Second
+	if streamingTimeout <= 0 {
+		streamingTimeout = 300 * time.Second
+	}
 
 	var (
 		stopChan    = make(chan bool, 3) // 增加缓冲区避免阻塞
@@ -192,6 +290,14 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 	scanner.Split(bufio.ScanLines)
 	copyCodexSSEHeaders(c, resp)
 	SetEventStreamHeaders(c)
+	writer, ok := c.Writer.(*streamResponseWriter)
+	if !ok {
+		writer = &streamResponseWriter{ResponseWriter: c.Writer}
+		c.Writer = writer
+	}
+	writer.clientContext = c.Request.Context()
+	writer.status = info.StreamStatus
+	writer.disconnected = make(chan struct{})
 
 	ctx = context.WithValue(ctx, "stop_chan", stopChan)
 
@@ -235,6 +341,8 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 					return
 				case <-c.Request.Context().Done():
 					// 监听客户端断开连接
+					return
+				case <-writer.disconnected:
 					return
 				case <-pingTimeout.C:
 					logger.LogError(c, common.LogText("ping goroutine max duration reached"))
@@ -285,6 +393,9 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		}()
 
 		for scanner.Scan() {
+			if err := c.Request.Context().Err(); err != nil {
+				writer.disconnect(err)
+			}
 			// 检查是否需要停止
 			select {
 			case <-stopChan:
@@ -338,23 +449,37 @@ func StreamScannerHandler(c *gin.Context, resp *http.Response, info *relaycommon
 		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonEOF, nil)
 	})
 
-	// 主循环等待完成或超时
-	select {
-	case <-ticker.C:
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
-	case <-stopChan:
-		// EndReason already set by the goroutine that triggered stopChan
-	case <-c.Request.Context().Done():
-		// 客户端断开：立即 cleanup 关闭上游 resp.Body，解除 scanner 阻塞并让上游停止生成，
-		// 避免为已放弃的请求继续消费上游 token。
-		info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonClientGone, c.Request.Context().Err())
+	clientDone, disconnected := c.Request.Context().Done(), writer.disconnected
+	var drainTimer *time.Timer
+	var drainExpired <-chan time.Time
+wait:
+	for {
+		select {
+		case <-ticker.C:
+			info.StreamStatus.SetEndReason(relaycommon.StreamEndReasonTimeout, nil)
+			break wait
+		case <-stopChan:
+			break wait
+		case <-clientDone:
+			writer.disconnect(c.Request.Context().Err())
+			clientDone = nil
+		case <-disconnected:
+			disconnected, clientDone = nil, nil
+			drainTimer = time.NewTimer(StreamDrainTimeout(c.Request.Context()))
+			drainExpired = drainTimer.C
+		case <-drainExpired:
+			break wait
+		}
+	}
+	if drainTimer != nil {
+		drainTimer.Stop()
 	}
 
 	cleanup()
 	// All stream goroutines have joined. Done from a successfully delivered
 	// protocol completion can now correct a cancellation that won while its
 	// callback was still running. Bare EOF and failed writes never qualify.
-	if sr.done && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) &&
+	if sr.done && !writer.discarded.Load() && info.StreamStatus.ResponseOutcome() == string(relaycommon.ResponseOutcomeCompleted) &&
 		info.StreamStatus.EndReason == relaycommon.StreamEndReasonClientGone &&
 		errors.Is(info.StreamStatus.EndError, context.Canceled) && !info.StreamStatus.HasErrors() {
 		info.StreamStatus.EndReason = relaycommon.StreamEndReasonDone

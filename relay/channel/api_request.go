@@ -1,9 +1,11 @@
 package channel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -417,7 +419,31 @@ func DoWssRequest(a Adaptor, c *gin.Context, info *common.RelayInfo, requestBody
 	if info.ChannelSetting.TLSInsecureSkipVerify {
 		dialer.TLSClientConfig = common2.InsecureTLSConfig
 	}
+	// Gorilla's DialContext only observes cancellation while dialing TCP.
+	// Also interrupt a pending HTTP upgrade, before any create can be sent.
+	netDial := dialer.NetDialContext
+	if netDial == nil {
+		if dialer.NetDial != nil {
+			legacyDial := dialer.NetDial
+			netDial = func(_ context.Context, network, address string) (net.Conn, error) {
+				return legacyDial(network, address)
+			}
+		} else {
+			netDial = (&net.Dialer{}).DialContext
+		}
+	}
+	var stopHandshakeCancellation func() bool
+	dialer.NetDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		connection, err := netDial(ctx, network, address)
+		if err == nil {
+			stopHandshakeCancellation = context.AfterFunc(c.Request.Context(), func() { _ = connection.Close() })
+		}
+		return connection, err
+	}
 	targetConn, resp, err := dialer.DialContext(c.Request.Context(), fullRequestURL, targetHeader)
+	if stopHandshakeCancellation != nil {
+		stopHandshakeCancellation()
+	}
 	if err != nil {
 		statusCode := http.StatusInternalServerError
 		if resp != nil {
@@ -504,9 +530,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			resp.Proto)
 	}
 
-	if upID := resp.Header.Get(common2.RequestIdKey); upID != "" {
-		c.Set(common2.UpstreamRequestIdKey, upID)
+	upID := resp.Header.Get(common2.RequestIdKey)
+	if upID == "" {
+		upID = resp.Header.Get("X-Request-Id")
 	}
+	c.Set(common2.UpstreamRequestIdKey, upID)
+	c.Set(common2.UpstreamClientRequestIdKey, resp.Header.Get("X-Client-Request-Id"))
 
 	_ = req.Body.Close()
 	_ = c.Request.Body.Close()
