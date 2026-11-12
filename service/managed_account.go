@@ -97,6 +97,10 @@ func ManagementResourceScope(c *gin.Context) model.ManagedResourceScope {
 	scope.StrictBatch = true
 	scope.Restricted = account.ResourceScope.Kind == "subject"
 	scope.SubjectRef = account.ResourceScope.SubjectRef
+	// Only a signed self-enable permission can establish a resumable pause.
+	if scope.Restricted && slices.Contains(account.AllowedStatuses, common.TokenStatusEnabled) {
+		scope.ActorID = account.ActorID
+	}
 	if selected, exists := c.GetQuery("subject_ref"); c.Request.Method == http.MethodGet && exists && selected != "" {
 		parsed, err := uuid.Parse(selected)
 		if err != nil || parsed.String() != selected || scope.Restricted && selected != scope.SubjectRef {
@@ -518,7 +522,7 @@ func verifyManagementCapability(raw string, request ManagementRequest) (*Managed
 		}
 		for _, status := range account.AllowedStatuses {
 			key := "status:" + strconv.Itoa(status)
-			if status != 1 && status != 2 || seen[key] || account.ResourceScope.Kind == "subject" && status != 2 {
+			if status != 1 && status != 2 || seen[key] {
 				return nil, ErrManagedAccountDenied
 			}
 			seen[key] = true

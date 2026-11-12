@@ -90,6 +90,7 @@ export function DataTableRowActions<TData>({
     resolveRealKey,
     loadingKeys,
     workspaceKey,
+    account,
     canPerform,
     canUpdateField,
     canSetStatus,
@@ -101,9 +102,13 @@ export function DataTableRowActions<TData>({
 
   const hasChatPresets = chatPresets.length > 0
   const toggleLabel = isEnabled ? t('Disable') : t('Enable')
-  const canToggle = canSetStatus(
-    isEnabled ? API_KEY_STATUS.DISABLED : API_KEY_STATUS.ENABLED
-  )
+  const canToggle =
+    canSetStatus(
+      isEnabled ? API_KEY_STATUS.DISABLED : API_KEY_STATUS.ENABLED
+    ) &&
+    (isEnabled ||
+      account?.resource_scope.kind !== 'subject' ||
+      (apiKey.status === API_KEY_STATUS.DISABLED && apiKey.can_enable === true))
   const canEdit = canUpdateField('name')
   const canReveal = canPerform('model.keys.reveal')
   const canReadUsage = canPerform('model.usage.read')

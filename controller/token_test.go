@@ -52,6 +52,7 @@ type tokenResponseItem struct {
 	Name              string                         `json:"name"`
 	Key               string                         `json:"key"`
 	Status            int                            `json:"status"`
+	CanEnable         bool                           `json:"can_enable"`
 	RemainQuota       *int                           `json:"remain_quota"`
 	Managed           bool                           `json:"managed"`
 	ManagedBindingRef string                         `json:"managed_binding_ref"`
@@ -620,6 +621,45 @@ func TestManagedMemberKeyRoutesKeepSubjectAndFieldBoundaries(t *testing.T) {
 			require.Equal(t, http.StatusForbidden, call("POST", "/api/token/", map[string]any{"name": "forbidden", "assignee_ref": managedMemberA}).Code)
 			require.True(t, decodeAPIResponse(t, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})).Success)
 			require.Equal(t, http.StatusForbidden, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1}).Code)
+			require.NoError(t, db.First(&after, owned.Id).Error)
+			require.Zero(t, after.SelfDisabledByUserID, "the old disable-only grant leaves the pause source unknown")
+			account.AllowedStatuses = []int{1, 2}
+			require.Equal(t, http.StatusForbidden, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1}).Code,
+				"new enable permission cannot retroactively establish a source")
+			admin, err := model.GetTokenByIds(owned.Id, 41)
+			require.NoError(t, err)
+			admin.Status = common.TokenStatusEnabled
+			require.NoError(t, admin.SelectUpdate())
+			require.True(t, decodeAPIResponse(t, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})).Success)
+			for _, path := range []string{"/api/token/", "/api/token/search?keyword=my+renamed+key", fmt.Sprintf("/api/token/%d", owned.Id)} {
+				response := call("GET", path, nil)
+				require.Contains(t, response.Body.String(), `"can_enable":true`)
+				require.NotContains(t, response.Body.String(), "self_disabled_by_user_id")
+			}
+			response = call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1})
+			require.True(t, decodeAPIResponse(t, response).Success)
+			require.Contains(t, response.Body.String(), `"can_enable":false`)
+			require.NoError(t, db.First(&after, owned.Id).Error)
+			require.Zero(t, after.SelfDisabledByUserID)
+			require.Equal(t, before.RemainQuota, after.RemainQuota)
+			require.Equal(t, before.UsedQuota, after.UsedQuota)
+			response = call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})
+			require.True(t, decodeAPIResponse(t, response).Success)
+			require.Contains(t, response.Body.String(), `"can_enable":true`)
+			admin, err = model.GetTokenByIds(owned.Id, 41)
+			require.NoError(t, err)
+			admin.Status = common.TokenStatusDisabled
+			require.NoError(t, admin.SelectUpdate())
+			response = call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 2})
+			require.True(t, decodeAPIResponse(t, response).Success)
+			require.Contains(t, response.Body.String(), `"can_enable":false`)
+			require.Equal(t, http.StatusForbidden, call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1}).Code)
+			for _, source := range []any{7, 0, nil} {
+				response := call("PUT", "/api/token/?status_only=true", map[string]any{"id": owned.Id, "status": 1, "self_disabled_by_user_id": source})
+				require.False(t, decodeAPIResponse(t, response).Success)
+				response = call("POST", "/api/token/", map[string]any{"name": "forged", "self_disabled_by_user_id": source})
+				require.False(t, decodeAPIResponse(t, response).Success)
+			}
 			for _, metadata := range []struct{ path, expected string }{{"/api/user/self/groups", "owner-group"}, {"/api/user/models", "owner-only"}, {"/api/token/auto-groups", "owner-group"}} {
 				response := call("GET", metadata.path, nil)
 				require.True(t, decodeAPIResponse(t, response).Success, response.Body.String())

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/gin-gonic/gin"
@@ -47,6 +48,101 @@ func managedScopeTestDatabase(t *testing.T, dialect, purpose string) (*gorm.DB, 
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	return db, kind
+}
+
+func TestMemberSelfEnableRechecksCurrentState(t *testing.T) {
+	for _, dialect := range []string{"sqlite", "mysql", "postgres"} {
+		t.Run(dialect, func(t *testing.T) {
+			db, kind := managedScopeTestDatabase(t, dialect, "")
+			oldDB, oldKind := DB, common.MainDatabaseType()
+			DB = db
+			common.SetMainDatabaseType(kind)
+			initCol()
+			t.Cleanup(func() { DB = oldDB; common.SetMainDatabaseType(oldKind); initCol() })
+			require.NoError(t, DB.AutoMigrate(&Token{}))
+			for _, test := range []struct {
+				name  string
+				allow bool
+			}{
+				{"self", true}, {"repeated_self_disable", true}, {"other_actor", false},
+				{"administrator_reasserts_disable", false}, {"machine_disables", false},
+				{"expired_while_paused", false}, {"exhausted_while_paused", false},
+				{"system_expired", false}, {"system_exhausted", false},
+				{"assignee_changed", false}, {"retired", false}, {"managed_key", false}, {"unconfirmed", false},
+			} {
+				t.Run(test.name, func(t *testing.T) {
+					token := Token{UserId: 71, Key: "self-enable-" + common.GetUUID(), Name: "retained",
+						Status: common.TokenStatusEnabled, ManagedSubjectRef: "member-a", ExpiredTime: -1,
+						RemainQuota: 100, UsedQuota: 25, ModelLimitsEnabled: true, ModelLimits: "model-a"}
+					require.NoError(t, token.Insert())
+					t.Cleanup(func() { require.NoError(t, DB.Unscoped().Delete(&token).Error) })
+					scope := ManagedResourceScope{OwnerID: 71, ActorID: 7, SubjectRef: "member-a", Restricted: true}
+					member, err := scope.GetToken(token.Id)
+					require.NoError(t, err)
+					member.Status = common.TokenStatusDisabled
+					require.NoError(t, member.SelectUpdate())
+					require.Equal(t, 7, member.SelfDisabledByUserID)
+					require.True(t, member.CanSelfEnable(7))
+					switch test.name {
+					case "repeated_self_disable":
+						require.NoError(t, member.SelectUpdate())
+						require.Equal(t, 7, member.SelfDisabledByUserID)
+					case "other_actor":
+						scope.ActorID = 8
+						member, err = scope.GetToken(token.Id)
+						require.NoError(t, err)
+					case "administrator_reasserts_disable", "machine_disables", "system_expired", "system_exhausted":
+						operator, err := GetTokenByIds(token.Id, token.UserId)
+						require.NoError(t, err)
+						operator.Status = common.TokenStatusDisabled
+						if test.name == "system_expired" {
+							operator.Status = common.TokenStatusExpired
+						}
+						if test.name == "system_exhausted" {
+							operator.Status = common.TokenStatusExhausted
+						}
+						require.NoError(t, operator.SelectUpdate())
+						require.Zero(t, operator.SelfDisabledByUserID)
+						if test.name == "administrator_reasserts_disable" {
+							require.NoError(t, member.SelectUpdate(), "a repeated disable cannot take over an administrator decision")
+							require.Zero(t, member.SelfDisabledByUserID)
+						}
+					case "expired_while_paused":
+						require.NoError(t, DB.Model(&token).Update("expired_time", common.GetTimestamp()-1).Error)
+					case "exhausted_while_paused":
+						require.NoError(t, DB.Model(&token).Update("remain_quota", 0).Error)
+					case "assignee_changed":
+						require.NoError(t, DB.Model(&token).Update("managed_subject_ref", "member-b").Error)
+					case "retired":
+						require.NoError(t, DB.Model(&token).Update("deleted_at", time.Now()).Error)
+					case "managed_key":
+						require.NoError(t, DB.Model(&token).Update("managed_binding_ref", "11111111-1111-4111-8111-111111111111").Error)
+					case "unconfirmed":
+						require.NoError(t, DB.Model(&token).Updates(map[string]any{"billing_context_ref": common.GetUUID(), "billing_context_confirmed": false}).Error)
+					}
+					member.Status = common.TokenStatusEnabled
+					err = member.SelectUpdate()
+					if test.allow {
+						require.NoError(t, err)
+						require.Zero(t, member.SelfDisabledByUserID)
+						require.False(t, member.CanSelfEnable(7))
+					} else {
+						require.Error(t, err, "the stale loaded key must not bypass current authorization facts")
+					}
+					var stored Token
+					require.NoError(t, DB.Unscoped().First(&stored, token.Id).Error)
+					if test.allow {
+						require.Equal(t, common.TokenStatusEnabled, stored.Status)
+					} else {
+						require.NotEqual(t, common.TokenStatusEnabled, stored.Status)
+					}
+					require.Equal(t, token.Key, stored.Key)
+					require.Equal(t, token.UsedQuota, stored.UsedQuota)
+					require.Equal(t, token.ModelLimits, stored.ModelLimits)
+				})
+			}
+		})
+	}
 }
 
 func TestManagedResourceScopeQueriesAndMutations(t *testing.T) {

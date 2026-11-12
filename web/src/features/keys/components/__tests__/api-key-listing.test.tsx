@@ -702,10 +702,10 @@ const memberAccount: ManagedAccountContext = {
     'model.usage.read',
   ],
   allowed_update_fields: ['name'],
-  allowed_statuses: [2],
+  allowed_statuses: [1, 2],
 }
 
-it('members can disable and copy their external key while create and re-enable stay unavailable', async () => {
+it('members can disable and copy a key while re-enable stays unavailable without server confirmation', async () => {
   const user = userEvent.setup()
   const { put, post } = await renderKeysPage(1, {}, [], memberAccount)
   expect(
@@ -738,6 +738,106 @@ it('members can disable and copy their external key while create and re-enable s
       })
     )
   )
+})
+
+it.each([false, true])(
+  'a member can re-enable a server-confirmed self-paused key on mobile=%s',
+  async (mobile) => {
+    if (mobile) {
+      const matchMedia = window.matchMedia
+      vi.spyOn(window, 'matchMedia').mockImplementation((query) => ({
+        ...matchMedia(query),
+        matches: query.includes('max-width'),
+      }))
+    }
+    const { put, post } = await renderKeysPage(
+      2,
+      { can_enable: true },
+      [],
+      memberAccount
+    )
+    const user = userEvent.setup()
+    const enable = screen.getByRole('button', { name: 'Enable' })
+    act(() => enable.focus())
+    await user.keyboard('{Enter}')
+    await waitFor(() =>
+      expect(put).toHaveBeenCalledWith(
+        '/api/token/?status_only=true',
+        { id: 7, status: 1 },
+        expect.objectContaining({
+          headers: { 'X-SAI-Workspace-Key': memberAccount.workspace_key },
+        })
+      )
+    )
+    await screen.findByText('Enabled')
+    expect(screen.getByRole('button', { name: 'Disable' })).toBeEnabled()
+    expect(post).not.toHaveBeenCalled()
+  }
+)
+
+it.each([undefined, false])(
+  'a member cannot re-enable a disabled key when can_enable is %s',
+  async (canEnable) => {
+    const { put } = await renderKeysPage(
+      2,
+      { can_enable: canEnable },
+      [],
+      memberAccount
+    )
+    expect(screen.getByText('Disabled')).toBeVisible()
+    expect(
+      screen.queryByRole('button', { name: 'Enable' })
+    ).not.toBeInTheDocument()
+    expect(put).not.toHaveBeenCalled()
+  }
+)
+
+it('a row capability cannot grant re-enable when the account action is unavailable', async () => {
+  await renderKeysPage(2, { can_enable: true }, [], {
+    ...memberAccount,
+    allowed_statuses: [2],
+  })
+  expect(
+    screen.queryByRole('button', { name: 'Enable' })
+  ).not.toBeInTheDocument()
+})
+
+it.each([3, 4])(
+  'a member cannot re-enable status %s even with a stale row capability',
+  async (status) => {
+    await renderKeysPage(status, { can_enable: true }, [], memberAccount)
+    expect(
+      screen.queryByRole('button', { name: 'Enable' })
+    ).not.toBeInTheDocument()
+  }
+)
+
+it('a managed key keeps its original read-only actions even with an enable capability', async () => {
+  await renderKeysPage(
+    2,
+    { managed: true, can_enable: true },
+    [],
+    memberAccount
+  )
+  expect(screen.getByRole('button', { name: 'Usage' })).toBeVisible()
+  expect(
+    screen.queryByRole('button', { name: 'Enable' })
+  ).not.toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Edit' })).not.toBeInTheDocument()
+})
+
+it('a stale re-enable capability retains the disabled row when the server refuses the change', async () => {
+  const { put } = await renderKeysPage(
+    2,
+    { can_enable: true },
+    [],
+    memberAccount
+  )
+  put.mockResolvedValue({ data: { success: false, message: 'Access denied' } })
+  await userEvent.click(screen.getByRole('button', { name: 'Enable' }))
+  await screen.findByText('Access denied')
+  expect(screen.getByText('Disabled')).toBeVisible()
+  expect(screen.queryByText('Enabled')).not.toBeInTheDocument()
 })
 
 it('administrators keep create and re-enable controls and external key attribution does not mask it as managed', async () => {

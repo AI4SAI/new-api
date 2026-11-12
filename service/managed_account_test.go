@@ -131,9 +131,9 @@ func TestManagedAccountCapabilityBindsEveryRequest(t *testing.T) {
 			g["resource_scope"] = map[string]any{"kind": "subject", "subject_ref": g["actor_ref"]}
 			g["allowed_update_fields"] = []string{"quota_delta"}
 		}},
-		{"subject-enable-permission", func(_ jwt.MapClaims, g map[string]any) {
+		{"subject-system-status-permission", func(_ jwt.MapClaims, g map[string]any) {
 			g["resource_scope"] = map[string]any{"kind": "subject", "subject_ref": g["actor_ref"]}
-			g["allowed_statuses"] = []int{1}
+			g["allowed_statuses"] = []int{3}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -164,6 +164,16 @@ func TestManagedAccountCapabilityBindsEveryRequest(t *testing.T) {
 	require.True(t, scope.Restricted)
 	require.True(t, scope.StrictBatch)
 	require.Equal(t, "11111111-1111-4111-8111-111111111111", scope.SubjectRef)
+	require.Zero(t, scope.ActorID, "a disable-only grant cannot establish a resumable pause")
+	mutate = func(claims jwt.MapClaims, grant map[string]any) {
+		member(claims, grant)
+		grant["allowed_statuses"] = []int{1, 2}
+	}
+	c = request()
+	require.NoError(t, AuthorizeManagedAccount(c, "model.keys.update"), "signed member status permissions still require per-key source checks")
+	require.Equal(t, []int{1, 2}, ManagementAccount(c).AllowedStatuses)
+	require.Equal(t, 7, ManagementResourceScope(c).ActorID)
+	mutate = member
 
 	method, body = http.MethodGet, ""
 	for _, selector := range []struct {

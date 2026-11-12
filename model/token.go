@@ -16,6 +16,7 @@ type Token struct {
 	UserId                  int            `json:"user_id" gorm:"index;index:idx_token_managed_subject,priority:1"`
 	Key                     string         `json:"key" gorm:"type:varchar(128);uniqueIndex"`
 	Status                  int            `json:"status" gorm:"default:1"`
+	SelfDisabledByUserID    int            `json:"-" gorm:"not null;default:0"`
 	Name                    string         `json:"name" gorm:"index" `
 	CreatedTime             int64          `json:"created_time" gorm:"bigint"`
 	AccessedTime            int64          `json:"accessed_time" gorm:"bigint"`
@@ -54,6 +55,7 @@ var ErrTokenDeletionNotAllowed = errors.New("API keys cannot be deleted. Disable
 // A restricted scope without a subject cannot fall back to the whole account.
 type ManagedResourceScope struct {
 	OwnerID     int
+	ActorID     int
 	SubjectRef  string
 	Restricted  bool
 	StrictBatch bool
@@ -392,6 +394,7 @@ func GetTokenByKey(key string, fromDB bool) (token *Token, err error) {
 }
 
 func (token *Token) Insert() error {
+	token.SelfDisabledByUserID = 0
 	var err error
 	err = DB.Create(token).Error
 	return err
@@ -464,7 +467,7 @@ func (token *Token) InsertPendingBillingToken() error {
 	if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
-	token.Status, token.BillingContextConfirmed = common.TokenStatusDisabled, false
+	token.Status, token.BillingContextConfirmed, token.SelfDisabledByUserID = common.TokenStatusDisabled, false, 0
 	if err = DB.Create(token).Error; err != nil {
 		if recovered := read(); !errors.Is(recovered, gorm.ErrRecordNotFound) {
 			return recovered
@@ -505,10 +508,10 @@ func (token *Token) ConfirmBillingContext(subject ...string) (err error) {
 				return err
 			}
 			if err := tx.Model(&current).Updates(map[string]any{"billing_context_confirmed": true, "status": common.TokenStatusEnabled,
-				"metadata_revision": next, "managed_subject_ref": current.ManagedSubjectRef}).Error; err != nil {
+				"metadata_revision": next, "managed_subject_ref": current.ManagedSubjectRef, "self_disabled_by_user_id": 0}).Error; err != nil {
 				return err
 			}
-			current.BillingContextConfirmed, current.Status = true, common.TokenStatusEnabled
+			current.BillingContextConfirmed, current.Status, current.SelfDisabledByUserID = true, common.TokenStatusEnabled, 0
 			current.MetadataRevision = next
 		}
 		current.resourceScope = token.resourceScope
@@ -680,6 +683,16 @@ func (token *Token) SelectUpdate() (err error) {
 	return token.mutateMetadata(map[string]any{"status": token.Status})
 }
 
+// CanSelfEnable is a presentation hint over the current stored facts. The
+// mutation checks them again under the row lock and retains quota reservations.
+func (token *Token) CanSelfEnable(actorID int) bool {
+	return actorID > 0 && token.SelfDisabledByUserID == actorID && token.ManagedSubjectRef != "" &&
+		token.Status == common.TokenStatusDisabled && !token.DeletedAt.Valid && token.ManagedBindingRef == "" &&
+		(token.BillingContextRef == nil || token.BillingContextConfirmed) &&
+		(token.ExpiredTime == -1 || token.ExpiredTime > common.GetTimestamp()) &&
+		(token.UnlimitedQuota || token.RemainQuota > 0)
+}
+
 // UpdateManagedName cannot overwrite concurrently updated quota or routing.
 func (token *Token) UpdateManagedName(name string) error {
 	if len(name) > 50 {
@@ -714,10 +727,44 @@ func (token *Token) mutateMetadata(fields map[string]any) (err error) {
 		}
 		if token.resourceScope != nil && token.resourceScope.Restricted {
 			for field, value := range fields {
-				if field != "name" && (field != "status" || value != common.TokenStatusDisabled) {
+				if field != "name" && (field != "status" || value != common.TokenStatusDisabled && value != common.TokenStatusEnabled) {
 					return ErrManagedResourceScopeDenied
 				}
 			}
+		}
+		if status, changed := fields["status"].(int); changed {
+			selfDisabledBy := 0
+			if token.resourceScope != nil && token.resourceScope.Restricted {
+				actorID := token.resourceScope.ActorID
+				if current.ManagedBindingRef != "" {
+					return ErrManagedResourceScopeDenied
+				}
+				if status == common.TokenStatusEnabled {
+					if !current.CanSelfEnable(actorID) {
+						return ErrManagedResourceScopeDenied
+					}
+					if common.RedisEnabled {
+						if _, err := cacheInitToken(current); err != nil {
+							return err
+						}
+						cached, err := cacheGetTokenByKey(current.Key)
+						if err != nil {
+							return err
+						}
+						if !current.UnlimitedQuota && cached.RemainQuota <= 0 {
+							return ErrManagedResourceScopeDenied
+						}
+					}
+				} else if current.Status == common.TokenStatusEnabled {
+					selfDisabledBy = max(actorID, 0)
+				} else if current.Status == common.TokenStatusDisabled {
+					selfDisabledBy = current.SelfDisabledByUserID
+				}
+			}
+			if status == common.TokenStatusEnabled && current.BillingContextRef != nil && !current.BillingContextConfirmed {
+				return ErrBillingContextConflict
+			}
+			fields["self_disabled_by_user_id"] = selfDisabledBy
 		}
 		next := max(current.MetadataRevision, 1) + 1
 		attempted, token.Key = next, current.Key
@@ -731,6 +778,9 @@ func (token *Token) mutateMetadata(fields map[string]any) (err error) {
 		token.Key, token.MetadataRevision = current.Key, next
 		if name, ok := fields["name"].(string); ok {
 			token.Name = name
+		}
+		if source, ok := fields["self_disabled_by_user_id"].(int); ok {
+			token.SelfDisabledByUserID = source
 		}
 		return nil
 	})

@@ -58,6 +58,7 @@ export const apiKeySchema = z.object({
   name: z.string(),
   key: z.string(),
   managed: z.boolean().optional(),
+  can_enable: z.boolean().optional(),
   attribution: z
     .discriminatedUnion('state', [
       z.object({ state: z.literal('unknown') }),

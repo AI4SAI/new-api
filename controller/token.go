@@ -71,6 +71,7 @@ type tokenResponse struct {
 	*model.Token
 	AutoGroups  []string                       `json:"auto_groups"`
 	Managed     bool                           `json:"managed"`
+	CanEnable   bool                           `json:"can_enable"`
 	Attribution *service.ManagedKeyAttribution `json:"attribution,omitempty"`
 }
 
@@ -181,9 +182,34 @@ func buildMaskedTokenResponses(tokens []*model.Token, machine bool) []*tokenResp
 	return maskedTokens
 }
 
+func canEnableToken(c *gin.Context, token *model.Token) bool {
+	if token.Status != common.TokenStatusDisabled || token.DeletedAt.Valid ||
+		(token.ManagedBindingRef != "" && !c.GetBool("access_token_managed")) ||
+		(token.BillingContextRef != nil && !token.BillingContextConfirmed) ||
+		(token.ExpiredTime != -1 && token.ExpiredTime <= common.GetTimestamp()) ||
+		(!token.UnlimitedQuota && token.RemainQuota <= 0) {
+		return false
+	}
+	account := service.ManagementAccount(c)
+	if account == nil {
+		return token.UserId == c.GetInt("id")
+	}
+	if account.OwnerID != token.UserId || !slices.Contains(account.AllowedActions, "model.keys.update") ||
+		!slices.Contains(account.AllowedStatuses, common.TokenStatusEnabled) {
+		return false
+	}
+	if account.ResourceScope.Kind == "subject" {
+		return token.ManagedSubjectRef == account.ResourceScope.SubjectRef && token.CanSelfEnable(account.ActorID)
+	}
+	return true
+}
+
 func presentTokenPage(c *gin.Context, tokens []*model.Token) ([]*tokenResponse, bool) {
 	machine := c.GetBool("access_token_managed")
 	responses := buildMaskedTokenResponses(tokens, machine)
+	for i, token := range tokens {
+		responses[i].CanEnable = canEnableToken(c, token)
+	}
 	if machine || service.ManagementAccount(c) == nil {
 		return responses, true
 	}
@@ -471,7 +497,7 @@ func AddToken(c *gin.Context) {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
-	if token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
+	if request.providedFields["self_disabled_by_user_id"] || token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -633,7 +659,7 @@ func UpdateToken(c *gin.Context) {
 		return
 	}
 	token := request.Token
-	if request.AssigneeRef != "" || token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.ManagedBindingRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
+	if request.providedFields["self_disabled_by_user_id"] || request.AssigneeRef != "" || token.ManagementCreatorID != 0 || token.ManagedSubjectRef != "" || token.ManagedBindingRef != "" || token.BillingContextRef != nil || token.BillingContextConfirmed || token.CreationRequestSHA != "" {
 		common.ApiErrorT(c, "Invalid parameters")
 		return
 	}
@@ -776,10 +802,12 @@ func UpdateToken(c *gin.Context) {
 		params["changed_fields"] = changedFields
 	}
 	common.SetContextKey(c, constant.ContextKeyTokenAuditSucceeded, true)
+	response := buildMaskedTokenResponse(cleanToken, c.GetBool("access_token_managed"))
+	response.CanEnable = canEnableToken(c, cleanToken)
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "",
-		"data":    buildMaskedTokenResponse(cleanToken, c.GetBool("access_token_managed")),
+		"data":    response,
 	})
 }
 

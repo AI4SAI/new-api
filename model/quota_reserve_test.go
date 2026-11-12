@@ -26,6 +26,39 @@ type quotaReplyLossHook struct {
 	before      bool
 }
 
+func TestMemberSelfEnablePreservesOutstandingQuotaReservation(t *testing.T) {
+	truncateTables(t)
+	resetBatchUpdateTestState(t)
+	useUserCacheMiniRedis(t)
+	token := createReserveTestToken(t, 100)
+	require.NoError(t, DB.Model(&token).Update("managed_subject_ref", "member-a").Error)
+	scope := ManagedResourceScope{OwnerID: token.UserId, ActorID: 7, SubjectRef: "member-a", Restricted: true}
+	member, err := scope.GetToken(token.Id)
+	require.NoError(t, err)
+	require.NoError(t, cacheSetTokenForTest(*member))
+	result, err := cacheTryReserveTokenQuota(token.Id, token.Key, 100)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	member.Status = common.TokenStatusDisabled
+	require.NoError(t, member.SelectUpdate())
+	member.Status = common.TokenStatusEnabled
+	require.ErrorIs(t, member.SelectUpdate(), ErrManagedResourceScopeDenied)
+	stored := getTokenFromDB(t, token.Id)
+	require.Equal(t, common.TokenStatusDisabled, stored.Status)
+	require.Equal(t, 7, stored.SelfDisabledByUserID)
+	require.Equal(t, 100, stored.RemainQuota, "batch persistence can lag the live reservation")
+	require.Equal(t, "0", common.RDB.HGet(context.Background(), getTokenCacheKey(token.Key), "RemainQuota").Val())
+	result, err = cacheApplyTokenQuotaDelta(token.Id, token.Key, 20)
+	require.NoError(t, err)
+	require.Equal(t, cacheQuotaOK, result)
+	require.NoError(t, member.SelectUpdate())
+	stored = getTokenFromDB(t, token.Id)
+	require.Equal(t, common.TokenStatusEnabled, stored.Status)
+	require.Zero(t, stored.SelfDisabledByUserID)
+	require.Equal(t, "20", common.RDB.HGet(context.Background(), getTokenCacheKey(token.Key), "RemainQuota").Val())
+	require.Equal(t, "80", common.RDB.HGet(context.Background(), getTokenCacheKey(token.Key), "UsedQuota").Val())
+}
+
 func (hook *quotaReplyLossHook) BeforeProcess(ctx context.Context, cmd redis.Cmder) (context.Context, error) {
 	if hook.before && !hook.fired && cmd.Name() == "eval" {
 		script, _ := cmd.Args()[1].(string)

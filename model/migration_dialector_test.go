@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/stretchr/testify/assert"
@@ -178,6 +179,54 @@ func TestMigrationSchemaStability(t *testing.T) {
 						require.NotNil(t, defaults.CacheCreationTokens)
 						assert.Zero(t, *defaults.CacheReadTokens)
 						assert.Zero(t, *defaults.CacheCreationTokens)
+					})
+				}
+			})
+
+			t.Run("token_self_disable_source", func(t *testing.T) {
+				for _, upgrade := range []bool{false, true} {
+					t.Run(fmt.Sprintf("upgrade=%v", upgrade), func(t *testing.T) {
+						const table = "migration_token_self_disable_test"
+						isolated := db
+						if dialect == "postgres" {
+							// Explicit Token index names are shared within a PostgreSQL schema.
+							isolated = db.Begin()
+							require.NoError(t, isolated.Error)
+							t.Cleanup(func() { require.NoError(t, isolated.Rollback().Error) })
+							schemaName := fmt.Sprintf("self_disable_test_%d", time.Now().UnixNano())
+							require.NoError(t, isolated.Exec("CREATE SCHEMA ?", clause.Table{Name: schemaName}).Error)
+							require.NoError(t, isolated.Exec("SET LOCAL search_path TO ?", clause.Table{Name: schemaName}).Error)
+						}
+						tokenDB := isolated.Table(table).Session(&gorm.Session{})
+						t.Cleanup(func() { require.NoError(t, isolated.Migrator().DropTable(table)) })
+						require.NoError(t, tokenDB.AutoMigrate(&Token{}))
+						if upgrade {
+							require.NoError(t, tokenDB.Migrator().DropColumn(&Token{}, "SelfDisabledByUserID"))
+						}
+						original := Token{Id: 1, UserId: 71, Key: "retained-source-key", Status: common.TokenStatusDisabled,
+							Name: "retained", ExpiredTime: -1, RemainQuota: 120, UsedQuota: 30, QuotaRevision: 2,
+							MetadataRevision: 4, ManagedSubjectRef: "member-a"}
+						require.NoError(t, tokenDB.Omit("SelfDisabledByUserID").Create(&original).Error)
+						for round := range 2 {
+							recorder.reset()
+							require.NoError(t, tokenDB.AutoMigrate(&Token{}))
+							if round == 1 {
+								assert.Empty(t, recorder.schemaMutations())
+							}
+							var stored Token
+							require.NoError(t, tokenDB.First(&stored, original.Id).Error)
+							assert.Equal(t, original, stored, "migration preserves original key identity, quota and authorization")
+							assert.False(t, stored.CanSelfEnable(7), "unknown historical disables do not acquire self-enable permission")
+						}
+						var source struct{ SelfDisabledByUserID *int }
+						require.NoError(t, tokenDB.Where("id = ?", original.Id).Take(&source).Error)
+						require.NotNil(t, source.SelfDisabledByUserID)
+						assert.Zero(t, *source.SelfDisabledByUserID)
+						require.NoError(t, tokenDB.Where("id = ?", original.Id).Update("self_disabled_by_user_id", 7).Error)
+						require.NoError(t, tokenDB.AutoMigrate(&Token{}))
+						var stored Token
+						require.NoError(t, tokenDB.First(&stored, original.Id).Error)
+						assert.True(t, stored.CanSelfEnable(7), "normal restarts retain an established member pause")
 					})
 				}
 			})
