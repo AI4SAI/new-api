@@ -307,12 +307,9 @@ func TestStreamScannerHandler_DataWithExtraSpaces(t *testing.T) {
 	assert.Equal(t, "{\"trimmed\":true}", got)
 }
 
-// TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns pins the
-// disconnect contract: when the client goes away, the handler must return
-// promptly (all goroutines joined, so the gin.Context can never leak into a
-// pooled reuse), the upstream body must be closed to stop token generation,
-// and no data received after the disconnect may be processed or written.
-func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T) {
+// A disconnected recipient must not prevent the same handler from collecting
+// upstream accounting facts. No further content is written to that recipient.
+func TestStreamScannerHandler_ClientCancelRetainsUpstreamAccounting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -357,26 +354,68 @@ func TestStreamScannerHandler_ClientCancelAbortsUpstreamAndReturns(t *testing.T)
 
 	cancel()
 
-	// The handler must return without any further upstream input: cleanup
-	// closes resp.Body, which unblocks the scanner goroutine.
+	_, err = fmt.Fprint(pw, "data: second\n\ndata: [DONE]\n\n")
+	require.NoError(t, err, "upstream remains readable after downstream cancellation")
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("handler did not return after client disconnect")
+		t.Fatal("handler did not finish after the upstream terminal")
 	}
+	_, err = fmt.Fprint(pw, "data: after terminal\n")
+	require.ErrorIs(t, err, io.ErrClosedPipe)
 
-	// Upstream read side must be closed so the provider stops generating
-	// (and billing) for a request nobody is listening to.
-	_, err = fmt.Fprint(pw, "data: second\n")
-	require.ErrorIs(t, err, io.ErrClosedPipe, "upstream body should be closed after client disconnect")
-
-	assert.Equal(t, int64(1), count.Load(), "no chunk after disconnect should be processed")
+	assert.Equal(t, int64(2), count.Load(), "upstream facts after disconnect must still be processed")
 	require.NotNil(t, info.StreamStatus)
 	assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
 
 	body := recorder.Body.String()
 	assert.Contains(t, body, "first")
 	assert.NotContains(t, body, "second")
+}
+
+func TestStreamScannerHandler_DisconnectDeadlineSurvivesUpstreamProgress(t *testing.T) {
+	previous := constant.StreamingTimeout
+	constant.StreamingTimeout = 1
+	t.Cleanup(func() { constant.StreamingTimeout = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil).WithContext(ctx)
+	info := &relaycommon.RelayInfo{DisablePing: true, ChannelMeta: &relaycommon.ChannelMeta{}}
+	first, done := make(chan struct{}), make(chan struct{})
+	var count atomic.Int64
+	go func() {
+		StreamScannerHandler(c, &http.Response{Body: reader}, info, func(data string, _ *StreamResult) {
+			if count.Add(1) == 1 {
+				close(first)
+			}
+			_ = StringData(c, data)
+		})
+		close(done)
+	}()
+	_, err := fmt.Fprint(writer, "data: first\n\n")
+	require.NoError(t, err)
+	<-first
+	cancel()
+	progress := time.NewTicker(25 * time.Millisecond)
+	defer progress.Stop()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case <-progress.C:
+			_, _ = fmt.Fprint(writer, "data: progress\n\n")
+		case <-done:
+			assert.Greater(t, count.Load(), int64(2), "progress was parsed during the drain")
+			assert.Equal(t, relaycommon.StreamEndReasonClientGone, info.StreamStatus.EndReason)
+			return
+		case <-deadline.C:
+			t.Fatal("upstream progress extended the absolute disconnect budget")
+		}
+	}
 }
 
 // ---------- Ping tests ----------

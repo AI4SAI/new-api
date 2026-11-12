@@ -144,6 +144,9 @@ func FlushWriter(c *gin.Context) (err error) {
 	if c == nil || c.Writer == nil {
 		return nil
 	}
+	if writer, ok := c.Writer.(*streamResponseWriter); ok {
+		return writer.FlushError()
+	}
 
 	if requestContextDone(c) {
 		return fmt.Errorf("request context done: %w", c.Request.Context().Err())
@@ -173,6 +176,13 @@ func FlushWriter(c *gin.Context) (err error) {
 }
 
 func requestContextDone(c *gin.Context) bool {
+	if c != nil {
+		if writer, ok := c.Writer.(*streamResponseWriter); ok && writer.disconnected != nil {
+			// The stream owner retains the response until usage collection ends.
+			// Its writer suppresses downstream I/O after disconnect independently.
+			return false
+		}
+	}
 	return c != nil && c.Request != nil && c.Request.Context().Err() != nil
 }
 

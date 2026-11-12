@@ -276,16 +276,18 @@ func TestResponsesWSRequestRunnerSharesRedisSuccessLimitWithHTTP(t *testing.T) {
 }
 
 type responsesWSBillingTest struct {
-	httpUpstream http.HandlerFunc
-	httpDone     chan struct{}
-	user         *model.User
-	token        *model.Token
-	channel      *model.Channel
-	client       *websocket.Conn
-	done         chan struct{}
-	upstreamDone chan struct{}
-	connections  atomic.Int32
-	gatewayURL   string
+	httpUpstream          http.HandlerFunc
+	httpClientGone        chan struct{}
+	beforeUpstreamUpgrade func(*http.Request)
+	httpDone              chan struct{}
+	user                  *model.User
+	token                 *model.Token
+	channel               *model.Channel
+	client                *websocket.Conn
+	done                  chan struct{}
+	upstreamDone          chan struct{}
+	connections           atomic.Int32
+	gatewayURL            string
 }
 
 func (fixture *responsesWSBillingTest) closeAndWait(t *testing.T) {
@@ -380,6 +382,12 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			return
 		}
+		if fixture.beforeUpstreamUpgrade != nil {
+			fixture.beforeUpstreamUpgrade(r)
+			if r.Context().Err() != nil {
+				return
+			}
+		}
 		ws, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
 		if !assert.NoError(t, err) {
 			return
@@ -412,6 +420,10 @@ func newResponsesWSBillingTest(t *testing.T, expression string, handle func(*web
 	})
 	engine.POST("/v1/responses", middleware.TokenAuth(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) {
 		defer func() { fixture.httpDone <- struct{}{} }()
+		if fixture.httpClientGone != nil {
+			ctx, gone := c.Request.Context(), fixture.httpClientGone
+			go func() { <-ctx.Done(); close(gone) }()
+		}
 		c.Set(common.RequestIdKey, "responses-http-billing")
 		Relay(c, types.RelayFormatOpenAIResponses)
 	})
@@ -848,31 +860,166 @@ func TestResponsesWebSocketDialsNativeResponsesChannelTypes(t *testing.T) {
 	}
 }
 
-func TestResponsesWebSocketDisconnectSettlesDeliveredOutputOnce(t *testing.T) {
-	fixture := newResponsesWSBillingTest(t, `tier("output", c * 2)`, func(ws *websocket.Conn, _ *http.Request) {
-		if _, _, err := ws.ReadMessage(); !assert.NoError(t, err) {
-			return
-		}
-		for _, event := range []string{
-			`{"type":"response.created","response":{"id":"partial","status":"in_progress"}}`,
-			`{"type":"response.output_text.delta","delta":"hello"}`,
-		} {
-			if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(event))) {
-				return
-			}
-		}
-		_, _, _ = ws.ReadMessage()
+func TestResponsesDisconnectBeforeCreateCancelsPendingDial(t *testing.T) {
+	entered, canceled, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	fixture := newResponsesWSBillingTest(t, `tier("output", c * 2)`, func(*websocket.Conn, *http.Request) {
+		t.Error("a disconnected client must not start a new upstream generation")
 	})
-	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hi","max_output_tokens":1}`)))
-	assert.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
-	delta := readResponsesWSTestEvent(t, fixture.client)
-	require.Equal(t, "response.output_text.delta", delta["type"])
-	assert.Equal(t, "hello", delta["delta"])
+	t.Cleanup(func() { close(release) })
+	fixture.beforeUpstreamUpgrade = func(request *http.Request) {
+		close(entered)
+		select {
+		case <-request.Context().Done():
+			close(canceled)
+		case <-release:
+		}
+	}
+	require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hi"}`)))
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("upstream dial not started")
+	}
+	require.NoError(t, fixture.client.Close())
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("disconnect did not cancel the pending upstream handshake")
+	}
 	fixture.closeAndWait(t)
-	assertResponsesWSAccounting(t, fixture, []int{1})
-	keys, err := common.RDB.Keys(context.Background(), "perf:ws-billing:*").Result()
-	require.NoError(t, err)
-	assert.Empty(t, keys, "client cancellation must not affect model health")
+	assertResponsesWSAccounting(t, fixture, nil)
+}
+
+func TestResponsesDisconnectedClientCollectsAuthoritativeUsage(t *testing.T) {
+	for _, transport := range []string{"sse", "websocket"} {
+		for _, outcome := range []string{"completed", "incomplete", "missing usage", "timeout"} {
+			t.Run(transport+"/"+outcome, func(t *testing.T) {
+				finish := make(chan struct{})
+				var release sync.Once
+				t.Cleanup(func() { release.Do(func() { close(finish) }) })
+				created := `{"type":"response.created","response":{"id":"disconnected","status":"in_progress"}}`
+				delta := `{"type":"response.output_text.delta","delta":"hello"}`
+				status := "completed"
+				if outcome == "incomplete" {
+					status = "incomplete"
+				}
+				usage := `,"usage":{"input_tokens":1000,"output_tokens":100,"total_tokens":1100,"input_tokens_details":{"cached_tokens":800}}`
+				if outcome == "missing usage" {
+					usage = ""
+				}
+				terminal := fmt.Sprintf(`{"type":"response.%s","response":{"id":"disconnected","status":%q%s}}`, status, status, usage)
+				fixture := newResponsesWSBillingTest(t, `tier("cached", p * 2 + c * 8 + cr * 0.2)`, func(ws *websocket.Conn, _ *http.Request) {
+					if _, _, err := ws.ReadMessage(); !assert.NoError(t, err) {
+						return
+					}
+					for _, event := range []string{created, delta} {
+						if !assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(event))) {
+							return
+						}
+					}
+					<-finish
+					if outcome == "timeout" {
+						_, _, _ = ws.ReadMessage()
+						return
+					}
+					assert.NoError(t, ws.WriteMessage(websocket.TextMessage, []byte(terminal)))
+					_, _, _ = ws.ReadMessage()
+				})
+				constant.StreamingTimeout = 1
+				var previousPolicy string
+				require.NoError(t, config.GlobalConfig.SaveToDB(func(key, value string) error {
+					if key == "billing_setting.require_confirmed_stream_usage" {
+						previousPolicy = value
+					}
+					return nil
+				}))
+				require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.require_confirmed_stream_usage": "true"}))
+				t.Cleanup(func() {
+					require.NoError(t, config.GlobalConfig.LoadFromDB(map[string]string{"billing_setting.require_confirmed_stream_usage": previousPolicy}))
+				})
+				if transport == "sse" {
+					fixture.httpClientGone = make(chan struct{})
+					fixture.httpUpstream = func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "text/event-stream")
+						w.Header().Set("X-Request-Id", "upstream-disconnect-test")
+						w.Header().Set("X-Client-Request-Id", "upstream-client-test")
+						for _, event := range []string{created, delta} {
+							_, _ = fmt.Fprintf(w, "data: %s\n\n", event)
+						}
+						w.(http.Flusher).Flush()
+						<-finish
+						if outcome == "timeout" {
+							<-r.Context().Done()
+							return
+						}
+						_, err := fmt.Fprintf(w, "data: %s\n\ndata: [DONE]\n\n", terminal)
+						assert.NoError(t, err)
+					}
+					ctx, cancel := context.WithCancel(context.Background())
+					defer cancel()
+					request, err := http.NewRequestWithContext(ctx, http.MethodPost, fixture.gatewayURL+"/v1/responses", strings.NewReader(`{"model":"ws-billing","input":"hi","stream":true}`))
+					require.NoError(t, err)
+					request.Header.Set("Authorization", "Bearer sk-"+fixture.token.Key)
+					request.Header.Set("Content-Type", "application/json")
+					response, err := (&http.Client{Timeout: 3 * time.Second}).Do(request)
+					require.NoError(t, err)
+					reader := bufio.NewReader(response.Body)
+					for {
+						line, err := reader.ReadString('\n')
+						require.NoError(t, err)
+						if strings.Contains(line, "response.output_text.delta") {
+							break
+						}
+					}
+					cancel()
+					require.NoError(t, response.Body.Close())
+					select {
+					case <-fixture.httpClientGone:
+					case <-time.After(time.Second):
+						t.Fatal("server did not observe the real downstream disconnect")
+					}
+					release.Do(func() { close(finish) })
+					select {
+					case <-fixture.httpDone:
+					case <-time.After(3 * time.Second):
+						t.Fatal("bounded usage collection did not finish")
+					}
+				} else {
+					require.NoError(t, fixture.client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"ws-billing","input":"hi"}`)))
+					assert.Equal(t, "response.created", readResponsesWSTestEvent(t, fixture.client)["type"])
+					assert.Equal(t, "response.output_text.delta", readResponsesWSTestEvent(t, fixture.client)["type"])
+					require.NoError(t, fixture.client.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second)))
+					_, _, err := fixture.client.ReadMessage()
+					require.Error(t, err)
+					select {
+					case <-fixture.done:
+						t.Fatal("gateway abandoned the active upstream response")
+					case <-time.After(50 * time.Millisecond):
+					}
+					release.Do(func() { close(finish) })
+				}
+				fixture.closeAndWait(t)
+				want := 680 // ((1000-800)*2 +100*8 +800*0.2)/1e6*500000
+				if outcome == "missing usage" || outcome == "timeout" {
+					want = 0
+				}
+				assertResponsesWSAccounting(t, fixture, []int{want})
+				if want != 0 {
+					var log model.Log
+					require.NoError(t, model.LOG_DB.Where("type = ?", model.LogTypeConsume).First(&log).Error)
+					assert.Equal(t, 1000, log.PromptTokens)
+					assert.Equal(t, 100, log.CompletionTokens)
+					var other map[string]any
+					require.NoError(t, common.Unmarshal([]byte(log.Other), &other))
+					assert.Equal(t, float64(800), other["cache_tokens"])
+					if transport == "sse" {
+						assert.Equal(t, "upstream-disconnect-test", log.UpstreamRequestId)
+						assert.Equal(t, "upstream-client-test", other["admin_info"].(map[string]any)["upstream_client_request_id"])
+					}
+				}
+			})
+		}
+	}
 }
 
 func TestResponsesWebSocketCancelErrorDoesNotFinishActiveRequest(t *testing.T) {

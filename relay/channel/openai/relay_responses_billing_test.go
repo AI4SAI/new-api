@@ -133,10 +133,10 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 		{name: "midstream disconnect", event: "response.output_text.delta", cancel: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
 		{name: "midstream disconnect followed by cleanup EOF", event: "response.output_text.delta", cancel: true, closeEOF: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
 		{name: "cancellation before flush", event: "response.completed", responseStatus: "completed", cancel: true, cancelBeforeFlush: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
-		{name: "event write failure", event: "response.completed", responseStatus: "completed", failWrite: 1, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
-		{name: "data write failure", event: "response.completed", responseStatus: "completed", failWrite: 2, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
-		{name: "delimiter write failure", event: "response.completed", responseStatus: "completed", failWrite: 3, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
-		{name: "flush failure", event: "response.completed", responseStatus: "completed", failFlush: true, wantEnd: relaycommon.StreamEndReasonHandlerStop, wantError: true},
+		{name: "event write failure", event: "response.completed", responseStatus: "completed", failWrite: 1, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
+		{name: "data write failure", event: "response.completed", responseStatus: "completed", failWrite: 2, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
+		{name: "delimiter write failure", event: "response.completed", responseStatus: "completed", failWrite: 3, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
+		{name: "flush failure", event: "response.completed", responseStatus: "completed", failFlush: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
 		{name: "protocol error before completion", event: "response.completed", responseStatus: "completed", priorError: true, cancel: true, wantEnd: relaycommon.StreamEndReasonClientGone, wantError: true},
 		{name: "upstream read failure before handler returns", event: "response.completed", responseStatus: "completed", scannerError: true, wantEnd: relaycommon.StreamEndReasonScannerErr, wantError: true},
 		{name: "done with failed response", event: "response.done", responseStatus: "failed", eof: true, wantEnd: relaycommon.StreamEndReasonEOF, wantError: true},
@@ -163,7 +163,7 @@ func TestOaiResponsesStreamHandlerCompletionLifecycle(t *testing.T) {
 			t.Cleanup(cancel)
 			writer := &responsesLifecycleWriter{
 				ResponseRecorder: httptest.NewRecorder(), body: body, needle: payload + "\n\n",
-				cancelBeforeFlush: tc.cancelBeforeFlush, waitForCleanup: tc.cancel || tc.scannerError,
+				cancelBeforeFlush: tc.cancelBeforeFlush, waitForCleanup: tc.scannerError,
 				failWrite: tc.failWrite, writeErr: errors.New("downstream write failed"),
 			}
 			if tc.cancel {
@@ -243,8 +243,10 @@ func TestConfirmedUsageAcrossOpenAIStreamHandlers(t *testing.T) {
 			name                  string
 			input, output         int
 			omitOutput, omitUsage bool
+			disconnected          bool
 		}{
 			{name: "cache", input: 7, output: 5},
+			{name: "cache after disconnect", input: 7, output: 5, disconnected: true},
 			{name: "zero"},
 			{name: "partial", input: 7, omitOutput: true},
 			{name: "missing", omitUsage: true},
@@ -255,7 +257,7 @@ func TestConfirmedUsageAcrossOpenAIStreamHandlers(t *testing.T) {
 					delete(counts, protocol.output)
 				}
 				cache := 0
-				if tc.name == "cache" {
+				if strings.HasPrefix(tc.name, "cache") {
 					cache = 3
 					counts[protocol.details] = map[string]any{"cached_tokens": cache}
 				}
@@ -273,6 +275,11 @@ func TestConfirmedUsageAcrossOpenAIStreamHandlers(t *testing.T) {
 				require.NoError(t, err)
 				c, _ := gin.CreateTestContext(httptest.NewRecorder())
 				c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+				if tc.disconnected {
+					ctx, cancel := context.WithCancel(c.Request.Context())
+					c.Request = c.Request.WithContext(ctx)
+					cancel()
+				}
 				info := &relaycommon.RelayInfo{RequireConfirmedStreamUsage: true, IsStream: true, DisablePing: true, RelayFormat: protocol.format,
 					ChannelMeta: &relaycommon.ChannelMeta{UpstreamModelName: "gpt-4o"}}
 				info.SetEstimatePromptTokens(100)
