@@ -37,7 +37,7 @@ func PrepareManagedModelRequest(c *gin.Context, modelName, kind string) *types.N
 	}
 	allowed, webProduct := false, ""
 	switch c.Request.URL.Path {
-	case "/v1/chat/completions":
+	case "/v1/chat/completions", "/v1/messages":
 		allowed = kind == "request"
 	case "/v1/responses":
 		allowed = kind == "request" || kind == "responses_ws"

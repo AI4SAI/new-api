@@ -60,9 +60,12 @@ func TestManagedModelAdmissionUsesLocalProjectionAndFreezesRequestFacts(t *testi
 	missing := request()
 	missing.Set("model_execution_revision", int64(0))
 	require.Equal(t, http.StatusServiceUnavailable, AdmitManagedModel(missing, "test-model", "request").StatusCode)
-	missing = request()
-	missing.Set("model_billing_context_ref", "")
-	require.Equal(t, http.StatusServiceUnavailable, AdmitManagedModel(missing, "test-model", "request").StatusCode)
+	for _, path := range []string{"/v1/responses", "/v1/messages"} {
+		missing = request()
+		missing.Request.URL.Path = path
+		missing.Set("model_billing_context_ref", "")
+		require.Equal(t, http.StatusServiceUnavailable, AdmitManagedModel(missing, "test-model", "request").StatusCode, path)
+	}
 	unsupported := request()
 	unsupported.Request.URL.Path = "/v1/embeddings"
 	denied = AdmitManagedModel(unsupported, "test-model", "request")
@@ -77,6 +80,9 @@ func TestManagedProtocolAndProductArePreparedLocally(t *testing.T) {
 	t.Setenv("MODEL_BILLING_INSTANCE_REF", "configured-instance")
 	for _, test := range []struct{ path, kind, model, alias, product string }{
 		{"/v1/chat/completions", "request", "chat-high", "chat", "chat"},
+		{"/v1/messages", "request", "chat-high", "chat", "chat"},
+		{"/v1/messages", "responses_ws", "chat", "", ""},
+		{"/v1/messages", "request", "deepseek-search", "", ""},
 		{"/v1/responses", "request", "responses", "", "responses"},
 		{"/v1/responses/compact", "request", "responses", "", "responses"},
 		{"/v1/responses", "responses_ws", "responses", "", "responses"},
